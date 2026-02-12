@@ -19,6 +19,7 @@ from _helpers import (
     calculate_annuity,
     configure_logging,
     export_network_for_gis_mapping,
+    get_multiindex_snapshots,
     update_p_nom_max,
     weighted_avg,
 )
@@ -177,12 +178,10 @@ def apply_dynamic_pricing(
     )
 
 
-def update_transmission_costs(n, costs, length_factor=1.0):
+def update_transmission_costs(n, costs):
     # TODO: line length factor of lines is applied to lines and links.
     # Separate the function to distinguish
-    n.lines["capital_cost"] = (
-        n.lines["length"] * length_factor * costs.at["HVAC overhead", "annualized_capex_per_mw_km"]
-    )
+    n.lines["capital_cost"] = n.lines["length"] * costs.at["HVAC overhead", "annualized_capex_per_mw_km"]
 
     if n.links.empty:
         return
@@ -196,13 +195,12 @@ def update_transmission_costs(n, costs, length_factor=1.0):
 
     costs = (
         n.links.loc[dc_b, "length"]
-        * length_factor
         * (
             (1.0 - n.links.loc[dc_b, "underwater_fraction"]) * costs.at["HVDC overhead", "annualized_capex_per_mw_km"]
             + n.links.loc[dc_b, "underwater_fraction"] * costs.at["HVDC submarine", "annualized_capex_per_mw_km"]
         )
         + costs.at["HVDC inverter pair", "annualized_capex_per_mw"]
-    )
+    ) / 2
     n.links.loc[dc_b, "capital_cost"] = costs
 
 
@@ -748,6 +746,68 @@ def apply_seasonal_capacity_derates(
     ).round(3)
 
 
+def calculate_state_derates(
+    plants: pd.DataFrame,
+    conventional_carriers: list,
+):
+    """
+    Calculate state-level and national average derates from existing plants.
+    Returns DataFrames for later export.
+
+    Parameters
+    ----------
+    plants : pd.DataFrame
+        Plant dataframe with derate information
+    conventional_carriers : list
+        List of conventional carrier types
+
+    Returns
+    -------
+    tuple
+        (state_derates_df, national_derates_df) as pandas DataFrames
+    """
+    # Calculate state-level average derates for each carrier
+    state_derates_list = []
+    national_derates_list = []
+
+    for carrier in conventional_carriers:
+        carrier_plants = plants.query("carrier == @carrier")
+        if not carrier_plants.empty:
+            # State-level average
+            state_avg = (
+                carrier_plants.groupby("state")
+                .agg(
+                    {
+                        "summer_derate": "mean",
+                        "winter_derate": "mean",
+                    }
+                )
+                .reset_index()
+            )
+            state_avg["carrier"] = carrier
+            state_derates_list.append(state_avg)
+
+            # National average
+            national_derates_list.append(
+                {
+                    "carrier": carrier,
+                    "summer_derate": carrier_plants["summer_derate"].mean(),
+                    "winter_derate": carrier_plants["winter_derate"].mean(),
+                }
+            )
+
+    # Convert to DataFrames
+    state_derates_df = pd.concat(state_derates_list, ignore_index=True) if state_derates_list else pd.DataFrame()
+    national_derates_df = pd.DataFrame(national_derates_list) if national_derates_list else pd.DataFrame()
+
+    logger.info(
+        f"Calculated derate data for {len(national_derates_list)} carriers "
+        f"across {len(state_derates_df)} state-carrier combinations",
+    )
+
+    return state_derates_df, national_derates_df
+
+
 def apply_must_run_ratings(
     n: pypsa.Network,
     plants: pd.DataFrame,
@@ -893,9 +953,17 @@ def apply_pudl_fuel_costs(
 
 def main(snakemake):
     params = snakemake.params
-    interconnection = snakemake.wildcards["interconnect"]
+    interconnection = getattr(snakemake.wildcards, "interconnect", "usa")
 
     n = pypsa.Network(snakemake.input.base_network)
+
+    if list(n.snapshots) == ["now"]:
+        # add snapshots
+        sns_config = snakemake.params.snapshots
+        planning_horizons = snakemake.params.planning_horizons
+
+        n.snapshots = get_multiindex_snapshots(sns_config, planning_horizons)
+        n.set_investment_periods(periods=planning_horizons)
 
     regions_onshore = gpd.read_file(snakemake.input.regions_onshore)
     regions_offshore = gpd.read_file(snakemake.input.regions_offshore)
@@ -903,7 +971,7 @@ def main(snakemake):
 
     costs = pd.read_csv(snakemake.input.tech_costs)
     costs = costs.pivot(index="pypsa-name", columns="parameter", values="value")
-    update_transmission_costs(n, costs, params.length_factor)
+    update_transmission_costs(n, costs)
 
     renewable_carriers = set(params.renewable_carriers)
     extendable_carriers = params.extendable_carriers
@@ -950,7 +1018,10 @@ def main(snakemake):
         conventional_carriers,
         n.snapshots,
     )
-
+    state_derates_df, national_derates_df = calculate_state_derates(
+        plants,
+        conventional_carriers,
+    )
     if params.conventional.get("must_run", False):
         # TODO (@ktehranchi): In the future the plants that are must-run should
         # not be clustered and instead retire according to lifetime
@@ -997,13 +1068,13 @@ def main(snakemake):
     update_p_nom_max(n)
 
     # apply regional multipliers to capital cost data
-    for carrier, multiplier_data in const.CAPEX_LOCATIONAL_MULTIPLIER.items():
-        if n.generators.query(f"carrier == '{carrier}'").empty:
-            continue
-        multiplier_file = snakemake.input[f"gen_cost_mult_{multiplier_data}"]
-        df_multiplier = pd.read_csv(multiplier_file)
-        df_multiplier = clean_locational_multiplier(df_multiplier)
-        update_capital_costs(n, carrier, costs, df_multiplier)
+    # for carrier, multiplier_data in const.CAPEX_LOCATIONAL_MULTIPLIER.items():
+    #     if n.generators.query(f"carrier == '{carrier}'").empty:
+    #         continue
+    #     multiplier_file = snakemake.input[f"gen_cost_mult_{multiplier_data}"]
+    #     df_multiplier = pd.read_csv(multiplier_file)
+    #     df_multiplier = clean_locational_multiplier(df_multiplier)
+    #     update_capital_costs(n, carrier, costs, df_multiplier)
 
     if params.conventional["dynamic_fuel_price"].get("enable", False):
         logger.info("Applying dynamic fuel pricing to conventional generators")
@@ -1062,10 +1133,10 @@ def main(snakemake):
 
     # fix p_nom_min for extendable generators
     # The "- 0.001" is just to avoid numerical issues
-    n.generators["p_nom_min"] = n.generators.apply(
-        lambda x: ((x["p_nom"] - 0.001) if (x["p_nom_extendable"] and x["p_nom_min"] == 0) else x["p_nom_min"]),
-        axis=1,
-    )
+    # n.generators["p_nom_min"] = n.generators.apply(
+    #     lambda x: ((x["p_nom"] - 0.001) if (x["p_nom_extendable"] and x["p_nom_min"] == 0) else x["p_nom_min"]),
+    #     axis=1,
+    # )
 
     output_folder = os.path.dirname(snakemake.output[0]) + "/base_network"
     export_network_for_gis_mapping(n, output_folder)
@@ -1075,13 +1146,25 @@ def main(snakemake):
     n.meta = snakemake.config
 
     # n.export_to_netcdf(snakemake.output[0])
-    pickle.dump(n, open(snakemake.output[0], "wb"))
+    pickle.dump(n, open(snakemake.output.network, "wb"))
+
+    # Export derate data to CSV files
+    state_derates_df.to_csv(snakemake.output.state_derates, index=False)
+    national_derates_df.to_csv(snakemake.output.national_derates, index=False)
+
+    logger.info(f"Saved state derates to: {snakemake.output.state_derates}")
+    logger.info(f"Saved national derates to: {snakemake.output.national_derates}")
 
 
 if __name__ == "__main__":
     if "snakemake" not in globals():
         from _helpers import mock_snakemake
 
-        snakemake = mock_snakemake("add_electricity", interconnect="western")
+        snakemake = mock_snakemake(
+            "add_electricity",
+            interconnect="usa",
+            sector="SimpSec",
+            planning_horizons=[2050],
+        )
     configure_logging(snakemake)
     main(snakemake)

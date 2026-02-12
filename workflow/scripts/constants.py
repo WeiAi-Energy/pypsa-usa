@@ -15,14 +15,17 @@ GPS_CRS = "EPSG:4326"
 ###################
 
 # convert euros to USD
-EUR_2_USD = 1.07  # taken on 12-12-2023
+discount_rate = 0.07
+cpi = 0.03
 
+POWER_MAX = 1e6
+CO2_MAX = 1e9
 # energy content of natural gas
 # Assumes national averages for the conversion
 # https://www.eia.gov/naturalgas/monthly/pdf/table_25.pdf
 # (1036 BTU / CF) * (0.293 Wh / 1 BTU) * (1 MWh / 1,000,000 Wh) * (1,000,000 CF / 1 MMCF) = 303.5 MWh / MMCF
 
-NG_MWH_2_MMCF = 303.5  # MWh / MMCF
+NG_MWH_2_MMCF = 272.5  # MWh / MMCF (LHV)
 
 # $/MMBtu * (1 MMBtu / 0.293 MWh) = $/MWh_thermal
 NG_Dol_MMBTU_2_MWH = 3.4129
@@ -31,10 +34,13 @@ LBS_TON = 2000  # lbs/ short ton
 COAL_BTU_LB = 9396  # BTU/lb - EIA US AVERAGE TODO: differentiate between coal types
 MMBTU_MWHthemal = 3.4129  # MMBTU to MWh_thermal
 COAL_dol_ton_2_MWHthermal = LBS_TON**-1 * COAL_BTU_LB * 1000**-1 * MMBTU_MWHthemal  # $/ton * ton/BTU * BTU/MWh_thermal
+HHV_to_LHV_CH4 = 1.109
+HHV_to_LHV_H2 = 1.182
 
 # (TBTU) (1e6 MMBTU / TBTU) (MWh / MMBTU)
 TBTU_2_MWH = 1e6 * (1 / MMBTU_MWHthemal)
 
+leakage_rate = 0.014
 ################################
 # Constants for ADS WECC mapping
 ################################
@@ -602,7 +608,7 @@ ATB_TECH_MAPPER = {
         "display_name": "Biopower - Dedicated",
         "technology": "Biopower",
         "techdetail": "Dedicated",
-        "crp": 45,
+        "crp": 30,
     },
     "coal": {
         "display_name": "Coal-new",
@@ -668,13 +674,13 @@ ATB_TECH_MAPPER = {
         "display_name": "Nuclear - AP1000",
         "technology": "Nuclear",
         "techdetail": "Nuclear - Large",
-        "crp": 60,
+        "crp": 30,
     },
     "SMR": {  # small modular reactor
         "display_name": "Nuclear - Small Modular Reactor",
         "technology": "Nuclear",
         "techdetail": "Nuclear - Small",
-        "crp": 60,
+        "crp": 30,
     },
     "onwind": {
         "display_name": "Land-Based Wind - Class 4 - Technology 1",

@@ -843,3 +843,155 @@ def get_multiindex_snapshots(
             get_snapshots(sns_config).map(lambda x: x.replace(year=year)),
         )
     return pd.MultiIndex.from_arrays([sns.year, sns])
+
+
+def filter_network_by_lifetime(
+    n: pypsa.Network,
+    investment_period: int,
+) -> pypsa.Network:
+    """
+    Create a filtered copy of the network containing only active components.
+    Uses PyPSA's remove() method to properly handle both static and time-series data.
+
+    Args:
+        n: Original PyPSA Network object
+        investment_period: Investment period (year) for filtering
+
+    Returns
+    -------
+        Filtered PyPSA Network object with only active components
+
+    Filter condition: build_year <= investment_period < build_year + lifetime
+    """
+    active_n = n.copy()
+
+    # Define component mappings: (table_name, component_class_name)
+    component_mappings = [
+        ("generators", "Generator"),
+        ("links", "Link"),
+        ("stores", "Store"),
+        ("storage_units", "StorageUnit"),
+        ("lines", "Line"),
+    ]
+
+    # Remove inactive components using PyPSA's remove method
+    for table_name, component_class in component_mappings:
+        _remove_inactive_components(
+            active_n,
+            table_name,
+            component_class,
+            investment_period,
+        )
+
+    return active_n
+
+
+def _remove_inactive_components(
+    active_n: pypsa.Network,
+    table_name: str,
+    component_class: str,
+    investment_period: int,
+):
+    """
+    Remove inactive components from network using PyPSA's remove method.
+    This automatically handles both static and time-series data removal.
+
+    Args:
+        active_n: Network to modify
+        table_name: Name of component table (e.g., 'generators', 'links')
+        component_class: PyPSA component class name (e.g., 'Generator', 'Link')
+        investment_period: Investment period (year)
+    """
+    # Get the component table
+    component_df = getattr(active_n, table_name)
+
+    # Find components that should be removed (inactive components)
+    build_year = component_df["build_year"]
+    lifetime = component_df["lifetime"]
+
+    # Filter condition: build_year <= investment_period < build_year + lifetime
+    # Components to KEEP (active)
+    active_mask = (build_year <= investment_period) & (investment_period < build_year + lifetime)
+
+    # Components to REMOVE (inactive)
+    inactive_mask = ~active_mask
+    inactive_components = component_df[inactive_mask].index.tolist()
+
+    # Remove inactive components using PyPSA's remove method
+    for component_name in inactive_components:
+        active_n.remove(component_class, component_name)
+
+
+def get_currency_conversion_factor(year, currency="EUR"):
+    """
+    Get conversion factor from a given currency and year to 2022 USD (hard-coded version).
+
+    Parameters
+    ----------
+    year : int
+        The year of the original currency
+    currency : str, optional
+        Currency code ('EUR' or 'USD'), default is 'EUR'
+
+    Returns
+    -------
+    float
+        Conversion factor to convert from (currency, year) to 2022 USD
+    """
+    # --- Step 1. Hard-coded EUR/USD annual average rates (USD per EUR) ---
+    eur_usd_avg = {
+        2010: 1.3261,
+        2011: 1.3931,
+        2012: 1.2859,
+        2013: 1.3281,
+        2014: 1.3297,
+        2015: 1.1096,
+        2016: 1.1072,
+        2017: 1.1301,
+        2018: 1.1817,
+        2019: 1.1194,
+        2020: 1.1410,
+        2021: 1.1830,
+        2022: 1.0534,
+        2023: 1.0817,
+        2024: 1.0820,
+    }
+
+    # --- Step 2. Hard-coded U.S. CPI (2022=100, CPI-U All Urban Consumers) ---
+    cpi_us = {
+        2010: 74.5,
+        2011: 76.9,
+        2012: 78.5,
+        2013: 79.6,
+        2014: 80.9,
+        2015: 81.0,
+        2016: 82.0,
+        2017: 83.8,
+        2018: 85.8,
+        2019: 87.4,
+        2020: 88.4,
+        2021: 92.6,
+        2022: 100.0,
+        2023: 104.1,
+        2024: 107.2,
+    }
+
+    # Check year validity
+    if year not in cpi_us:
+        raise ValueError(f"Year {year} not in supported range (2010–2024).")
+
+    # --- Step 3. Currency conversion ---
+    if currency.upper() == "EUR":
+        exchange_rate = eur_usd_avg[year]  # USD per EUR
+    elif currency.upper() == "USD":
+        exchange_rate = 1.0
+    else:
+        raise ValueError(f"Unsupported currency: {currency}. Use 'EUR' or 'USD'.")
+
+    # --- Step 4. Inflation adjustment to 2022 USD ---
+    inflation_factor = cpi_us[2022] / cpi_us[year]
+
+    # --- Step 5. Combined conversion factor ---
+    conversion_factor = exchange_rate * inflation_factor
+
+    return conversion_factor

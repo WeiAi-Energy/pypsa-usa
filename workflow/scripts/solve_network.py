@@ -25,7 +25,7 @@ Additionally, some extra constraints specified in :mod:`solve_network` are added
 
 import copy
 import logging
-import re
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -35,28 +35,28 @@ import xarray as xr
 import yaml
 from _helpers import (
     configure_logging,
-    is_transport_model,
-    update_config_from_wildcards,
-    update_config_with_sector_opts,
+    load_costs,
 )
-from constants import NG_MWH_2_MMCF
+from constants import NG_MWH_2_MMCF, STATE_2_CODE
 from eia import Trade
+from pandas import Series
 from pypsa.descriptors import get_switchable_as_dense as get_as_dense
 
 logger = logging.getLogger(__name__)
-pypsa.pf.logger.setLevel(logging.WARNING)
+# pypsa.pf.logger.setLevel(logging.WARNING)
 
 
 def get_region_buses(n, region_list):
     return n.buses[
         (
             n.buses.country.isin(region_list)
-            | n.buses.reeds_zone.isin(region_list)
+            # | n.buses.reeds_zone.isin(region_list)
             | n.buses.reeds_state.isin(region_list)
             | n.buses.interconnect.str.lower().isin(region_list)
-            | n.buses.nerc_reg.isin(region_list)
+            # | n.buses.nerc_reg.isin(region_list)
             | (1 if "all" in region_list else 0)
         )
+        & (n.buses.carrier == "AC")
     ]
 
 
@@ -113,6 +113,785 @@ def filter_components(
     return filtered
 
 
+def _build_observation_matrix(multiplier_data_path: str) -> tuple[pd.DataFrame, pd.Index, pd.Index]:
+    """
+    Build sparse observation matrix for all technologies and states.
+
+    Returns
+    -------
+    Tuple[pd.DataFrame, pd.Index, pd.Index]
+        - obs_matrix: DataFrame with shape (n_files, n_states), NaN for missing
+        - file_index: Index of file names (technologies)
+        - state_index: Index of state codes
+    """
+    multiplier_path = Path(multiplier_data_path)
+
+    # Collect all observations
+    observations = []
+    for csv_file in multiplier_path.glob("*.csv"):
+        try:
+            df = pd.read_csv(csv_file)
+            if "Location Variation" not in df.columns:
+                continue
+
+            df = df[["State", "Location Variation"]].copy()
+            df["State"] = df["State"].map(STATE_2_CODE)
+            df = df.dropna(subset=["State", "Location Variation"])
+
+            df_grouped = df.groupby("State")["Location Variation"].mean()
+
+            observations.append(
+                {
+                    "file": csv_file.stem,
+                    "data": df_grouped,
+                }
+            )
+        except Exception:
+            continue
+
+    if not observations:
+        return pd.DataFrame(), pd.Index([]), pd.Index([])
+
+    # Build matrix
+    all_states = set()
+    for obs in observations:
+        all_states.update(obs["data"].index)
+
+    all_states = sorted(all_states)
+    all_files = [obs["file"] for obs in observations]
+
+    # Create sparse matrix
+    obs_matrix = pd.DataFrame(
+        index=pd.Index(all_files, name="file"),
+        columns=pd.Index(all_states, name="state"),
+        dtype=float,
+    )
+
+    for obs in observations:
+        file_name = obs["file"]
+        for state, value in obs["data"].items():
+            obs_matrix.loc[file_name, state] = value
+
+    return obs_matrix, obs_matrix.index, obs_matrix.columns
+
+
+def _fit_two_way_fixed_effects(
+    obs_matrix: pd.DataFrame,
+    max_iter: int = 100,
+    tol: float = 1e-6,
+) -> tuple[float, pd.Series, pd.Series]:
+    """
+    Fit two-way fixed effects model using Alternating Least Squares (ALS).
+
+    Model: x_{f,s} ≈ μ + α_f + β_s
+
+    Parameters
+    ----------
+    obs_matrix : pd.DataFrame
+        Observation matrix (files x states) with NaN for missing values
+    max_iter : int
+        Maximum ALS iterations
+    tol : float
+        Convergence tolerance
+
+    Returns
+    -------
+    Tuple[float, pd.Series, pd.Series]
+        - mu: global mean
+        - alpha: file/tech effects (indexed by file)
+        - beta: state effects (indexed by state)
+    """
+    # Initialize
+    mu = obs_matrix.stack().mean()  # Global mean of observed values
+    alpha = pd.Series(0.0, index=obs_matrix.index, name="tech_effect")
+    beta = pd.Series(0.0, index=obs_matrix.columns, name="state_effect")
+
+    for iteration in range(max_iter):
+        alpha_old = alpha.copy()
+        beta_old = beta.copy()
+
+        # Update alpha (file effects): α_f = mean_s(x_{f,s} - μ - β_s)
+        for file in obs_matrix.index:
+            row = obs_matrix.loc[file]
+            observed = row.dropna()
+            if len(observed) > 0:
+                residuals = observed - mu - beta[observed.index]
+                alpha[file] = residuals.mean()
+
+        # Update beta (state effects): β_s = mean_f(x_{f,s} - μ - α_f)
+        for state in obs_matrix.columns:
+            col = obs_matrix[state]
+            observed = col.dropna()
+            if len(observed) > 0:
+                residuals = observed - mu - alpha[observed.index]
+                beta[state] = residuals.mean()
+
+        # Check convergence
+        alpha_change = np.abs(alpha - alpha_old).max()
+        beta_change = np.abs(beta - beta_old).max()
+
+        if alpha_change < tol and beta_change < tol:
+            logger.info(f"Two-way FE converged in {iteration + 1} iterations")
+            break
+    else:
+        logger.warning(f"Two-way FE did not converge in {max_iter} iterations")
+
+    return mu, alpha, beta
+
+
+def _compute_z_scores_per_file(obs_matrix: pd.DataFrame) -> dict[str, pd.Series]:
+    """
+    Compute z-scores for each state within each file.
+
+    z_{f,s} = (x_{f,s} - μ_f) / σ_f
+
+    Returns
+    -------
+    Dict[str, pd.Series]
+        Dictionary mapping file name to Series of z-scores (indexed by state)
+    """
+    z_scores = {}
+
+    for file in obs_matrix.index:
+        row = obs_matrix.loc[file].dropna()
+        if len(row) > 1:
+            mean_f = row.mean()
+            std_f = row.std(ddof=1)
+            if std_f > 0:
+                z_scores[file] = (row - mean_f) / std_f
+
+    return z_scores
+
+
+def _aggregate_state_z_scores(z_scores: dict[str, pd.Series]) -> pd.Series:
+    """
+    Aggregate z-scores across files to get average state z-score.
+
+    Returns
+    -------
+    pd.Series
+        Mean z-score for each state across all files (states with data)
+    """
+    # Collect all z-scores
+    all_z = []
+    for file, zs in z_scores.items():
+        for state, z in zs.items():
+            all_z.append({"state": state, "z": z})
+
+    if not all_z:
+        return pd.Series(dtype=float)
+
+    df_z = pd.DataFrame(all_z)
+    # Average z-score for each state
+    mean_z = df_z.groupby("state")["z"].mean()
+    return mean_z
+
+
+def _compute_adaptive_weight(
+    target_file: str,
+    obs_matrix: pd.DataFrame,
+    z_scores: dict[str, pd.Series],
+) -> float:
+    """
+    Compute adaptive weight w ∈ [0, 1] for blending z-score and FE estimates.
+
+    Higher w → trust z-score method more (more data overlap with other files)
+    Lower w → trust FE method more (sparse data, rely on systematic effects)
+
+    Parameters
+    ----------
+    target_file : str
+        File name for which we're computing weight
+    obs_matrix : pd.DataFrame
+        Full observation matrix
+    z_scores : Dict[str, pd.Series]
+        Z-scores per file
+
+    Returns
+    -------
+    float
+        Weight w ∈ [0, 1]
+    """
+    if target_file not in obs_matrix.index:
+        return 0.5  # Default
+
+    # Count how many other files have overlapping states
+    target_states = set(obs_matrix.loc[target_file].dropna().index)
+
+    if len(target_states) == 0:
+        return 0.0  # No data, rely purely on FE
+
+    # Count states with z-score information from other files
+    states_with_z = set()
+    for file, zs in z_scores.items():
+        if file != target_file:
+            states_with_z.update(zs.index)
+
+    overlap = len(target_states & states_with_z)
+
+    # Weight based on overlap ratio
+    # More overlap → higher confidence in z-score method
+    w = overlap / len(target_states) if len(target_states) > 0 else 0.0
+
+    return w
+
+
+def _build_state_normalized_deviations_twoway(
+    multiplier_data_path: str,
+) -> tuple[Any, Any, float, Series, Series, Series]:
+    """
+    Build two-way fixed effects model and z-score information.
+
+    Returns
+    -------
+    Tuple containing:
+        - file_means: Dict[file] = μ_f (mean of each file)
+        - file_stds: Dict[file] = σ_f (std of each file)
+        - mu_global: Global mean
+        - alpha: Tech/file effects
+        - beta: State effects
+        - mean_z_scores: Average z-score per state across files
+    """
+    # Step 1: Build observation matrix
+    obs_matrix, file_idx, state_idx = _build_observation_matrix(multiplier_data_path)
+
+    if obs_matrix.empty:
+        return {}, {}, 1.0, pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float)
+
+    # Step 2: Fit two-way fixed effects
+    logger.info("Fitting two-way fixed effects model...")
+    mu_global, alpha, beta = _fit_two_way_fixed_effects(obs_matrix)
+
+    logger.info(
+        f"Global mean: {mu_global:.3f}, "
+        f"Tech effect range: [{alpha.min():.3f}, {alpha.max():.3f}], "
+        f"State effect range: [{beta.min():.3f}, {beta.max():.3f}]",
+    )
+
+    # Step 3: Compute z-scores per file
+    logger.info("Computing z-scores per file...")
+    z_scores = _compute_z_scores_per_file(obs_matrix)
+
+    # Step 4: Aggregate z-scores across files
+    mean_z_scores = _aggregate_state_z_scores(z_scores)
+
+    # Step 5: Compute file statistics for z-score method
+    file_means = obs_matrix.mean(axis=1).to_dict()
+    file_stds = obs_matrix.std(axis=1, ddof=1).to_dict()
+
+    return file_means, file_stds, mu_global, alpha, beta, mean_z_scores
+
+
+def clean_locational_multiplier_twoway(
+    df: pd.DataFrame,
+    file_means: dict[str, float],
+    file_stds: dict[str, float],
+    mu_global: float,
+    alpha: pd.Series,
+    beta: pd.Series,
+    mean_z_scores: pd.Series,
+    obs_matrix: pd.DataFrame,
+    csv_filename: str = None,
+) -> pd.DataFrame:
+    """
+    Clean and fill missing states using adaptive blending of z-score and FE methods.
+
+    Final estimate: x̂ = w·(μ_f + ẑ_s·σ_f) + (1-w)·(μ + α_f + β_s)
+    """
+    ALL_US_STATES = {
+        "AL",
+        "AZ",
+        "AR",
+        "CA",
+        "CO",
+        "CT",
+        "DE",
+        "FL",
+        "GA",
+        "ID",
+        "IL",
+        "IN",
+        "IA",
+        "KS",
+        "KY",
+        "LA",
+        "ME",
+        "MD",
+        "MA",
+        "MI",
+        "MN",
+        "MS",
+        "MO",
+        "MT",
+        "NE",
+        "NV",
+        "NH",
+        "NJ",
+        "NM",
+        "NY",
+        "NC",
+        "ND",
+        "OH",
+        "OK",
+        "OR",
+        "PA",
+        "RI",
+        "SC",
+        "SD",
+        "TN",
+        "TX",
+        "UT",
+        "VT",
+        "VA",
+        "WA",
+        "WV",
+        "WI",
+        "WY",
+    }
+
+    # Clean existing data
+    df_clean = df[["State", "Location Variation"]].copy()
+    df_clean["State"] = df_clean["State"].map(STATE_2_CODE)
+    df_clean = df_clean.dropna(subset=["State"])
+    df_grouped = df_clean.groupby("State").mean()
+
+    states_with_data = set(df_grouped.dropna(subset=["Location Variation"]).index)
+    missing_states = ALL_US_STATES - states_with_data
+
+    if not missing_states:
+        return df_grouped
+
+    if csv_filename not in file_means or csv_filename not in alpha.index:
+        # Fallback: no info for this file
+        logger.warning(f"{csv_filename}: No FE info available, using simple mean")
+        fallback = (
+            df_grouped["Location Variation"].dropna().mean()
+            if len(
+                df_grouped["Location Variation"].dropna(),
+            )
+            > 0
+            else 1.0
+        )
+        for state in missing_states:
+            df_grouped.loc[state, "Location Variation"] = fallback
+        return df_grouped
+
+    # Get file statistics
+    mu_f = file_means[csv_filename]
+    sigma_f = file_stds.get(csv_filename, 0.0)
+    alpha_f = alpha[csv_filename]
+
+    # Compute adaptive weight
+    w = _compute_adaptive_weight(
+        csv_filename,
+        obs_matrix,
+        _compute_z_scores_per_file(obs_matrix),
+    )
+
+    filled_count = 0
+    for state in missing_states:
+        # Method 1: z-score estimate
+        if state in mean_z_scores and sigma_f > 0:
+            z_hat = mean_z_scores[state]
+            x_hat_z = mu_f + z_hat * sigma_f
+        else:
+            x_hat_z = mu_f  # Fallback to file mean
+
+        # Method 2: Fixed effects estimate
+        if state in beta.index:
+            beta_s = beta[state]
+            x_hat_fe = mu_global + alpha_f + beta_s
+        else:
+            x_hat_fe = mu_global + alpha_f  # State effect unknown, use global + tech
+
+        # Adaptive blend
+        x_final = w * x_hat_z + (1 - w) * x_hat_fe
+
+        df_grouped.loc[state, "Location Variation"] = x_final
+        filled_count += 1
+
+    if filled_count > 0:
+        logger.info(
+            f"{csv_filename}: Filled {filled_count} states with adaptive blend "
+            f"(w={w:.2f}, μ_f={mu_f:.3f}, α_f={alpha_f:+.3f})",
+        )
+
+    return df_grouped
+
+
+def apply_regional_cost_multipliers(
+    n: pypsa.Network,
+    multiplier_data_path: str = "repo_data/locational_multipliers/",
+) -> None:
+    """
+    Apply regional multipliers using two-way fixed effects model.
+    """
+    logger.info("Applying regional cost multipliers with two-way FE model")
+
+    # Build two-way fixed effects model and z-scores
+    file_means, file_stds, mu_global, alpha, beta, mean_z_scores = _build_state_normalized_deviations_twoway(
+        multiplier_data_path
+    )
+
+    # Build observation matrix for adaptive weighting
+    obs_matrix, _, _ = _build_observation_matrix(multiplier_data_path)
+
+    # Define carrier to multiplier mapping
+    carrier_multiplier_map = {
+        # Generator
+        "hydro": ("hydro-100mw", ["Generator"]),
+        "nuclear": ("nuclear-1117mw", ["Generator"]),
+        "solar": ("spv-150mw", ["Generator"]),
+        "onwind": ("onshore-wind-200mw", ["Generator"]),
+        "offwind_floating": ("offshore-wind-40x10mw", ["Generator"]),
+        # Gas-related generation and links (mostly Links after sector coupling)
+        "OCGT": ("natural-gas-430mw-90ccs", ["Link"]),
+        "CCGT": ("natural-gas-430mw-90ccs", ["Link"]),
+        "CCGT-95CCS": ("natural-gas-430mw-90ccs", ["Link"]),
+        "CCGT-97CCS": ("natural-gas-430mw-90ccs", ["Link"]),
+        "acaes": ("natural-gas-430mw-90ccs", ["Link"]),
+        "tes": ("natural-gas-430mw-90ccs", ["Link"]),
+        "h2 turbine": ("natural-gas-430mw-90ccs", ["Link"]),
+        # Biomass-related (mostly Links after sector coupling)
+        "biomass": ("biomass-50mw", ["Link"]),
+        "biomass-CCS": ("biomass-50mw", ["Link"]),
+        # Coal-related (mostly Links after sector coupling)
+        "coal": ("coal-ultra-supercritical", ["Link"]),
+        "coal-95CCS": ("coal-ultra-supercritical-90ccs", ["Link"]),
+        "coal-99CCS": ("coal-ultra-supercritical-90ccs", ["Link"]),
+        # Battery storage (StorageUnits)
+        "2hr_battery_storage": ("battery-storage-4hr-50mw", ["StorageUnit"]),
+        "4hr_battery_storage": ("battery-storage-4hr-50mw", ["StorageUnit"]),
+        "6hr_battery_storage": ("battery-storage-4hr-50mw", ["StorageUnit"]),
+        "8hr_battery_storage": ("battery-storage-4hr-50mw", ["StorageUnit"]),
+        "10hr_battery_storage": ("battery-storage-4hr-50mw", ["StorageUnit"]),
+        "battery": ("battery-storage-4hr-50mw", ["StorageUnit"]),
+        "battery storage": ("battery-storage-4hr-50mw", ["StorageUnit"]),
+        # DAC and electrolyzer (Links)
+        "dac": ("fuel-cell-10mw", ["Link"]),
+        "h2 electrolysis": ("fuel-cell-10mw", ["Link"]),
+        "gas methanation": ("fuel-cell-10mw", ["Link"]),
+        "h2 smr": ("fuel-cell-10mw", ["Link"]),
+        "h2 smr-cc": ("fuel-cell-10mw", ["Link"]),
+        "h2 bio": ("fuel-cell-10mw", ["Link"]),
+        "h2 bio-cc": ("fuel-cell-10mw", ["Link"]),
+        "gas bio-cc": ("fuel-cell-10mw", ["Link"]),
+        # Pumped hydro storage and hydro
+        "8hr_PHS": ("hydro-100mw", ["StorageUnit"]),
+        "10hr_PHS": ("hydro-100mw", ["StorageUnit"]),
+        "12hr_PHS": ("hydro-100mw", ["StorageUnit"]),
+        "PHS": ("hydro-100mw", ["StorageUnit"]),
+    }
+
+    # Get bus to state mapping
+    bus_state_mapper = n.buses["STATE"].to_dict()
+
+    # Process each carrier across all component types
+    for carrier, (multiplier_file, component_types) in carrier_multiplier_map.items():
+        multiplier_path = Path(multiplier_data_path) / f"{multiplier_file}.csv"
+        if not multiplier_path.exists():
+            logger.warning(f"Multiplier file {multiplier_path} not found. Skipping {carrier}")
+            continue
+
+        df_multiplier = pd.read_csv(multiplier_path)
+
+        # Use two-way FE method to fill missing states
+        df_multiplier = clean_locational_multiplier_twoway(
+            df_multiplier,
+            file_means=file_means,
+            file_stds=file_stds,
+            mu_global=mu_global,
+            alpha=alpha,
+            beta=beta,
+            mean_z_scores=mean_z_scores,
+            obs_matrix=obs_matrix,
+            csv_filename=multiplier_file,
+        )
+
+        current_mean = df_multiplier["Location Variation"].mean()
+        if current_mean > 0:  # Avoid division by zero
+            df_multiplier["Location Variation"] = df_multiplier["Location Variation"] / current_mean
+            logger.info(
+                f"Normalized {carrier} multipliers: original mean={current_mean:.3f}, "
+                f"new mean={df_multiplier['Location Variation'].mean():.3f}",
+            )
+        else:
+            logger.warning(f"Cannot normalize {carrier} multipliers: mean is {current_mean}")
+
+        # Process Generators
+        if "Generator" in component_types:
+            gens = n.generators[n.generators.carrier == carrier]
+            if not gens.empty:
+                gen_copy = gens.copy()
+                gen_copy["state"] = gen_copy.bus.map(bus_state_mapper)
+                gen_copy = gen_copy[gen_copy["state"].isin(df_multiplier.index)]
+
+                for idx in gen_copy.index:
+                    state = gen_copy.at[idx, "state"]
+                    multiplier = df_multiplier.at[state, "Location Variation"]
+                    current_cost = n.generators.at[idx, "capital_cost"]
+                    n.generators.at[idx, "capital_cost"] = current_cost * multiplier
+
+                logger.info(f"Applied regional multipliers to {len(gen_copy)} {carrier} generators")
+
+        # Process Links
+        if "Link" in component_types:
+            links = n.links[n.links.carrier == carrier]
+            if not links.empty:
+                link_copy = links.copy()
+                link_copy["state"] = link_copy.bus1.map(bus_state_mapper)
+                link_copy = link_copy[link_copy["state"].isin(df_multiplier.index)]
+
+                for idx in link_copy.index:
+                    state = link_copy.at[idx, "state"]
+                    multiplier = df_multiplier.at[state, "Location Variation"]
+                    current_cost = n.links.at[idx, "capital_cost"]
+                    n.links.at[idx, "capital_cost"] = current_cost * multiplier
+
+                logger.info(f"Applied regional multipliers to {len(link_copy)} {carrier} links")
+
+        # Process StorageUnits
+        if "StorageUnit" in component_types:
+            storage = n.storage_units[n.storage_units.carrier == carrier]
+            if not storage.empty:
+                storage_copy = storage.copy()
+                storage_copy["state"] = storage_copy.bus.map(bus_state_mapper)
+                storage_copy = storage_copy[storage_copy["state"].isin(df_multiplier.index)]
+
+                for idx in storage_copy.index:
+                    state = storage_copy.at[idx, "state"]
+                    multiplier = df_multiplier.at[state, "Location Variation"]
+                    current_cost = n.storage_units.at[idx, "capital_cost"]
+                    n.storage_units.at[idx, "capital_cost"] = current_cost * multiplier
+
+                logger.info(f"Applied regional multipliers to {len(storage_copy)} {carrier} storage units")
+
+
+def recalculate_network_costs(n: pypsa.Network, costs: pd.DataFrame) -> None:
+    """
+    Recalculate capital costs for transmission lines, AC/DC links, gas pipelines, and H2 pipelines.
+
+    For HVDC links:
+    - Recalculates length and efficiency based on haversine distance
+    - Merges duplicate HVDC links between same state pairs
+    - Applies state multipliers ONLY to distance-related costs
+    - Inverter costs are NOT affected by state multipliers
+
+    For AC lines/links:
+    - Applies state multipliers to all capital costs
+
+    For gas, H2, CO2 pipelines:
+    - Applies same state multiplier approach as transmission links
+
+    Parameters
+    ----------
+    n : pypsa.Network
+        Network object to modify
+    costs : pd.DataFrame
+        Cost data containing transmission cost parameters
+
+    Reference
+    ---------
+    State multipliers based on: https://docs.nrel.gov/docs/fy21osti/78195.pdf Fig.26
+    """
+    logger.info("Recalculating network capital costs with state multipliers")
+
+    # ========================================================================
+    # State multiplier mapping
+    # ========================================================================
+    state_multipliers = {
+        # 3.89 multiplier - Highest cost states (Northeast)
+        "ME": 3.89,
+        "NH": 3.89,
+        "VT": 3.89,
+        "MA": 3.89,
+        "RI": 3.89,
+        "CT": 3.89,
+        "NJ": 3.89,
+        "DE": 3.89,
+        "MD": 3.89,
+        # 3.06 multiplier - High cost states
+        "CA": 3.06,
+        "NY": 3.06,
+        "PA": 3.06,
+        # 1.94 multiplier - Moderate-high cost states
+        "LA": 1.94,
+        "AR": 1.94,
+        "MS": 1.94,
+        # 1.5 multiplier - Moderate cost states
+        "AL": 1.5,
+        "AZ": 1.5,
+        "CO": 1.5,
+        "FL": 1.5,
+        "GA": 1.5,
+        "ID": 1.5,
+        "KY": 1.5,
+        "MT": 1.5,
+        "NM": 1.5,
+        "NV": 1.5,
+        "OH": 1.5,
+        "OR": 1.5,
+        "TX": 1.5,
+        "UT": 1.5,
+        "VA": 1.5,
+        "WA": 1.5,
+        "WV": 1.5,
+        "WY": 1.5,
+        # 1.17 multiplier - Low-moderate cost states
+        "MI": 1.17,
+        "WI": 1.17,
+        "TN": 1.17,
+        # 1.0 multiplier - Baseline (lowest cost states)
+        "ND": 1.0,
+        "SD": 1.0,
+        "MN": 1.0,
+        "NE": 1.0,
+        "IA": 1.0,
+        "IL": 1.0,
+        "IN": 1.0,
+        "MO": 1.0,
+        "KS": 1.0,
+        "OK": 1.0,
+    }
+
+    # Determine which column has state information
+    state_col = "STATE"
+
+    # ========================================================================
+    # Part 1: Process HVDC Links
+    # ========================================================================
+    hvdc_links = n.links[n.links.carrier == "DC"]
+
+    if not hvdc_links.empty:
+        logger.info(f"Processing {len(hvdc_links)} HVDC links")
+
+        # Ensure underwater_fraction column exists
+        if "underwater_fraction" not in n.links.columns:
+            n.links["underwater_fraction"] = 0.0
+
+        # Get cost parameters
+        hvdc_overhead_cost = costs.at["HVDC overhead", "annualized_capex_per_mw_km"]
+        hvdc_submarine_cost = costs.at["HVDC submarine", "annualized_capex_per_mw_km"]
+        hvdc_inverter_cost = costs.at["HVDC inverter pair", "annualized_capex_per_mw"]
+
+        for link_idx in hvdc_links.index:
+            link = n.links.loc[link_idx]
+
+            # Get states and multipliers
+            state0 = n.buses.at[link.bus0, state_col]
+            state1 = n.buses.at[link.bus1, state_col]
+            mult0 = state_multipliers.get(state0, 1.0)
+            mult1 = state_multipliers.get(state1, 1.0)
+            avg_multiplier = (mult0 + mult1) / 2.0
+
+            # Calculate distance-related cost (subject to state multiplier)
+            underwater_frac = link.underwater_fraction
+            distance_cost_per_mw = link.length * (
+                (1.0 - underwater_frac) * hvdc_overhead_cost + underwater_frac * hvdc_submarine_cost
+            )
+            distance_cost_adjusted = distance_cost_per_mw * avg_multiplier
+
+            # Inverter cost (NOT subject to state multiplier)
+            inverter_cost = hvdc_inverter_cost
+
+            # Total capital cost (divide by 2 for bidirectional links)
+            total_cost = (distance_cost_adjusted + inverter_cost) / 2
+
+            n.links.at[link_idx, "capital_cost"] = total_cost
+
+        logger.info(f"Recalculated costs for {len(hvdc_links)} HVDC links")
+
+    # ========================================================================
+    # Part 2: Process AC Lines
+    # ========================================================================
+    if not n.lines.empty:
+        logger.info(f"Processing {len(n.lines)} AC lines")
+        lines_updated = 0
+
+        for line_idx in n.lines.index:
+            line = n.lines.loc[line_idx]
+
+            state0 = n.buses.at[line.bus0, state_col]
+            state1 = n.buses.at[line.bus1, state_col]
+            mult0 = state_multipliers.get(state0, 1.0)
+            mult1 = state_multipliers.get(state1, 1.0)
+            avg_multiplier = (mult0 + mult1) / 2.0
+
+            if pd.notna(line.capital_cost) and line.capital_cost > 0:
+                old_cost = line.capital_cost
+                new_cost = old_cost * avg_multiplier
+                n.lines.at[line_idx, "capital_cost"] = new_cost
+                lines_updated += 1
+
+        logger.info(f"Updated costs for {lines_updated} AC lines")
+
+    # ========================================================================
+    # Part 3: Process AC Links
+    # ========================================================================
+    ac_links = n.links[n.links.carrier == "AC"]
+
+    if not ac_links.empty:
+        logger.info(f"Processing {len(ac_links)} AC links")
+        links_updated = 0
+
+        for link_idx in ac_links.index:
+            link = n.links.loc[link_idx]
+
+            state0 = n.buses.at[link.bus0, state_col]
+            state1 = n.buses.at[link.bus1, state_col]
+            mult0 = state_multipliers.get(state0, 1.0)
+            mult1 = state_multipliers.get(state1, 1.0)
+            avg_multiplier = (mult0 + mult1) / 2.0
+
+            if pd.notna(link.capital_cost) and link.capital_cost > 0:
+                old_cost = link.capital_cost
+                new_cost = old_cost * avg_multiplier
+                n.links.at[link_idx, "capital_cost"] = new_cost
+                links_updated += 1
+
+        logger.info(f"Updated costs for {links_updated} AC links")
+
+    # ========================================================================
+    # Part 4: Process Gas Pipelines and H2 Pipelines Retrofit (No change)
+    # ========================================================================
+    # https://static1.squarespace.com/static/5b1032e545776e01e7058845/t/5cb37389c830257d563c0034/1555264398511/02%2BPhase%2BII.pdf Table 5.3
+
+    # ========================================================================
+    # Part 5: Process new H2/CO2 Pipelines
+    # ========================================================================
+    new_pipeline_carriers = ["h2 pipeline new", "co2 pipeline new"]
+    new_pipelines = n.links[n.links.carrier.isin(new_pipeline_carriers)]
+
+    if not new_pipelines.empty:
+        logger.info(f"Processing {len(new_pipelines)} H2/CO2 pipelines")
+        pipes_updated = 0
+
+        for pipe_idx in new_pipelines.index:
+            pipe = n.links.loc[pipe_idx]
+
+            # Extract state from bus names (format: "STATE h2")
+            bus0_parts = pipe.bus0.split()
+            bus1_parts = pipe.bus1.split()
+
+            state0 = bus0_parts[0] if len(bus0_parts) > 0 else None
+            state1 = bus1_parts[0] if len(bus1_parts) > 0 else None
+
+            if state0 is None or state1 is None:
+                continue
+
+            mult0 = state_multipliers.get(state0, 1.0)
+            mult1 = state_multipliers.get(state1, 1.0)
+            avg_multiplier = (mult0 + mult1) / 2.0
+
+            if pd.notna(pipe.capital_cost) and pipe.capital_cost > 0:
+                old_cost = pipe.capital_cost
+                new_cost = old_cost * avg_multiplier
+                n.links.at[pipe_idx, "capital_cost"] = new_cost
+                pipes_updated += 1
+
+        logger.info(f"Updated costs for {pipes_updated} H2/CO2 pipelines")
+
+
 def add_land_use_constraints(n):
     """
     Adds constraint for land-use based on information from the generators
@@ -148,17 +927,106 @@ def add_land_use_constraints(n):
         )
 
 
+def add_bidirectional_link_constraints(n):
+    """
+    Add constraints for bidirectional links (transmission and H2 pipelines).
+
+    For pairs of extendable links with identical names except for 'fwd' and 'rev':
+    Add constraint: fwd.p_nom_opt - fwd.p_nom = rev.p_nom_opt - rev.p_nom
+
+    This ensures the two links model the same physical infrastructure.
+    """
+    # Get all extendable links
+    extendable_links = n.links[n.links.p_nom_extendable].copy()
+
+    # Find potential bidirectional link pairs
+    # These are links that contain either '_fwd' or '_rev' at the end of their names
+    bidirectional_candidates = extendable_links[
+        extendable_links.index.str.contains(r"_fwd$|_rev$", regex=True, case=True)
+    ]
+
+    if bidirectional_candidates.empty:
+        logger.info("No bidirectional link candidates found (no _fwd or _rev at the end of the names)")
+        return
+
+    # Group links by their base name (removing _fwd or _rev parts)
+    link_pairs = {}
+
+    for link_name in bidirectional_candidates.index:
+        if "_fwd" in link_name:
+            base_name = link_name.replace("_fwd", "", 1)
+            if base_name not in link_pairs:
+                link_pairs[base_name] = {}
+            link_pairs[base_name]["fwd"] = link_name
+        elif "_rev" in link_name:
+            base_name = link_name.replace("_rev", "", 1)
+            if base_name not in link_pairs:
+                link_pairs[base_name] = {}
+            link_pairs[base_name]["rev"] = link_name
+
+    # Filter to only complete pairs (both fwd and rev exist)
+    complete_pairs = {base_name: pair for base_name, pair in link_pairs.items() if "fwd" in pair and "rev" in pair}
+
+    if not complete_pairs:
+        logger.info("No complete bidirectional link pairs found")
+        # Log the incomplete pairs for infoging
+        incomplete_pairs = {k: v for k, v in link_pairs.items() if len(v) == 1}
+        if incomplete_pairs:
+            logger.info(f"Found {len(incomplete_pairs)} incomplete pairs:")
+            for base_name, pair in incomplete_pairs.items():
+                direction = list(pair.keys())[0]
+                link_name = list(pair.values())[0]
+                logger.info(f"  {base_name}: only {direction} link ({link_name})")
+        return
+
+    constraints_added = 0
+
+    for base_name, pair in complete_pairs.items():
+        fwd_link = pair["fwd"]
+        rev_link = pair["rev"]
+
+        # Get link properties
+        fwd_p_nom = n.links.loc[fwd_link, "p_nom"]
+        rev_p_nom = n.links.loc[rev_link, "p_nom"]
+
+        # Get optimization variables
+        fwd_p_nom_opt = n.model["Link-p_nom"].loc[fwd_link]
+        rev_p_nom_opt = n.model["Link-p_nom"].loc[rev_link]
+
+        # Add constraint: fwd.p_nom_opt - fwd.p_nom = rev.p_nom_opt - rev.p_nom
+        constraint_name = f"bidirectional_link_{base_name.replace(' ', '_').replace('-', '_')}"
+        lhs = fwd_p_nom_opt + rev_p_nom - fwd_p_nom - rev_p_nom_opt
+
+        n.model.add_constraints(
+            lhs == 0,
+            name=constraint_name,
+        )
+        constraints_added += 1
+
+    logger.info(f"Added {constraints_added} bidirectional link constraints")
+
+
 def prepare_network(
     n,
     solve_opts=None,
 ):
     if "clip_p_max_pu" in solve_opts:
-        for df in (
-            n.generators_t.p_max_pu,
-            n.generators_t.p_min_pu,
-            n.storage_units_t.inflow,
-        ):
-            df = df.where(df > solve_opts["clip_p_max_pu"], other=0.0)
+        clip_val = solve_opts["clip_p_max_pu"]
+
+        n.generators_t.p_max_pu = n.generators_t.p_max_pu.where(
+            n.generators_t.p_max_pu > clip_val,
+            other=0.0,
+        )
+
+        n.generators_t.p_min_pu = n.generators_t.p_min_pu.where(
+            n.generators_t.p_min_pu > clip_val,
+            other=0.0,
+        )
+
+        n.storage_units_t.inflow = n.storage_units_t.inflow.where(
+            n.storage_units_t.inflow > clip_val,
+            other=0.0,
+        )
 
     load_shedding = solve_opts.get("load_shedding")
     if load_shedding:
@@ -197,499 +1065,6 @@ def prepare_network(
         n.snapshot_weightings[:] = 8760.0 / nhours
 
     return n
-
-
-def add_technology_capacity_target_constraints(n, config):
-    """
-    Add Technology Capacity Target (TCT) constraint to the network.
-
-    Add minimum or maximum levels of generator nominal capacity per carrier for individual regions.
-    Each constraint can be designated for a specified planning horizon in multi-period models.
-    Opts and path for technology_capacity_targets.csv must be defined in config.yaml.
-    Default file is available at config/policy_constraints/technology_capacity_targets.csv.
-
-    Parameters
-    ----------
-    n : pypsa.Network
-    config : dict
-
-    Example
-    -------
-    scenario:
-        opts: [Co2L-TCT-24H]
-    electricity:
-        technology_capacity_target: config/policy_constraints/technology_capacity_target.csv
-    """
-    tct_data = pd.read_csv(config["electricity"]["technology_capacity_targets"])
-    if tct_data.empty:
-        return
-
-    for _, target in tct_data.iterrows():
-        planning_horizon = target.planning_horizon
-        region_list = [region_.strip() for region_ in target.region.split(",")]
-        carrier_list = [carrier_.strip() for carrier_ in target.carrier.split(",")]
-        region_buses = get_region_buses(n, region_list)
-
-        lhs_gens_ext = filter_components(
-            n=n,
-            component_type="Generator",
-            planning_horizon=planning_horizon,
-            carrier_list=carrier_list,
-            region_buses=region_buses.index,
-            extendable=True,
-        )
-        lhs_gens_existing = filter_components(
-            n=n,
-            component_type="Generator",
-            planning_horizon=planning_horizon,
-            carrier_list=carrier_list,
-            region_buses=region_buses.index,
-            extendable=False,
-        )
-
-        lhs_storage_ext = filter_components(
-            n=n,
-            component_type="StorageUnit",
-            planning_horizon=planning_horizon,
-            carrier_list=carrier_list,
-            region_buses=region_buses.index,
-            extendable=True,
-        )
-        lhs_storage_existing = filter_components(
-            n=n,
-            component_type="StorageUnit",
-            planning_horizon=planning_horizon,
-            carrier_list=carrier_list,
-            region_buses=region_buses.index,
-            extendable=False,
-        )
-
-        lhs_link_ext = filter_components(
-            n=n,
-            component_type="Link",
-            planning_horizon=planning_horizon,
-            carrier_list=carrier_list,
-            region_buses=region_buses.index,
-            extendable=True,
-        )
-        lhs_link_existing = filter_components(
-            n=n,
-            component_type="Link",
-            planning_horizon=planning_horizon,
-            carrier_list=carrier_list,
-            region_buses=region_buses.index,
-            extendable=False,
-        )
-
-        if region_buses.empty or (lhs_gens_ext.empty and lhs_storage_ext.empty and lhs_link_ext.empty):
-            continue
-
-        if not lhs_gens_ext.empty:
-            grouper_g = pd.concat(
-                [lhs_gens_ext.bus.map(n.buses.country), lhs_gens_ext.carrier],
-                axis=1,
-            ).rename_axis(
-                "Generator-ext",
-            )
-            lhs_g = n.model["Generator-p_nom"].loc[lhs_gens_ext.index].groupby(grouper_g).sum().rename(bus="country")
-        else:
-            lhs_g = None
-
-        if not lhs_storage_ext.empty:
-            grouper_s = pd.concat(
-                [lhs_storage_ext.bus.map(n.buses.country), lhs_storage_ext.carrier],
-                axis=1,
-            ).rename_axis(
-                "StorageUnit-ext",
-            )
-            lhs_s = n.model["StorageUnit-p_nom"].loc[lhs_storage_ext.index].groupby(grouper_s).sum()
-        else:
-            lhs_s = None
-
-        if not lhs_link_ext.empty:
-            grouper_l = pd.concat(
-                [lhs_link_ext.bus.map(n.buses.country), lhs_link_ext.carrier],
-                axis=1,
-            ).rename_axis(
-                "Link-ext",
-            )
-            lhs_l = n.model["Link-p_nom"].loc[lhs_link_ext.index].groupby(grouper_l).sum()
-        else:
-            lhs_l = None
-
-        if lhs_g is None and lhs_s is None and lhs_l is None:
-            continue
-        else:
-            gen = lhs_g.sum() if lhs_g else 0
-            lnk = lhs_l.sum() if lhs_l else 0
-            sto = lhs_s.sum() if lhs_s else 0
-
-        lhs = gen + lnk + sto
-
-        lhs_existing = lhs_gens_existing.p_nom.sum() + lhs_storage_existing.p_nom.sum() + lhs_link_existing.p_nom.sum()
-
-        if target["max"] == "existing":
-            target["max"] = round(lhs_existing, 2) + 0.01
-        else:
-            target["max"] = float(target["max"])
-
-        if target["min"] == "existing":
-            target["min"] = round(lhs_existing, 2) - 0.01
-        else:
-            target["min"] = float(target["min"])
-
-        if not np.isnan(target["min"]):
-            rhs = target["min"] - round(lhs_existing, 2)
-
-            n.model.add_constraints(
-                lhs >= rhs,
-                name=f"GlobalConstraint-{target.name}_{target.planning_horizon}_min",
-            )
-
-            logger.info(
-                f"Adding TCT Constraint: Name: {target.name}, Planning Horizon: {target.planning_horizon}, Region: {target.region}, Carrier: {target.carrier}, Min Value: {target['min']}, Min Value Adj: {rhs}",
-            )
-
-        if not np.isnan(target["max"]):
-            assert target["max"] >= lhs_existing, (
-                f"TCT constraint of {target['max']} MW for {target['carrier']} must be at least {lhs_existing}"
-            )
-
-            rhs = target["max"] - round(lhs_existing, 2)
-
-            n.model.add_constraints(
-                lhs <= rhs,
-                name=f"GlobalConstraint-{target.name}_{target.planning_horizon}_max",
-            )
-
-            logger.info(
-                f"Adding TCT Constraint: Name: {target.name}, Planning Horizon: {target.planning_horizon}, Region: {target.region}, Carrier: {target.carrier}, Max Value: {target['max']}, Max Value Adj: {rhs}",
-            )
-
-
-def add_RPS_constraints(n, sns, config, sector):
-    """
-    Add Renewable Portfolio Standards (RPS) constraints to the network.
-
-    This function enforces constraints on the percentage of electricity generation
-    from renewable energy sources for specific regions and planning horizons.
-    It reads the necessary data from configuration files and the network.
-
-    The differenct between electrical and sector implementation is:
-    - Electrical applies RPS against exogenously defined demand
-    - Sector applies RPS against endogenously solved power sector generation
-
-    Parameters
-    ----------
-    n : pypsa.Network
-        The PyPSA network object.
-    config : dict
-        A dictionary containing configuration settings and file paths.
-    sector: bool
-        Sector study
-    """
-
-    def process_reeds_data(filepath, carriers, value_col):
-        """Helper function to process RPS or CES REEDS data."""
-        reeds = pd.read_csv(filepath)
-
-        # Handle both wide and long formats
-        if "rps_all" not in reeds.columns:
-            reeds = reeds.melt(
-                id_vars="st",
-                var_name="planning_horizon",
-                value_name=value_col,
-            )
-
-        # Standardize column names
-        reeds = reeds.rename(
-            columns={"st": "region", "t": "planning_horizon", "rps_all": "pct"},
-        )
-        reeds["carrier"] = [", ".join(carriers)] * len(reeds)
-
-        # Extract and create new rows for `rps_solar` and `rps_wind`
-        additional_rows = []
-        for carrier_col, carrier_name in [
-            ("rps_solar", "solar"),
-            ("rps_wind", "onwind, offwind, offwind_floating"),
-        ]:
-            if carrier_col in reeds.columns:
-                temp = reeds[["region", "planning_horizon", carrier_col]].copy()
-                temp = temp.rename(columns={carrier_col: "pct"})
-                temp["carrier"] = carrier_name
-                additional_rows.append(temp)
-
-        # Combine original data with additional rows
-        if additional_rows:
-            additional_rows = pd.concat(additional_rows, ignore_index=True)
-            reeds = pd.concat([reeds, additional_rows], ignore_index=True)
-
-        # Ensure the final dataframe has consistent columns
-        reeds = reeds[["region", "planning_horizon", "carrier", "pct"]]
-        reeds = reeds[reeds["pct"] > 0.0]  # Remove any rows with zero or negative percentages
-
-        return reeds
-
-    # Read portfolio standards data
-    portfolio_standards = pd.read_csv(config["electricity"]["portfolio_standards"])
-
-    # Define carriers for RPS and CES
-    rps_carriers = [
-        "onwind",
-        "offwind",
-        "offwind_floating",
-        "solar",
-        "hydro",
-        "geothermal",
-        "biomass",
-        "EGS",
-    ]
-    ces_carriers = [*rps_carriers, "nuclear", "SMR"]
-
-    # Process RPS and CES REEDS data
-    rps_reeds = process_reeds_data(
-        snakemake.input.rps_reeds,
-        rps_carriers,
-        value_col="pct",
-    )
-    ces_reeds = process_reeds_data(
-        snakemake.input.ces_reeds,
-        ces_carriers,
-        value_col="pct",
-    )
-
-    # Concatenate all portfolio standards
-    portfolio_standards = pd.concat([portfolio_standards, rps_reeds, ces_reeds])
-    portfolio_standards = portfolio_standards[
-        (portfolio_standards.pct > 0.0)
-        & (portfolio_standards.planning_horizon.isin(sns.get_level_values(0)))
-        & (portfolio_standards.region.isin(n.buses.reeds_state.unique()))
-    ]
-
-    # Iterate through constraints and add RPS constraints to the model
-    for _, constraint_row in portfolio_standards.iterrows():
-        region_list = [region.strip() for region in constraint_row.region.split(",")]
-        region_buses = get_region_buses(n, region_list)
-
-        if region_buses.empty:
-            continue
-
-        carriers = [carrier.strip() for carrier in constraint_row.carrier.split(",")]
-
-        # Filter region generators
-        region_gens = n.generators[n.generators.bus.isin(region_buses.index)]
-        region_gens_eligible = region_gens[region_gens.carrier.isin(carriers)]
-
-        if region_gens_eligible.empty:
-            return
-
-        elif not sector:
-            # Eligible generation
-            p_eligible = n.model["Generator-p"].sel(
-                period=constraint_row.planning_horizon,
-                Generator=region_gens_eligible.index,
-            )
-            lhs = p_eligible.sum()
-
-            # Region demand
-            region_demand = (
-                n.loads_t.p_set.loc[
-                    constraint_row.planning_horizon,
-                    n.loads.bus.isin(region_buses.index),
-                ]
-                .sum()
-                .sum()
-            )
-
-            rhs = constraint_row.pct * region_demand
-
-        elif sector:
-            # generator power contributing
-            p_eligible = n.model["Generator-p"].sel(
-                period=constraint_row.planning_horizon,
-                Generator=region_gens_eligible.index,
-            )
-            # power level buses
-            pwr_buses = n.buses[(n.buses.carrier == "AC") & (n.buses.index.isin(region_buses.index))]
-            # links delievering power within the region
-            # removes any transmission links
-            pwr_links = n.links[(n.links.bus0.isin(pwr_buses.index)) & ~(n.links.bus1.isin(pwr_buses.index))]
-            region_demand = n.model["Link-p"].sel(period=constraint_row.planning_horizon, Link=pwr_links.index)
-
-            lhs = p_eligible.sum() - (constraint_row.pct * region_demand.sum())
-            rhs = 0
-
-        else:
-            logger.error("Undefined control flow for RPS constraint.")
-
-        # Add constraint
-        n.model.add_constraints(
-            lhs >= rhs,
-            name=f"GlobalConstraint-{constraint_row.name}_{constraint_row.planning_horizon}_rps_limit",
-        )
-        logger.info(
-            f"Added RPS {constraint_row.name} for {constraint_row.planning_horizon}.",
-        )
-
-
-def add_EQ_constraints(n, o, scaling=1e-1):
-    """
-    Add equity constraints to the network.
-
-    Currently this is only implemented for the electricity sector only.
-
-    Opts must be specified in the config.yaml.
-
-    Parameters
-    ----------
-    n : pypsa.Network
-    o : str
-
-    Example
-    -------
-    scenario:
-        opts: [Co2L-EQ0.7-24H]
-
-    Require each country or node to on average produce a minimal share
-    of its total electricity consumption itself. Example: EQ0.7c demands each country
-    to produce on average at least 70% of its consumption; EQ0.7 demands
-    each node to produce on average at least 70% of its consumption.
-    """
-    # TODO: Generalize to cover myopic and other sectors?
-    float_regex = r"[0-9]*\.?[0-9]+"
-    level = float(re.findall(float_regex, o)[0])
-    if o[-1] == "c":
-        ggrouper = n.generators.bus.map(n.buses.country)
-        lgrouper = n.loads.bus.map(n.buses.country)
-        sgrouper = n.storage_units.bus.map(n.buses.country)
-    else:
-        ggrouper = n.generators.bus
-        lgrouper = n.loads.bus
-        sgrouper = n.storage_units.bus
-    load = n.snapshot_weightings.generators @ n.loads_t.p_set.groupby(lgrouper, axis=1).sum()
-    inflow = n.snapshot_weightings.stores @ n.storage_units_t.inflow.groupby(sgrouper, axis=1).sum()
-    inflow = inflow.reindex(load.index).fillna(0.0)
-    rhs = scaling * (level * load - inflow)
-    p = n.model["Generator-p"]
-    lhs_gen = (p * (n.snapshot_weightings.generators * scaling)).groupby(ggrouper.to_xarray()).sum().sum("snapshot")
-    # TODO: double check that this is really needed, why do have to subtract the spillage
-    if not n.storage_units_t.inflow.empty:
-        spillage = n.model["StorageUnit-spill"]
-        lhs_spill = (
-            (spillage * (-n.snapshot_weightings.stores * scaling)).groupby(sgrouper.to_xarray()).sum().sum("snapshot")
-        )
-        lhs = lhs_gen + lhs_spill
-    else:
-        lhs = lhs_gen
-    n.model.add_constraints(lhs >= rhs, name="equity_min")
-
-
-def add_BAU_constraints(n, config):
-    """
-    Add a per-carrier minimal overall capacity.
-
-    BAU_mincapacities and opts must be adjusted in the config.yaml.
-
-    Parameters
-    ----------
-    n : pypsa.Network
-    config : dict
-
-    Example
-    -------
-    scenario:
-        opts: [Co2L-BAU-24H]
-    electricity:
-        BAU_mincapacities:
-            solar: 0
-            onwind: 0
-            OCGT: 100000
-            offwind-ac: 0
-            offwind-dc: 0
-    Which sets minimum expansion across all nodes e.g. in Europe to 100GW.
-    OCGT bus 1 + OCGT bus 2 + ... > 100000
-    """
-    mincaps = pd.Series(config["electricity"]["BAU_mincapacities"])
-    p_nom = n.model["Generator-p_nom"]
-    ext_i = n.generators.query("p_nom_extendable")
-    ext_carrier_i = xr.DataArray(ext_i.carrier.rename_axis("Generator-ext"))
-    lhs = p_nom.groupby(ext_carrier_i).sum()
-    index = mincaps.index.intersection(lhs.indexes["carrier"])
-    rhs = mincaps[index].rename_axis("carrier")
-    n.model.add_constraints(lhs >= rhs, name="bau_mincaps")
-
-
-def add_interface_limits(n, sns, config):
-    """
-    Adds interface transmission limits to constrain inter-regional transfer
-    capacities based on user-defined inter-regional transfer capacity limits.
-    """
-    logger.info("Adding Interface Transmission Limits.")
-    transport_model = is_transport_model(snakemake.params.transmission_network)
-    limits = pd.read_csv(snakemake.input.flowgates)
-    user_limits = pd.read_csv(
-        config["electricity"]["transmission_interface_limits"],
-    ).rename(
-        columns={
-            "region_1": "r",
-            "region_2": "rr",
-            "flow_12": "MW_f0",
-            "flow_21": "MW_r0",
-        },
-    )
-
-    limits = pd.concat([limits, user_limits])
-
-    for idx, interface in limits.iterrows():
-        regions_list_r = [region.strip() for region in interface.r.split(",")]
-        regions_list_rr = [region.strip() for region in interface.rr.split(",")]
-
-        zone0_buses = n.buses[n.buses.country.isin(regions_list_r)]
-        zone1_buses = n.buses[n.buses.country.isin(regions_list_rr)]
-        if zone0_buses.empty | zone1_buses.empty:
-            continue
-
-        logger.info(f"Adding Interface Transmission Limit for {interface.interface}")
-
-        interface_lines_b0 = n.lines[n.lines.bus0.isin(zone0_buses.index) & n.lines.bus1.isin(zone1_buses.index)]
-        interface_lines_b1 = n.lines[n.lines.bus0.isin(zone1_buses.index) & n.lines.bus1.isin(zone0_buses.index)]
-        interface_links_b0 = n.links[n.links.bus0.isin(zone0_buses.index) & n.links.bus1.isin(zone1_buses.index)]
-        interface_links_b1 = n.links[n.links.bus0.isin(zone1_buses.index) & n.links.bus1.isin(zone0_buses.index)]
-
-        if not n.lines.empty:
-            line_flows = n.model["Line-s"].loc[:, interface_lines_b1.index].sum(
-                dims="Line",
-            ) - n.model["Line-s"].loc[
-                :,
-                interface_lines_b0.index,
-            ].sum(
-                dims="Line",
-            )
-        else:
-            line_flows = 0.0
-        lhs = line_flows
-
-        if (
-            not (pd.concat([interface_links_b0, interface_links_b1]).empty)
-            and ("RESOLVE" in interface.interface or transport_model)
-            # Apply link constraints if RESOLVE constraint or if zonal model. ITLs
-            # should usually only apply to AC lines if DC PF is used.
-        ):
-            link_flows = n.model["Link-p"].loc[:, interface_links_b1.index].sum(
-                dims="Link",
-            ) - n.model["Link-p"].loc[
-                :,
-                interface_links_b0.index,
-            ].sum(
-                dims="Link",
-            )
-            lhs += link_flows
-
-        rhs_pos = interface.MW_f0 * -1
-        n.model.add_constraints(lhs >= rhs_pos, name=f"ITL_{interface.interface}_pos")
-
-        rhs_neg = interface.MW_r0
-        n.model.add_constraints(lhs <= rhs_neg, name=f"ITL_{interface.interface}_neg")
 
 
 def add_regional_co2limit(n, sns, config):
@@ -733,42 +1108,6 @@ def add_regional_co2limit(n, sns, config):
         lhs = (p_em * em_pu).sum()
         rhs = region_co2lim
 
-        # EF_imports = emmission_lim.get('import_emissions_factor')  # MT CO₂e/MWh_elec
-        # if EF_imports > 0.0:
-        #     # emissions imported = EF_imports * imports
-        #     # imports = Internal Demand - Internal Production
-        #     # Emissions imported = EF_imports * Internal Demand - EF_imports * Internal Production
-
-        #     # Full Constraint:
-        #     # Emissions Produced + Emissions Imported <= Emissions Limit
-        #     # Emissions Produced  - EF_imports * Internal Production  <= Emissions Limit - (EF_imports * Internal Demand)
-
-        #     # Internal Production
-        #     p_internal = (
-        #         n.model["Generator-p"]
-        #         .loc[:, region_gens.index]
-        #         .sel(period=planning_horizon)
-        #         .mul(weightings.generators.loc[planning_horizon])
-        #     )
-        #     lhs -= (p_internal * EF_imports).sum()
-
-        #     region_storage = n.storage_units[n.storage_units.bus.isin(region_buses.index)]
-        #     if not region_storage.empty:
-        #         p_store_discharge = (
-        #             n.model["StorageUnit-p_dispatch"]
-        #             .loc[:, region_storage.index]
-        #             .sel(period=planning_horizon)
-        #             .mul(weightings.stores.loc[planning_horizon])
-        #         )
-        #         lhs -= (p_store_discharge * EF_imports).sum()
-
-        #     # Internal Demand
-        #     region_loads = n.loads[n.loads.bus.isin(region_buses.index)]
-        #     region_demand = (
-        #         n.loads_t.p_set.loc[planning_horizon,region_loads.index].sum().sum()
-        #     )
-        #     rhs -= (region_demand * EF_imports)
-
         n.model.add_constraints(
             lhs <= rhs,
             name=f"GlobalConstraint-{emmission_lim.name}_{planning_horizon}co2_limit",
@@ -799,40 +1138,501 @@ def add_PRM_constraints(n, config):
 
     # Apply constraints for each region and planning horizon
     for _, prm in regional_prm.iterrows():
-        # Skip if no valid planning horizon or region
-        if prm.planning_horizon not in n.investment_periods:
-            continue
-
         region_list = [region_.strip() for region_ in prm.region.split(",")]
         region_buses = get_region_buses(n, region_list)
 
-        if region_buses.empty:
-            continue
-
-        # Calculate peak demand and required reserve margin
+        # Calculate required reserve margin
         regional_demand = _get_regional_demand(n, prm.planning_horizon, region_buses)
-        peak_demand = regional_demand.max()
-        planning_reserve = peak_demand * (1.0 + prm.prm)
+        total_regional_demand = regional_demand.sum(axis=1)
+        planning_reserve = total_regional_demand * (1.0 + prm.prm)
 
         # Get capacity contribution from resources
-        lhs_capacity, rhs_existing = _calculate_capacity_accredidation(
+        total_extendable_contribution, total_nonextendable_contribution = _calculate_capacity_accreditation(
             n,
             prm.planning_horizon,
             region_buses,
-            peak_demand_hour=regional_demand.idxmax(),
         )
+
+        # 2. StorageUnit Contribution (including nhr_battery_storage and PSH)
+        active_su = n.get_active_assets("StorageUnit", prm.planning_horizon)
+        region_su_mask = n.storage_units.bus.isin(region_buses.index)
+        regional_active_su = n.storage_units[region_su_mask & active_su]
+
+        extendable_su = regional_active_su[regional_active_su.p_nom_extendable]
+        nonextendable_su = regional_active_su[~regional_active_su.p_nom_extendable]
+
+        if not extendable_su.empty:
+            p_nom_su = n.model["StorageUnit-p_nom"].loc[extendable_su.index]
+            credit = pd.Series(1.0, index=extendable_su.index)
+            batt_mask = extendable_su.carrier.str.contains("battery")
+            credit.loc[batt_mask] = (extendable_su.loc[batt_mask, "max_hours"] / 4).clip(upper=1.0)
+            hours = n.snapshots.get_level_values(1)
+            credit_matrix = pd.DataFrame(
+                np.outer(np.ones(len(hours)), credit),
+                index=hours,
+                columns=extendable_su.index,
+            )
+            credit_matrix.T.index.name = "StorageUnit-ext"
+            total_extendable_contribution += (p_nom_su * credit_matrix).sum(dim="StorageUnit-ext")
+
+        if not nonextendable_su.empty:
+            p_nom_su = nonextendable_su.p_nom
+            credit = pd.Series(1.0, index=nonextendable_su.index)
+            batt_mask = nonextendable_su.carrier.str.contains("battery")
+            credit.loc[batt_mask] = (nonextendable_su.loc[batt_mask, "max_hours"] / 4).clip(upper=1.0)
+            credit.T.index.name = "StorageUnit-ext"
+            total_nonextendable_contribution += (p_nom_su * credit).sum()
+
+        # 3. Link Contribution (h2 turbine, acaes discharge, tes discharge)
+        link_carriers = ["h2 turbine", "acaes retrofit discharge", "acaes new discharge", "tes discharge"]
+        active_links = n.get_active_assets("Link", prm.planning_horizon)
+        region_links_mask = n.links.bus1.isin(region_buses.index)
+        carrier_mask = n.links.carrier.str.contains("|".join(link_carriers))
+        regional_active_links = n.links[region_links_mask & carrier_mask & active_links]
+
+        extendable_links = regional_active_links[regional_active_links.p_nom_extendable]
+        nonextendable_links = regional_active_links[~regional_active_links.p_nom_extendable]
+
+        # Process extendable links
+        if not extendable_links.empty:
+            p_nom_links = n.model["Link-p_nom"].loc[extendable_links.index]
+            discharge_efficiency = extendable_links.efficiency
+
+            # Check if links have time-varying p_max_pu
+            if (
+                hasattr(n, "links_t")
+                and "p_max_pu" in n.links_t
+                and any(link in n.links_t.p_max_pu.columns for link in extendable_links.index)
+            ):
+                # Get time-varying p_max_pu for links that have it
+                p_max_pu_links = get_as_dense(n, "Link", "p_max_pu", inds=extendable_links.index)
+                p_max_pu_links = p_max_pu_links.loc[prm.planning_horizon]
+
+                # Multiply efficiency by time-varying p_max_pu
+                discharge_efficiency_adj = p_max_pu_links.multiply(discharge_efficiency, axis=1)
+                discharge_efficiency_adj.T.index.name = "Link-ext"
+                total_extendable_contribution += (p_nom_links * discharge_efficiency_adj).sum(dim="Link-ext")
+            else:
+                # Use static efficiency if no time-varying p_max_pu
+                discharge_efficiency.T.index.name = "Link-ext"
+                total_extendable_contribution += (p_nom_links * discharge_efficiency).sum(dim="Link-ext")
+
+        # Process non-extendable links
+        if not nonextendable_links.empty:
+            p_nom_links = nonextendable_links.p_nom
+            discharge_efficiency = nonextendable_links.efficiency
+
+            # Check if links have time-varying p_max_pu
+            if (
+                hasattr(n, "links_t")
+                and "p_max_pu" in n.links_t
+                and any(link in n.links_t.p_max_pu.columns for link in nonextendable_links.index)
+            ):
+                # Get time-varying p_max_pu for links that have it
+                p_max_pu_links = get_as_dense(n, "Link", "p_max_pu", inds=nonextendable_links.index)
+                p_max_pu_links = p_max_pu_links.loc[prm.planning_horizon]
+
+                # Multiply efficiency by time-varying p_max_pu
+                discharge_efficiency_adj = p_max_pu_links.multiply(discharge_efficiency, axis=1)
+                total_nonextendable_contribution += (p_nom_links * discharge_efficiency_adj).sum(axis=1)
+            else:
+                # Use static efficiency if no time-varying p_max_pu
+                total_nonextendable_contribution += (p_nom_links * discharge_efficiency).sum()
 
         # Add the constraint to the model
         n.model.add_constraints(
-            lhs_capacity >= planning_reserve - rhs_existing,
+            total_extendable_contribution >= planning_reserve - total_nonextendable_contribution,
             name=f"GlobalConstraint-{prm.name}_{prm.planning_horizon}_PRM",
         )
+        # snapshots = n.snapshots.get_level_values(1)[n.snapshots.get_level_values(0) == prm.planning_horizon]
+        #
+        # for i, snapshot in enumerate(snapshots):
+        #     constraint_name = f"GlobalConstraint-{prm.name}_{prm.planning_horizon}_PRM_t{i:04d}"
+        #     lhs_t = lhs_capacity.sel(timestep=snapshot)
+        #
+        #     rhs_t = planning_reserve.iloc[i] - (rhs_existing.iloc[i] if hasattr(rhs_existing, 'iloc') else rhs_existing)
+        #
+        #     n.model.add_constraints(
+        #         lhs_t >= rhs_t,
+        #         name=constraint_name
+        #     )
 
         logger.info(
-            f"Added PRM constraint for {prm.name} in {prm.planning_horizon}: "
-            f"Peak demand: {peak_demand:.2f} MW, "
-            f"Required capacity: {planning_reserve:.2f} MW",
+            f"Added PRM constraint for {prm.name} in {prm.planning_horizon} for all time steps.",
         )
+
+
+def add_ERM_constraints(n, config):
+    """
+    Add Energy Reserve Margin (ERM) constraints for individual state buses.
+
+    This function enforces that each state has sufficient capacity to meet
+    demand plus a reserve margin at each timestep, considering storage
+    state of charge constraints and time-varying p_max_pu.
+
+    Modified to apply constraints at the state level rather than regional level.
+
+    The constraint is:
+    extendable_gen + storage_unit_reserve + nonstore_link_reserve + store_link_reserve
+    >= planning_reserve - non_extendable_gen
+
+    Parameters
+    ----------
+    n : pypsa.Network
+        The PyPSA network object
+    config : dict
+        Configuration dictionary containing ERM parameters
+    """
+    # Load regional ERM requirements (reuse PRM structure)
+    regional_erm = _get_combined_prm_requirements(n, config)
+
+    # Apply constraints for each region and planning horizon
+    for _, erm in regional_erm.iterrows():
+        region_list = [region_.strip() for region_ in erm.region.split(",")]
+        region_buses = get_region_buses(n, region_list)
+
+        # Get unique states within this region
+        states_in_region = region_buses["reeds_state"].dropna().unique()
+
+        logger.info(
+            f"Adding ERM constraints for {len(states_in_region)} states in region {erm.name} for planning horizon {erm.planning_horizon}",
+        )
+
+        # Apply ERM constraint to each state individually
+        for state in states_in_region:
+            # Get buses for this specific state
+            state_buses = region_buses[region_buses["reeds_state"] == state]
+
+            # Create unique identifier for this state-horizon combination
+            state_id = f"{state}_{erm.planning_horizon}".replace(" ", "_").replace("-", "_")
+
+            # Calculate required reserve margin for each timestep for this state
+            state_demand = _get_regional_demand(n, erm.planning_horizon, state_buses)
+            planning_reserve = state_demand.sum(axis=1) * (1.0 + erm.prm)  # Using prm field for ERM ratio
+
+            # Get capacity contribution from generators for this state
+            total_extendable_contribution, total_nonextendable_contribution = _calculate_capacity_accreditation(
+                n,
+                erm.planning_horizon,
+                state_buses,
+            )
+
+            # Get timesteps for this planning horizon
+            snapshots = n.snapshots.get_level_values(1)[n.snapshots.get_level_values(0) == erm.planning_horizon]
+
+            # 1. Storage Unit Reserve Variables and Constraints for this state
+            active_su = n.get_active_assets("StorageUnit", erm.planning_horizon)
+            state_su_mask = n.storage_units.bus.isin(state_buses.index)
+            state_active_su = n.storage_units[state_su_mask & active_su]
+
+            storage_unit_reserve_total = 0
+            if not state_active_su.empty:
+                # Add storage unit reserve variables with unique name for this state
+                storage_reserve_coords = [state_active_su.index, snapshots]
+                storage_var_name = f"storage_unit_reserve_{state_id}"
+                n.model.add_variables(
+                    coords=storage_reserve_coords,
+                    name=storage_var_name,
+                )
+                storage_unit_reserve = n.model[storage_var_name]
+
+                # Constraints for storage unit reserve
+                for su in state_active_su.index:
+                    if state_active_su.loc[su, "p_nom_extendable"]:
+                        p_nom_su = n.model["StorageUnit-p_nom"].loc[su]
+                    else:
+                        p_nom_su = state_active_su.loc[su, "p_nom"]
+
+                    # storage_unit_reserve <= p_nom_opt
+                    n.model.add_constraints(
+                        storage_unit_reserve.loc[su, :] <= p_nom_su,
+                        name=f"ERM_storage_reserve_capacity_{su.replace(' ', '_')}_{state_id}",
+                    )
+
+                    # storage_unit_reserve / efficiency_dispatch <= e
+                    e_su = n.model["StorageUnit-state_of_charge"].loc[erm.planning_horizon, su]
+                    efficiency_dispatch = state_active_su.loc[su, "efficiency_dispatch"]
+
+                    n.model.add_constraints(
+                        storage_unit_reserve.loc[su, :] / efficiency_dispatch - e_su <= 0,
+                        name=f"ERM_storage_reserve_soc_{su.replace(' ', '_')}_{state_id}",
+                    )
+
+                storage_unit_reserve_total = storage_unit_reserve.sum(dim="StorageUnit")
+
+            # 2. Store Link Reserve Variables and Constraints (for ACAES/TES discharge links) for this state
+            ldes_carriers = ["acaes retrofit", "acaes new", "tes"]
+            active_links = n.get_active_assets("Link", erm.planning_horizon)
+            # bus1 is in state and bus0 is not in state
+            state_links_mask = n.links.bus1.isin(state_buses.index) & ~n.links.bus0.isin(state_buses.index)
+            ldes_mask = n.links.carrier.isin(ldes_carriers)
+            state_ldes_links = n.links[state_links_mask & ldes_mask & active_links]
+
+            store_link_reserve_total = 0
+            if not state_ldes_links.empty:
+                # Add store link reserve variables with unique name for this state
+                store_reserve_coords = [state_ldes_links.index, snapshots]
+                store_var_name = f"store_link_reserve_{state_id}"
+                n.model.add_variables(
+                    coords=store_reserve_coords,
+                    name=store_var_name,
+                    lower=0,
+                )
+                store_link_reserve = n.model[store_var_name]
+
+                # Constraints for store link reserve
+                for link in state_ldes_links.index:
+                    if state_ldes_links.loc[link, "p_nom_extendable"]:
+                        p_nom_link = n.model["Link-p_nom"].loc[link]
+                    else:
+                        p_nom_link = state_ldes_links.loc[link, "p_nom"]
+
+                    efficiency_link = state_ldes_links.loc[link, "efficiency"]
+
+                    # store_link_reserve <= p_nom_opt * efficiency_link
+                    n.model.add_constraints(
+                        store_link_reserve.loc[link, :] <= p_nom_link * efficiency_link,
+                        name=f"ERM_store_link_capacity_{link.replace(' ', '_')}_{state_id}",
+                    )
+
+                    # store_link_reserve / efficiency_link <= e
+                    # Find the connected store from bus0
+                    store_bus = state_ldes_links.loc[link, "bus0"]
+                    # Find store connected to this bus
+                    connected_stores = n.stores[n.stores.bus == store_bus]
+                    if not connected_stores.empty:
+                        store_name = connected_stores.index[0]  # Assume one store per bus
+                        e_store = n.model["Store-e"].loc[erm.planning_horizon, store_name]
+
+                        n.model.add_constraints(
+                            store_link_reserve.loc[link, :] / efficiency_link - e_store <= 0,
+                            name=f"ERM_store_link_soc_{link.replace(' ', '_')}_{state_id}",
+                        )
+
+                store_link_reserve_total = store_link_reserve.sum(dim="Link")
+
+            # 3. Non-store Link Contributions for this state
+            state_other_links = n.links[state_links_mask & ~ldes_mask & active_links]
+            nonstore_link_reserve_total = 0
+            if not state_other_links.empty:
+                extendable_other_links = state_other_links[state_other_links.p_nom_extendable]
+                nonextendable_other_links = state_other_links[~state_other_links.p_nom_extendable]
+
+                # Process extendable links
+                if not extendable_other_links.empty:
+                    p_nom_other_links = n.model["Link-p_nom"].loc[extendable_other_links.index]
+                    efficiency_other = extendable_other_links.efficiency
+                    p_max_pu_other = extendable_other_links.p_max_pu
+
+                    # Check for time-varying p_max_pu for extendable links
+                    if hasattr(n, "links_t") and "p_max_pu" in n.links_t:
+                        timevar_links = [
+                            link for link in extendable_other_links.index if link in n.links_t.p_max_pu.columns
+                        ]
+                        static_links = [
+                            link for link in extendable_other_links.index if link not in n.links_t.p_max_pu.columns
+                        ]
+
+                        total_contribution = 0
+
+                        # Process time-varying links
+                        if timevar_links:
+                            timevar_links_index = pd.Index(timevar_links)
+                            p_max_pu_timevar = get_as_dense(n, "Link", "p_max_pu", inds=timevar_links_index)
+                            p_max_pu_timevar = p_max_pu_timevar.loc[erm.planning_horizon]
+
+                            p_nom_timevar = p_nom_other_links.loc[timevar_links]
+                            efficiency_timevar = efficiency_other.loc[timevar_links]
+
+                            # Ensure proper indexing for vectorized operations
+                            efficiency_timevar.index.name = "Link-ext"
+
+                            # First calculate efficiency * p_max_pu for each link and timestep
+                            # This creates a DataFrame with shape (timesteps, links)
+                            efficiency_p_max_pu = p_max_pu_timevar.multiply(efficiency_timevar, axis=1)
+
+                            # Convert to xarray with proper coordinates for linopy operations
+                            efficiency_p_max_pu_xr = xr.DataArray(
+                                efficiency_p_max_pu.values.T,  # Transpose to get (links, timesteps)
+                                coords=[timevar_links, efficiency_p_max_pu.index],
+                                dims=["Link-ext", "timestep"],
+                            )
+
+                            # Now multiply with p_nom_timevar and sum over links
+                            timevar_contribution = (p_nom_timevar * efficiency_p_max_pu_xr).sum(dim="Link-ext")
+                            total_contribution += timevar_contribution
+
+                        # Process static links (no time-varying p_max_pu)
+                        if static_links:
+                            p_nom_static = p_nom_other_links.loc[static_links]
+                            efficiency_static = efficiency_other.loc[static_links]
+                            p_max_pu_static = p_max_pu_other.loc[static_links]
+                            efficiency_static.index.name = "Link-ext"
+                            p_max_pu_static.index.name = "Link-ext"
+                            static_contribution = (p_nom_static * efficiency_static * p_max_pu_static).sum(
+                                dim="Link-ext"
+                            )
+                            total_contribution += static_contribution
+
+                        nonstore_link_reserve_total += total_contribution
+                    else:
+                        # Original logic if no time-varying p_max_pu exists
+                        efficiency_other.index.name = "Link-ext"
+                        p_max_pu_other.index.name = "Link-ext"
+                        nonstore_link_reserve_total += (p_nom_other_links * efficiency_other * p_max_pu_other).sum(
+                            dim="Link-ext"
+                        )
+
+                # Process non-extendable links
+                if not nonextendable_other_links.empty:
+                    p_nom_other_links = nonextendable_other_links.p_nom
+                    efficiency_other = nonextendable_other_links.efficiency
+                    p_max_pu_other = nonextendable_other_links.p_max_pu
+
+                    # Check if links have time-varying p_max_pu
+                    if hasattr(n, "links_t") and "p_max_pu" in n.links_t:
+                        timevar_links = [
+                            link for link in nonextendable_other_links.index if link in n.links_t.p_max_pu.columns
+                        ]
+                        static_links = [
+                            link for link in nonextendable_other_links.index if link not in n.links_t.p_max_pu.columns
+                        ]
+
+                        # Process time-varying links
+                        if timevar_links:
+                            timevar_links_index = pd.Index(timevar_links)
+                            p_max_pu_timevar = get_as_dense(n, "Link", "p_max_pu", inds=timevar_links_index)
+                            p_max_pu_timevar = p_max_pu_timevar.loc[erm.planning_horizon]
+
+                            p_nom_timevar = p_nom_other_links.loc[timevar_links]
+                            efficiency_timevar = efficiency_other.loc[timevar_links]
+
+                            # Multiply efficiency by time-varying p_max_pu for each timestep
+                            efficiency_p_max_pu = p_max_pu_timevar.multiply(efficiency_timevar, axis=1)
+                            timevar_contribution = (p_nom_timevar * efficiency_p_max_pu).sum(axis=1)
+                            nonstore_link_reserve_total += timevar_contribution
+
+                        # Process static links
+                        if static_links:
+                            p_nom_static = p_nom_other_links.loc[static_links]
+                            efficiency_static = efficiency_other.loc[static_links]
+                            p_max_pu_static = p_max_pu_other.loc[static_links]
+                            static_contribution = (p_nom_static * efficiency_static * p_max_pu_static).sum()
+                            nonstore_link_reserve_total += static_contribution
+                    else:
+                        # Original logic if no time-varying p_max_pu exists
+                        nonstore_link_reserve_total += (p_nom_other_links * efficiency_other * p_max_pu_other).sum()
+
+            # 4. Line Contributions for this state
+            active_lines = n.get_active_assets("Line", erm.planning_horizon)
+
+            # Lines that connect to the state (at least one end in state, one end potentially outside)
+            supply_lines_mask = (n.lines.bus0.isin(state_buses.index) | n.lines.bus1.isin(state_buses.index)) & ~(
+                n.lines.bus0.isin(state_buses.index) & n.lines.bus1.isin(state_buses.index)
+            )
+
+            state_supply_lines = n.lines[supply_lines_mask & active_lines]
+
+            extendable_lines = state_supply_lines[state_supply_lines.s_nom_extendable]
+            nonextendable_lines = state_supply_lines[~state_supply_lines.s_nom_extendable]
+
+            line_extendable_contribution = 0
+            line_nonextendable_contribution = 0
+
+            # --- Extendable Lines ---
+            if not extendable_lines.empty:
+                ext_s_nom = n.model["Line-s_nom"].loc[extendable_lines.index]
+                ext_s_max_pu = extendable_lines.s_max_pu
+                ext_s_max_pu.index.name = "Line-ext"
+
+                line_extendable_contribution = (ext_s_nom * ext_s_max_pu).sum(dim="Line-ext")
+
+            # --- Non-Extendable Lines ---
+            if not nonextendable_lines.empty:
+                non_ext_s_nom = nonextendable_lines.s_nom
+                non_ext_s_max_pu = nonextendable_lines.s_max_pu
+
+                line_nonextendable_contribution = (non_ext_s_nom * non_ext_s_max_pu).sum()
+
+            # 5. Add the main ERM constraint for this state for ALL timesteps at once (vectorized)
+            constraint_name = f"ERM_Constraint_{state}_{erm.planning_horizon}"
+
+            # Left hand side: all capacity contributions across all timesteps
+            lhs_capacity = (
+                total_extendable_contribution
+                + line_extendable_contribution
+                + storage_unit_reserve_total
+                + store_link_reserve_total
+                + nonstore_link_reserve_total
+            )
+
+            # Right hand side: demand plus reserve minus non-extendable capacity for all timesteps
+            rhs = planning_reserve - total_nonextendable_contribution - line_nonextendable_contribution
+
+            # Add vectorized constraint for all timesteps at once
+            n.model.add_constraints(
+                lhs_capacity >= rhs,
+                name=constraint_name,
+            )
+
+
+STATE_TO_NERC_REGION = {
+    # NPCC
+    "ME": "NPCC_NE",
+    "NH": "NPCC_NE",
+    "VT": "NPCC_NE",
+    "MA": "NPCC_NE",
+    "RI": "NPCC_NE",
+    "CT": "NPCC_NE",
+    "NY": "NPCC_NY",
+    # PJM
+    "PA": "PJM",
+    "NJ": "PJM",
+    "DE": "PJM",
+    "MD": "PJM",
+    "OH": "PJM",
+    "WV": "PJM",
+    # MISO
+    "MI": "MISO",
+    "WI": "MISO",
+    "MN": "MISO",
+    "IA": "MISO",
+    "IL": "MISO",
+    "IN": "MISO",
+    "MO": "MISO",
+    "ND": "MISO",
+    "SD": "MISO",
+    # SERC
+    "KY": "SERC",
+    "VA": "SERC",
+    "NC": "SERC",
+    "SC": "SERC",
+    "TN": "SERC",
+    "GA": "SERC",
+    "AL": "SERC",
+    "MS": "SERC",
+    "FL": "SERC",
+    "AR": "SERC",
+    "LA": "SERC",
+    # SPP
+    "KS": "SPP",
+    "OK": "SPP",
+    "NE": "SPP",
+    # ERCOT
+    "TX": "ERCOT",
+    # WECC
+    "WA": "WECC_NWPP",
+    "OR": "WECC_NWPP",
+    "ID": "WECC_NWPP",
+    "MT": "WECC_NWPP",
+    "WY": "WECC_NWPP",
+    "UT": "WECC_NWPP",
+    "CA": "WECC_CA",
+    "NV": "WECC_SRSG",
+    "AZ": "WECC_SRSG",
+    "CO": "WECC_SRSG",
+    "NM": "WECC_SRSG",
+}
 
 
 def _get_combined_prm_requirements(n, config):
@@ -850,25 +1650,21 @@ def _get_combined_prm_requirements(n, config):
         Combined PRM requirements with columns: name, region, prm, planning_horizon
     """
     # Load user-defined PRM requirements
-    regional_prm = pd.read_csv(
-        config["electricity"]["SAFE_regional_reservemargins"],
-        index_col=[0],
-    )
+    # regional_prm = pd.read_csv(
+    #     config["electricity"]["SAFE_regional_reservemargins"],
+    #     index_col=[0],
+    # )
 
     # Process ReEDS PRM data if available
     try:
         reeds_prm = pd.read_csv(snakemake.input.safer_reeds, index_col=[0])
 
-        # Map NERC regions to ReEDS zones
-        nerc_memberships = (
-            n.buses.groupby("nerc_reg")["reeds_zone"]
-            .apply(
-                lambda x: ", ".join(x),
-            )
-            .to_dict()
+        buses_df = n.buses[n.buses.carrier == "AC"].copy()
+        buses_df["nerc_reg"] = buses_df["STATE"].map(STATE_TO_NERC_REGION)
+        nerc_to_states_map = (
+            buses_df.groupby("nerc_reg")["STATE"].unique().apply(lambda x: ", ".join(sorted(x))).to_dict()
         )
-
-        reeds_prm["region"] = reeds_prm.index.map(nerc_memberships)
+        reeds_prm["region"] = reeds_prm.index.map(nerc_to_states_map)
         reeds_prm = reeds_prm.dropna(subset="region")
         reeds_prm = reeds_prm.drop(
             columns=["none", "ramp2025_20by50", "ramp2025_25by50", "ramp2025_30by50"],
@@ -876,7 +1672,8 @@ def _get_combined_prm_requirements(n, config):
         reeds_prm = reeds_prm.rename(columns={"static": "prm", "t": "planning_horizon"})
 
         # Combine both data sources
-        regional_prm = pd.concat([regional_prm, reeds_prm])
+        # regional_prm = pd.concat([regional_prm, reeds_prm])
+        regional_prm = reeds_prm
     except (FileNotFoundError, AttributeError):
         logger.info("ReEDS PRM data not available, using only user-defined PRM values")
 
@@ -904,442 +1701,223 @@ def _get_regional_demand(n, planning_horizon, region_buses):
     return n.loads_t.p_set.loc[
         planning_horizon,
         n.loads.bus.isin(region_buses.index),
-    ].sum(axis=1)
+    ]
 
 
-#  n.loads_t.p_set.loc[planning_horizon, n.loads.bus.isin(region_buses.index)].sum(axis=1)
-def _calculate_capacity_accredidation(n, planning_horizon, region_buses, peak_demand_hour):
+def _calculate_capacity_accreditation(n, planning_horizon, region_buses):
     """
-    Calculate capacity contribution from all resources in a region at the peak demand hour.
-
-    This function accounts for:
-    1. Extendable resources with appropriate capacity credit
-    2. Non-extendable existing resources
-
-    Parameters
-    ----------
-    n : pypsa.Network
-    planning_horizon : int or str
-    region_buses : pd.DataFrame
-    peak_demand_hour : pd.Timestamp
-        Hour of peak demand used for calculating capacity credits
-
-    Returns
-    -------
-    float or xarray.DataArray
-        Total firm capacity contribution
+    Calculate capacity accreditation for generators, storage units, and links.
     """
-    # Get active generators during this planning period
+    # Initialize total contributions as linopy expressions or floats
+    extendable_contribution = 0
+    nonextendable_contribution = 0
+
+    # 1. Generator Contribution
     active_gens = n.get_active_assets("Generator", planning_horizon)
-    extendable_gens = n.generators.p_nom_extendable
-    region_gens = n.generators.bus.isin(region_buses.index)
+    region_gens_mask = n.generators.bus.isin(region_buses.index)
+    regional_active_gens = n.generators[region_gens_mask & active_gens]
 
-    # Extendable capacity with capacity credit
-    region_active_ext_gens = region_gens & active_gens & extendable_gens
-    region_active_ext_gens = n.generators[region_active_ext_gens]
+    extendable_gens = regional_active_gens[regional_active_gens.p_nom_extendable]
+    nonextendable_gens = regional_active_gens[~regional_active_gens.p_nom_extendable]
 
-    if not region_active_ext_gens.empty:
-        ext_p_nom = n.model["Generator-p_nom"].loc[region_active_ext_gens.index]
-        ext_p_max_pu = get_as_dense(
-            n,
-            "Generator",
-            "p_max_pu",
-            inds=region_active_ext_gens.index,
-        ).loc[
-            planning_horizon,
-            peak_demand_hour,
-        ]
+    # --- Extendable Generators ---
+    if not extendable_gens.empty:
+        ext_p_nom = n.model["Generator-p_nom"].loc[extendable_gens.index]
+        ext_p_max_pu = get_as_dense(n, "Generator", "p_max_pu", inds=extendable_gens.index)
+        ext_p_max_pu = ext_p_max_pu.loc[planning_horizon]
+        ext_p_max_pu.T.index.name = "Generator-ext"
 
-        ext_contribution = ext_p_nom * ext_p_max_pu.values
-    else:
-        ext_contribution = 0
+        extendable_contribution += (ext_p_nom * ext_p_max_pu).sum(dim="Generator-ext")
 
-    # Non-extendable existing capacity
-    region_active_nonext_gens = region_gens & active_gens & ~extendable_gens
-    region_active_nonext_gens = n.generators[region_active_nonext_gens]
+    # --- Non-Extendable Generators ---
+    if not nonextendable_gens.empty:
+        non_ext_p_nom = nonextendable_gens.p_nom
+        non_ext_p_max_pu = get_as_dense(n, "Generator", "p_max_pu", inds=nonextendable_gens.index)
+        non_ext_p_max_pu = non_ext_p_max_pu.loc[planning_horizon]
 
-    if not region_active_nonext_gens.empty:
-        non_ext_p_max_pu = get_as_dense(
-            n,
-            "Generator",
-            "p_max_pu",
-            inds=region_active_nonext_gens.index,
-        ).loc[
-            planning_horizon,
-            peak_demand_hour,
-        ]
-        non_ext_p_nom = region_active_nonext_gens.p_nom
-        non_ext_contribution = (non_ext_p_nom * non_ext_p_max_pu).sum()
-    else:
-        non_ext_contribution = 0
+        nonextendable_contribution += (non_ext_p_nom * non_ext_p_max_pu).sum(axis=1)
 
-    return ext_contribution.sum(), non_ext_contribution
+    return extendable_contribution, nonextendable_contribution
 
 
-def add_operational_reserve_margin(n, sns, config):
+def add_co2_constraints(n, config, reference_network_path=None):
     """
-    Build reserve margin constraints based on the formulation given in
-    https://genxproject.github.io/GenX/dev/core/#Reserves.
+    Adds national CO2 constraints based on NZA emission scenarios.
 
-    Parameters
-    ----------
-        n : pypsa.Network
-        sns: pd.DatetimeIndex
-        config : dict
+    When only_power is enabled, applies a carbon price (from reference network's
+    co2 bus marginal prices) to the objective function instead of an emission cap.
 
-    Example:
-    --------
-    config.yaml requires to specify operational_reserve:
-    operational_reserve: # like https://genxproject.github.io/GenX/dev/core/#Reserves
-        activate: true
-        epsilon_load: 0.02 # percentage of load at each snapshot
-        epsilon_vres: 0.02 # percentage of VRES at each snapshot
-        contingency: 400000 # MW
-    """
-    reserve_config = config["electricity"]["operational_reserve"]
-    eps_load = reserve_config["epsilon_load"]
-    eps_vres = reserve_config["epsilon_vres"]
-    contingency = reserve_config["contingency"]
-
-    # Reserve Variables
-    n.model.add_variables(
-        0,
-        np.inf,
-        coords=[sns, n.generators.index],
-        name="Generator-r",
-    )
-    reserve = n.model["Generator-r"]
-    summed_reserve = reserve.sum("Generator")
-
-    # Share of extendable renewable capacities
-    ext_i = n.generators.query("p_nom_extendable").index
-    vres_i = n.generators_t.p_max_pu.columns
-    if not ext_i.empty and not vres_i.empty:
-        capacity_factor = n.generators_t.p_max_pu[vres_i.intersection(ext_i)]
-        p_nom_vres = n.model["Generator-p_nom"].loc[vres_i.intersection(ext_i)].rename({"Generator-ext": "Generator"})
-        lhs = summed_reserve + (p_nom_vres * (-eps_vres * capacity_factor)).sum(
-            "Generator",
-        )
-    else:  # if no extendable VRES
-        lhs = summed_reserve
-
-    # Total demand per t
-    demand = get_as_dense(n, "Load", "p_set").sum(axis=1)
-
-    # VRES potential of non extendable generators
-    capacity_factor = n.generators_t.p_max_pu[vres_i.difference(ext_i)]
-    renewable_capacity = n.generators.p_nom[vres_i.difference(ext_i)]
-    potential = (capacity_factor * renewable_capacity).sum(axis=1)
-
-    # Right-hand-side
-    rhs = eps_load * demand + eps_vres * potential + contingency
-
-    n.model.add_constraints(lhs >= rhs, name="reserve_margin")
-
-    # additional constraint that capacity is not exceeded
-    gen_i = n.generators.index
-    ext_i = n.generators.query("p_nom_extendable").index
-    fix_i = n.generators.query("not p_nom_extendable").index
-
-    dispatch = n.model["Generator-p"]
-    reserve = n.model["Generator-r"]
-
-    capacity_fixed = n.generators.p_nom[fix_i]
-
-    p_max_pu = get_as_dense(n, "Generator", "p_max_pu")
-
-    if not ext_i.empty:
-        capacity_variable = n.model["Generator-p_nom"].rename(
-            {"Generator-ext": "Generator"},
-        )
-        lhs = dispatch + reserve - capacity_variable * p_max_pu[ext_i]
-    else:
-        lhs = dispatch + reserve
-
-    rhs = (p_max_pu[fix_i] * capacity_fixed).reindex(columns=gen_i, fill_value=0)
-
-    n.model.add_constraints(lhs <= rhs, name="Generator-p-reserve-upper")
-
-
-def add_demand_response_constraint(n, config, sector_study):
-    """Add demand response capacity constraint."""
-
-    def add_capacity_constraint(
-        n: pypsa.Network,
-        shift: float,  # per_unit
-    ):
-        """Add limit on deferable load. No need for snapshot weights."""
-        dr_links = n.links[n.links.carrier == "demand_response"].copy()
-
-        if dr_links.empty:
-            logger.info("No demand response links identified.")
-            return
-
-        deferrable_links = dr_links[dr_links.index.str.endswith("-discharger")]
-        deferrable_loads = n.loads[n.loads.bus.isin(deferrable_links.bus1)]
-
-        lhs = n.model["Link-p"].loc[:, deferrable_links.index].groupby(deferrable_links.bus1).sum()
-        rhs = n.loads_t["p_set"][deferrable_loads.index].mul(shift).round(2)
-        rhs.columns.name = "bus1"
-        rhs = rhs.rename(columns={x: x.strip(" AC") for x in rhs})
-
-        # force rhs to be same order as lhs
-        # idk why but coordinates were not aligning and this gets around that
-        bus_order = lhs.vars.bus1.data
-        rhs = rhs[bus_order.tolist()]
-
-        n.model.add_constraints(lhs <= rhs.T, name="demand_response_capacity")
-
-    def add_sector_capacity_constraint(
-        n: pypsa.Network,
-        shift: float,  # per_unit
-    ):
-        """Add limit on deferable load. No need for snapshot weights."""
-        dr_links = n.links[n.links.carrier == "demand_response"].copy()
-
-        if dr_links.empty:
-            logger.info("No demand response links identified.")
-            return
-
-        inflow_links = dr_links[dr_links.index.str.endswith("-discharger")]
-        inflow = n.model["Link-p"].loc[:, inflow_links.index].groupby(inflow_links.bus1).sum()
-        inflow = inflow.rename({"bus1": "Bus"})  # align coordinate names
-
-        outflow_links = n.links[n.links.bus0.isin(inflow_links.bus1) & ~n.links.carrier.str.endswith("-dr")]
-        outflow = n.model["Link-p"].loc[:, outflow_links.index].groupby(outflow_links.bus0).sum()
-        outflow = outflow.rename({"bus0": "Bus"})  # align coordinate names
-
-        lhs = outflow.mul(shift) - inflow
-        rhs = 0
-
-        n.model.add_constraints(
-            lhs >= rhs,
-            name="demand_response_capacity",
-        )
-
-    dr_config = config["electricity"].get("demand_response", {})
-
-    shift = dr_config.get("shift", 0)
-
-    # seperate, as the electrical constraint can directly apply to the load,
-    # while the sector constraint has to apply to the power flows out of the bus
-    if sector_study:
-        fn = add_sector_capacity_constraint
-    else:
-        fn = add_capacity_constraint
-
-    if isinstance(shift, str):
-        if shift == "inf":
-            pass
-        else:
-            logger.error(f"Unknown arguement of {shift} for DR")
-            raise ValueError(shift)
-    elif isinstance(shift, int | float):
-        if shift < 0.001:
-            logger.info("Demand response not enabled")
-        else:
-            fn(n, shift)
-    else:
-        logger.error(f"Unknown arguement of {shift} for DR")
-        raise ValueError(shift)
-
-
-def add_sector_co2_constraints(n, config):
-    """
-    Adds sector co2 constraints.
+    This is a simplified version of add_sector_co2_constraints that only
+    considers national-level total carbon emission constraints.
 
     Parameters
     ----------
         n : pypsa.Network
         config : dict
+        reference_network_path : str, optional
+            Path to reference network for extracting carbon prices (only_power mode)
     """
 
-    def apply_state_limit(n: pypsa.Network, year: int, state: str, value: float, sector: str | None = None):
-        if sector:
-            stores = n.stores[
-                (n.stores.index.str.startswith(state))
-                & ((n.stores.index.str.endswith(f"{sector}-co2")) | (n.stores.index.str.endswith(f"{sector}-ch4")))
-            ].index
-            name = f"GlobalConstraint-co2_limit-{year}-{state}-{sector}"
-            log_statement = f"Adding {state} {sector} co2 Limit in {year} of"
-        else:
-            stores = n.stores[
-                (n.stores.index.str.startswith(state))
-                & ((n.stores.index.str.endswith("-co2")) | (n.stores.index.str.endswith("-ch4")))
-            ].index
-            name = f"GlobalConstraint-co2_limit-{year}-{state}"
-            log_statement = f"Adding {state} co2 Limit in {year} of"
+    def apply_national_co2_limit(n: pypsa.Network, year: int, value: float):
+        """
+        Apply national CO2 limit for the specified year.
+        For every snapshot, sum of co2 and ch4 must be less than limit.
+        """
+        # Find all CO2 and CH4 stores at national level (no state prefix filtering)
+        stores = n.stores[(n.stores.index.str.endswith("co2 atmosphere")) | (n.stores.index.str.endswith("ch4"))].index
 
-        lhs = n.model["Store-e"].loc[:, stores].sum(dim="Store")
+        name = f"co2_limit-{year}"
+        log_statement = f"Adding national co2 Limit in {year} of"
+
+        # Apply constraint to final snapshot (cumulative emissions)
+        lhs = n.model["Store-e"].loc[:, stores].sel(snapshot=n.snapshots[-1]).sum(dim="Store")
         rhs = value  # value in T CO2
 
         n.model.add_constraints(lhs <= rhs, name=name)
 
         logger.info(f"{log_statement} {rhs * 1e-6} MMT CO2")
 
-    def apply_national_limit(n: pypsa.Network, year: int, value: float, sector: str | None = None):
-        """For every snapshot, sum of co2 and ch4 must be less than limit."""
-        if sector:
-            stores = n.stores[
-                ((n.stores.index.str.endswith(f"{sector}-co2")) | (n.stores.index.str.endswith(f"{sector}-ch4")))
-            ].index
-            name = f"co2_limit-{year}-{sector}"
-            log_statement = f"Adding national {sector} co2 Limit in {year} of"
-        else:
-            stores = n.stores[((n.stores.index.str.endswith("-co2")) | (n.stores.index.str.endswith("-ch4")))].index
-            name = f"co2_limit-{year}"
-            log_statement = f"Adding national co2 Limit in {year} of"
+    def apply_carbon_price_from_reference_network(n: pypsa.Network, reference_network_path: str):
+        """
+        Extract carbon price from reference network and add penalties to objective function.
 
-        lhs = n.model["Store-e"].loc[:, stores].sum(dim="Store")
-        rhs = value  # value in T CO2
+        This function:
+        1. Loads the reference network
+        2. Extracts carbon price from co2 bus marginal prices
+        3. Adds carbon_price * final_co2_emissions to the objective function
 
-        n.model.add_constraints(lhs <= rhs, name=name)
+        Parameters
+        ----------
+        n : pypsa.Network
+            Current network to modify
+        reference_network_path : str
+            Path to the reference solved network
+        """
+        # Load the reference network
+        n_ref = pypsa.Network(reference_network_path)
 
-        logger.info(f"{log_statement} {rhs * 1e-6} MMT CO2")
+        # ========== Extract and apply carbon price ==========
+        # Extract CO2 marginal prices from the reference network's co2 buses
+        co2_buses = n_ref.buses[n_ref.buses.carrier == "co2"].index
 
+        # Get co2 atmosphere buses
+        co2_atmosphere_buses = [b for b in co2_buses if "atmosphere" in b]
+
+        # Get the marginal price from buses_t.marginal_price
+        co2_marginal_prices = n_ref.buses_t.marginal_price[co2_atmosphere_buses]
+
+        # Take the mean across all states and time periods
+        carbon_price = -co2_marginal_prices.mean().mean()
+
+        # Find all CO2 atmosphere stores in current network
+        co2_atmosphere_stores = n.stores[n.stores.index.str.endswith("co2 atmosphere")].index
+
+        # Get final snapshot
+        final_snapshot = n.snapshots[-1]
+
+        # Get CO2 storage levels at final timestep
+        final_co2_levels = n.model["Store-e"].loc[final_snapshot, co2_atmosphere_stores]
+
+        # Add carbon price penalty to objective
+        # Positive carbon_price penalizes emissions (positive storage in atmosphere)
+        carbon_penalty = carbon_price * final_co2_levels.sum()
+
+        # Modify objective function
+        n.model.objective.expression += carbon_penalty
+
+        logger.info(
+            f"Added carbon price penalty of {carbon_price:.2f} USD/tCO2 to objective function "
+            f"for {len(co2_atmosphere_stores)} CO2 atmosphere stores at final timestep",
+        )
+
+    # Check if only_power mode is enabled
+    only_power_enabled = config.get("sector", {}).get("only_power", {}).get("enable", False)
+
+    if only_power_enabled:
+        logger.info("Only power mode enabled - applying carbon price to objective function instead of emission cap")
+        apply_carbon_price_from_reference_network(n, reference_network_path)
+        return
+
+    # Try to get the CO2 policy file path from config
     try:
-        f = config["sector"]["co2"]["policy"]
+        base_policy_path = config["sector"]["co2"]["policy"]
+
+        # If only_power is enabled, use the power-specific emissions file
+        if only_power_enabled:
+            # Replace nza_emissions.csv with nza_emissions_power.csv
+            f = base_policy_path.replace("nza_emissions.csv", "nza_emissions_power.csv")
+            logger.info(f"Only power mode enabled - using power-specific emission caps: {f}")
+        else:
+            f = base_policy_path
+
     except KeyError:
         logger.error("No co2 policy constraint file found")
         return
 
-    df = pd.read_csv(f)
+    # Read the NZA emissions CSV file
+    try:
+        df = pd.read_csv(f)
+    except FileNotFoundError:
+        logger.error(f"CO2 policy file not found: {f}")
+        return
 
     if df.empty:
-        logger.warning("No co2 policies applied")
+        logger.warning("No co2 policies applied - CSV file is empty")
         return
 
-    sectors = df.sector.unique()
-
-    for sector in sectors:
-        df_sector = df[df.sector == sector]
-        states = df_sector.state.unique()
-
-        for state in states:
-            df_state = df_sector[df_sector.state == state]
-            years = [x for x in df_state.year.unique() if x in n.investment_periods]
-
-            if not years:
-                logger.warning(
-                    f"No co2 policies applied for {sector} due to no defined years",
-                )
-                continue
-
-            for year in years:
-                df_limit = df_state[df_state.year == year].reset_index(drop=True)
-                assert df_limit.shape[0] == 1
-
-                # results calcualted in T CO2, policy given in MMT CO2
-                value = df_limit.loc[0, "co2_limit_mmt"] * 1e6
-
-                if state.lower() == "all":
-                    if sector == "all":
-                        apply_national_limit(n, year, value)
-                    else:
-                        apply_national_limit(n, year, value, sector)
-                else:
-                    if sector == "all":
-                        apply_state_limit(n, year, state, value)
-                    else:
-                        apply_state_limit(n, year, state, value, sector)
-
-
-def add_cooling_heat_pump_constraints(n, config):
-    """
-    Adds constraints to the cooling heat pumps.
-
-    These constraints allow HPs to be used to meet both heating and cooling
-    demand within a single timeslice while respecting capacity limits.
-    Since we are aggregating (and not modelling individual units)
-    this should be fine.
-
-    Two seperate constraints are added:
-    - Constrains the cooling HP capacity to equal the heating HP capacity. Since the
-    cooling hps do not have a capital cost, this will not effect objective cost
-    - Constrains the total generation of Heating and Cooling HPs at each time slice
-    to be less than or equal to the max generation of the heating HP. Note, that both
-    the cooling and heating HPs have the same COP
-    """
-
-    def add_hp_capacity_constraint(n, hp_type):
-        assert hp_type in ("ashp", "gshp")
-
-        heating_hps = n.links[n.links.index.str.endswith(hp_type)].index
-        if heating_hps.empty:
-            return
-        cooling_hps = n.links[n.links.index.str.endswith(f"{hp_type}-cool")].index
-
-        assert len(heating_hps) == len(cooling_hps)
-
-        lhs = n.model["Link-p_nom"].loc[heating_hps] - n.model["Link-p_nom"].loc[cooling_hps]
-        rhs = 0
-
-        n.model.add_constraints(lhs == rhs, name=f"Link-{hp_type}_cooling_capacity")
-
-    def add_hp_generation_constraint(n, hp_type):
-        heating_hps = n.links[n.links.index.str.endswith(hp_type)].index
-        if heating_hps.empty:
-            return
-        cooling_hps = n.links[n.links.index.str.endswith(f"{hp_type}-cooling")].index
-
-        heating_hp_p = n.model["Link-p"].loc[:, heating_hps]
-        cooling_hp_p = n.model["Link-p"].loc[:, cooling_hps]
-
-        heating_hps_cop = n.links_t["efficiency"][heating_hps]
-        cooling_hps_cop = n.links_t["efficiency"][cooling_hps]
-
-        heating_hps_gen = heating_hp_p.mul(heating_hps_cop)
-        cooling_hps_gen = cooling_hp_p.mul(cooling_hps_cop)
-
-        lhs = heating_hps_gen + cooling_hps_gen
-
-        heating_hp_p_nom = n.model["Link-p_nom"].loc[heating_hps]
-        max_gen = heating_hp_p_nom.mul(heating_hps_cop)
-
-        rhs = max_gen
-
-        n.model.add_constraints(lhs <= rhs, name=f"Link-{hp_type}_cooling_generation")
-
-    for hp_type in ("ashp", "gshp"):
-        add_hp_capacity_constraint(n, hp_type)
-        add_hp_generation_constraint(n, hp_type)
-
-
-def add_gshp_capacity_constraint(n, config):
-    """
-    Constrains gshp capacity based on population and ashp installations.
-
-    This constraint should be added if rural/urban sectors are combined into
-    a single total area. In this case, we need to constrain how much gshp capacity
-    can be added to the system.
-
-    For example:
-    - If ratio is 0.75 urban and 0.25 rural
-    - We want to enforce that at max, only 0.33 unit of GSHP can be installed for every unit of ASHP
-    - The constraint is: [ASHP - (urban / rural) * GSHP >= 0]
-    - ie. for every unit of GSHP, we need to install 3 units of ASHP
-    """
-    pop = pd.read_csv(snakemake.input.pop_layout)
-    pop["urban_rural_fraction"] = (pop.urban_fraction / pop.rural_fraction).round(2)
-    fraction = pop.set_index("name")["urban_rural_fraction"].to_dict()
-
-    ashp = n.links[n.links.index.str.endswith("ashp")].copy()
-    gshp = n.links[n.links.index.str.endswith("gshp")].copy()
-    if gshp.empty:
+    # Get the NZA scenario from config
+    try:
+        nza_scenario = config["scenario"]["nza_scenario"]
+    except KeyError:
+        logger.error("No nza_scenario specified in config. Please add config['scenario']['nza_scenario']")
+        logger.info(f"Available scenarios: {df.scenario.unique().tolist()}")
         return
 
-    assert len(ashp) == len(gshp)
+    # Filter for the specified scenario
+    df_scenario = df[df.scenario == nza_scenario]
 
-    gshp["urban_rural_fraction"] = gshp.bus0.map(fraction)
+    if df_scenario.empty:
+        logger.error(f"No data found for scenario: {nza_scenario}")
+        logger.info(f"Available scenarios: {df.scenario.unique().tolist()}")
+        return
 
-    ashp_capacity = n.model["Link-p_nom"].loc[ashp.index]
-    gshp_capacity = n.model["Link-p_nom"].loc[gshp.index]
-    gshp_multiplier = gshp["urban_rural_fraction"]
+    # Filter for years that exist in the network's investment periods
+    # For 2050 specifically as requested
+    target_years = [year for year in df_scenario.year.unique() if year in n.investment_periods]
 
-    lhs = ashp_capacity - gshp_capacity.mul(gshp_multiplier.values)
-    rhs = 0
+    if not target_years:
+        logger.warning("No matching years found between scenario data and network investment periods")
+        logger.info(f"Scenario years: {df_scenario.year.unique().tolist()}")
+        logger.info(f"Network investment periods: {n.investment_periods}")
+        return
 
-    n.model.add_constraints(lhs >= rhs, name="Link-gshp_capacity_ratio")
+    # Get emission cap reduction from adj_scenario (if any)
+    emission_cap_reduction = getattr(n, "adj_scenario_emission_reduction", 0.0)
+
+    # Apply constraints for each year
+    for year in target_years:
+        df_year = df_scenario[df_scenario.year == year].reset_index(drop=True)
+
+        if df_year.empty:
+            continue
+
+        # Get the emission cap (in MMT CO2)
+        emission_cap = df_year.loc[0, "emission_cap"]
+
+        # Apply adjustment from adj_scenario
+        # emission_cap_reduction is in ton CO2, convert to match units
+        adjusted_emission_cap = emission_cap * 1e6 - emission_cap_reduction
+
+        if emission_cap_reduction > 0:
+            logger.info(
+                f"Adjusting emission cap for {year}: "
+                f"{emission_cap * 1e6:.2f} - {emission_cap_reduction:.2f} = {adjusted_emission_cap:.2f} ton CO2",
+            )
+
+        # Apply the national constraint with adjusted cap
+        apply_national_co2_limit(n, year, adjusted_emission_cap)
+
+    logger.info(f"Applied CO2 constraints for scenario '{nza_scenario}' using data from {f}")
 
 
 def add_ng_import_export_limits(n, config):
@@ -1481,181 +2059,738 @@ def add_ng_import_export_limits(n, config):
         add_export_limits(n, trade, "max", export_max)
 
 
-def add_water_heater_constraints(n, config):
-    """Adds constraint so energy to meet water demand must flow through store."""
-    links = n.links[(n.links.index.str.contains("-water-")) & (n.links.index.str.contains("-discharger"))]
-
-    link_names = links.index
-    store_names = [x.replace("-discharger", "") for x in links.index]
-
-    for period in n.investment_periods:
-        # first snapshot does not respect constraint
-        e_previous = n.model["Store-e"].loc[period, store_names]
-        e_previous = e_previous.roll(timestep=1)
-        e_previous = e_previous.mul(n.snapshot_weightings.stores.loc[period])
-
-        p_current = n.model["Link-p"].loc[period, link_names]
-        p_current = p_current.mul(n.snapshot_weightings.objective.loc[period])
-
-        lhs = e_previous - p_current
-        rhs = 0
-
-        n.model.add_constraints(lhs >= rhs, name=f"water_heater-{period}")
-
-
-def add_sector_demand_response_constraints(n, config):
+def add_gas_storage_retrofit_constraints(n, config):
     """
-    Add demand response equations for individual sectors.
-
-    These constraints are applied at the sector/carrier level. They are
-    fundamentally the same as the power sector constraints, tho.
+    Add constraints for retrofit of gas infrastructure.
+    Updated to handle continuous mode only with new mathematical constraints.
     """
+    # Get retrofit parameters from config
+    ng_options = config.get("sector", {}).get("natural_gas", {})
+    retro_storage_h2 = ng_options.get("retro_storage_h2", False)
+    retro_storage_acaes = ng_options.get("retro_storage_acaes", False)
 
-    def add_capacity_constraint(
-        n: pypsa.Network,
-        sector: str,
-        shift: float,  # as a percentage
-        carrier: str | None = None,
-    ):
-        """Adds limit on deferable load.
+    # If neither H2 nor ACAES retrofit is enabled, return early
+    if not retro_storage_h2 and not retro_storage_acaes:
+        return
 
-        No need to multiply out snapshot weights here
-        """
-        dr_links = n.links[n.links.carrier.str.endswith("-dr") & n.links.carrier.str.startswith(f"{sector}-")].copy()
-        constraint_name = f"demand_response_capacity-{sector}"
+    # Get retrofit factors
+    storage_eng_retro_factor_h2 = ng_options.get("storage_eng_retro_factor_h2", 0.2551)  # α_eng,H2
+    storage_pow_retro_factor_h2 = ng_options.get("storage_pow_retro_factor_h2", 0.4)  # α_pow,H2
+    storage_eng_retro_factor_acaes = ng_options.get("storage_eng_retro_factor_acaes", 0.0093)  # α_eng,air
 
-        if carrier:
-            dr_links = dr_links[dr_links.carrier.str.contains(f"-{carrier}-")].copy()
-            constraint_name = f"demand_response_capacity-{sector}-{carrier}"
+    logger.info("Adding storage retrofit constraints")
 
-        if dr_links.empty:
-            return
+    # Get aggregation level (0, 1)
+    agg_storage = ng_options.get("aggregate_storage", 1)
 
-        if sector != "trn":
-            deferrable_links = dr_links[dr_links.index.str.endswith("-dr-discharger")]
+    # Identify retrofit gas storage
+    gas_stores = n.stores[n.stores.carrier.str.contains("gas storage") & ~n.stores.carrier.str.contains("non")]
 
-            deferrable_loads = deferrable_links.bus1.unique().tolist()
+    # Identify H2 and ACAES storage if enabled
+    h2_stores = None
+    acaes_stores = None
 
-            lhs = n.model["Link-p"].loc[:, deferrable_links.index].groupby(deferrable_links.bus1).sum()
-            rhs = n.loads_t["p_set"][deferrable_loads].mul(shift).div(100).round(2)  # div cause percentage input
-            rhs.columns.name = "bus1"
+    if retro_storage_h2:
+        h2_stores = n.stores[n.stores.carrier.str.contains("h2 storage") & n.stores.carrier.str.contains("retrofit")]
 
-            # force rhs to be same order as lhs
-            # idk why but coordinates were not aligning and this gets around that
-            bus_order = lhs.vars.bus1.data
-            rhs = rhs[bus_order]
+    if retro_storage_acaes:
+        acaes_stores = n.stores[n.stores.carrier.str.contains("acaes") & n.stores.carrier.str.contains("retrofit")]
 
-            n.model.add_constraints(lhs <= rhs, name=constraint_name)
+    # Build storage pairs based on aggregation level
+    storage_triples = []  # (state, gas_store, h2_store, acaes_store)
 
-        # transport dr is at the aggregation bus
-        # sum all outgoing capacity and apply the capacity limit to that
+    if agg_storage == 1:  # State and type aggregation
+        for gas_store in gas_stores.index:
+            # Format: "STATE gas storage FIELD_TYPE retrofit"
+            parts = gas_store.split(" gas storage ")
+            if len(parts) >= 2:
+                state = parts[0]
+                field_type_and_suffix = parts[1]  # "FIELD_TYPE retrofit"
+                field_type = field_type_and_suffix.replace(" retrofit", "")
+
+                h2_store = None
+                acaes_store = None
+
+                if retro_storage_h2 and h2_stores is not None:
+                    h2_store_name = f"{state} h2 storage {field_type} retrofit"
+                    if h2_store_name in h2_stores.index:
+                        h2_store = h2_store_name
+
+                if retro_storage_acaes and acaes_stores is not None:
+                    acaes_store_name = f"{state} acaes {field_type} retrofit"
+                    if acaes_store_name in acaes_stores.index:
+                        acaes_store = acaes_store_name
+
+                # Only add if at least one retrofit storage exists
+                if h2_store is not None or acaes_store is not None:
+                    storage_triples.append((state, gas_store, h2_store, acaes_store))
+
+    else:  # agg_storage == 0, individual facilities
+        for gas_store in gas_stores.index:
+            parts = gas_store.split(" gas storage ")
+            state = parts[0]
+            facility_suffix = parts[1]
+
+            h2_store = None
+            acaes_store = None
+
+            if retro_storage_h2 and h2_stores is not None:
+                h2_store_name = f"{state} h2 storage {facility_suffix}"
+                if h2_store_name in h2_stores.index:
+                    h2_store = h2_store_name
+
+            if retro_storage_acaes and acaes_stores is not None:
+                acaes_store_name = f"{state} acaes {facility_suffix}"
+                if acaes_store_name in acaes_stores.index:
+                    acaes_store = acaes_store_name
+
+            # Only add if at least one retrofit storage exists
+            if h2_store is not None or acaes_store is not None:
+                storage_triples.append((state, gas_store, h2_store, acaes_store))
+
+    # Add constraints for each storage triple
+    for state, gas_store, h2_store, acaes_store in storage_triples:
+        # Get original gas storage capacity
+        original_e_nom = gas_stores.loc[gas_store, "e_nom_max"]
+
+        # Get extendable storage capacities
+        gas_e_nom = n.model["Store-e_nom"].loc[gas_store]
+
+        # Initialize storage variables
+        h2_e_nom = None
+        acaes_e_nom = None
+
+        if h2_store is not None:
+            h2_e_nom = n.model["Store-e_nom"].loc[h2_store]
+        if acaes_store is not None:
+            acaes_e_nom = n.model["Store-e_nom"].loc[acaes_store]
+
+        # Constraint 1: Energy capacity constraint
+        # E_gas^nom + E_H2^nom/α_eng,H2 + E_air^nom/α_eng,air ≤ E_original^nom
+        energy_constraint_terms = [gas_e_nom]
+
+        if h2_e_nom is not None:
+            energy_constraint_terms.append(h2_e_nom / storage_eng_retro_factor_h2)
+        if acaes_e_nom is not None:
+            energy_constraint_terms.append(acaes_e_nom / storage_eng_retro_factor_acaes)
+
+        if len(energy_constraint_terms) > 1:  # Only add constraint if there are retrofit options
+            n.model.add_constraints(
+                sum(energy_constraint_terms) <= original_e_nom,
+                name=f"storage_retrofit_energy_capacity_{gas_store.replace(' ', '_')}",
+            )
+
+        # Add power capacity constraints for charge/discharge links
+        # Determine link names based on aggregation level
+        gas_charge = f"{gas_store} charge"
+        gas_discharge = f"{gas_store} discharge"
+
+        h2_charge = None
+        h2_discharge = None
+        if h2_store is not None:
+            h2_charge = f"{h2_store} charge"
+            h2_discharge = f"{h2_store} discharge"
+
+        # Check if discharge links exist before adding power constraints
+        if gas_discharge in n.links.index:
+            original_p_discharge = n.links.loc[gas_discharge, "p_nom_max"]
+            gas_p_discharge = n.model["Link-p_nom"].loc[gas_discharge]
+
+            # Constraint 2: Power capacity constraint for discharging
+            # P_gas,dis^nom + P_H2,dis^nom/α_pow,H2 ≤ P_original,dis^nom
+            if h2_discharge is not None and h2_discharge in n.links.index:
+                h2_p_discharge = n.model["Link-p_nom"].loc[h2_discharge]
+
+                n.model.add_constraints(
+                    gas_p_discharge + h2_p_discharge / storage_pow_retro_factor_h2 <= original_p_discharge,
+                    name=f"storage_retrofit_power_discharge_{gas_store.replace(' ', '_')}",
+                )
+
+                # Constraint 3a: Internal proportionality for gas discharge
+                # P_gas,dis^nom / P_original,dis^nom = E_gas^nom / E_original^nom
+                # Rearranged: P_gas,dis^nom * E_original^nom / P_original,dis^nom = E_gas^nom
+                n.model.add_constraints(
+                    gas_p_discharge * original_e_nom / original_p_discharge == gas_e_nom,
+                    name=f"storage_gas_discharge_energy_proportion_{gas_store.replace(' ', '_')}",
+                )
+
+                # Constraint 3b: Internal proportionality for H2 discharge
+                # P_H2,dis^nom / α_pow,H2 / P_original,dis^nom = E_H2^nom / α_eng,H2 / E_original^nom
+                # Rearranged: P_H2,dis^nom * α_eng,H2 / α_pow,H2 * E_original^nom / P_original,dis^nom = E_H2^nom
+                if h2_e_nom is not None:
+                    n.model.add_constraints(
+                        h2_p_discharge
+                        * storage_eng_retro_factor_h2
+                        / storage_pow_retro_factor_h2
+                        * original_e_nom
+                        / original_p_discharge
+                        == h2_e_nom,
+                        name=f"storage_h2_discharge_energy_proportion_{gas_store.replace(' ', '_')}",
+                    )
+
+        # Check if charge links exist and add similar proportionality constraints for gas
+        if gas_charge in n.links.index:
+            original_p_charge = n.links.loc[gas_charge, "p_nom_max"]
+            gas_p_charge = n.model["Link-p_nom"].loc[gas_charge]
+
+            # Constraint 4a: Internal proportionality for gas charge
+            # P_gas,char^nom * E_original^nom / P_original,char^nom <= E_gas^nom
+            n.model.add_constraints(
+                gas_p_charge * original_e_nom / original_p_charge <= gas_e_nom,
+                name=f"storage_gas_charge_energy_proportion_{gas_store.replace(' ', '_')}",
+            )
+
+            if h2_charge is not None and h2_charge in n.links.index and h2_e_nom is not None:
+                h2_p_charge = n.model["Link-p_nom"].loc[h2_charge]
+                # Constraint 4b: Internal proportionality for H2 charge
+                n.model.add_constraints(
+                    h2_p_charge
+                    * storage_eng_retro_factor_h2
+                    / storage_pow_retro_factor_h2
+                    * original_e_nom
+                    / original_p_charge
+                    <= h2_e_nom,
+                    name=f"storage_h2_charge_energy_proportion_{gas_store.replace(' ', '_')}",
+                )
+
+    # Add proportionality constraints for non-retrofit gas storage
+    gas_stores_nonretro = n.stores[
+        n.stores.carrier.str.contains("gas storage") & n.stores.carrier.str.contains("nonretrofit")
+    ]
+
+    if not gas_stores_nonretro.empty:
+        for store_name in gas_stores_nonretro.index:
+            # Define corresponding link names
+            charge_link = f"{store_name} charge"
+            discharge_link = f"{store_name} discharge"
+
+            # Check if links exist
+            if charge_link not in n.links.index or discharge_link not in n.links.index:
+                logger.warning(f"Links not found for non-retrofit storage {store_name}")
+                continue
+
+            # Get original capacities
+            original_e_nom = n.stores.loc[store_name, "e_nom_max"]
+            original_p_discharge = n.links.loc[discharge_link, "p_nom_max"]
+            original_p_charge = n.links.loc[charge_link, "p_nom_max"]
+
+            # Get optimization variables
+            e_nom = n.model["Store-e_nom"].loc[store_name]
+            p_nom_discharge = n.model["Link-p_nom"].loc[discharge_link]
+            p_nom_charge = n.model["Link-p_nom"].loc[charge_link]
+
+            # Add discharge proportionality constraint
+            # p_nom_discharge * original_e_nom / original_p_discharge == e_nom
+            n.model.add_constraints(
+                p_nom_discharge * original_e_nom / original_p_discharge == e_nom,
+                name=f"nonretrofit_gas_discharge_energy_proportion_{store_name.replace(' ', '_')}",
+            )
+
+            # Add charge proportionality constraint
+            # p_nom_charge * original_e_nom / original_p_charge <= e_nom
+            n.model.add_constraints(
+                p_nom_charge * original_e_nom / original_p_charge <= e_nom,
+                name=f"nonretrofit_gas_charge_energy_proportion_{store_name.replace(' ', '_')}",
+            )
+
+
+def add_gas_pipeline_retrofit_constraints(n, config):
+    """
+    Add constraints for hydrogen retrofit of gas infrastructure.
+    """
+    # Get retrofit parameters from config
+    ng_options = config.get("sector", {}).get("natural_gas", {})
+    retro_pipeline = ng_options.get("retro_pipeline", False)
+
+    # Get retrofit factors
+    pipeline_retro_factor = ng_options.get("pipeline_retro_factor", 0.6)
+
+    # Check if binary mode is enabled
+    binary_pipeline = ng_options.get("binary_pipeline", False)
+
+    if retro_pipeline:
+        logger.info("Adding pipeline retrofit constraints")
+        # Identify retrofit gas and H2 pipeline pairs
+        gas_pipes = n.links[n.links.carrier.str.contains("gas pipeline") & ~n.links.carrier.str.contains("non")]
+        h2_pipes = n.links[n.links.carrier.str.contains("h2 pipeline") & n.links.carrier.str.contains("retrofit")]
+
+        agg_pipeline = ng_options.get("aggregate_pipeline", True)
+
+        if agg_pipeline:
+            # For aggregated pipelines
+            pipeline_pairs = []
+            for gas_pipe in gas_pipes.index:
+                h2_pipe_fwd = gas_pipe.replace(" gas pipeline", " h2 pipeline retrofit")
+                h2_pipe_rev = gas_pipe.replace(" gas pipeline", " h2 pipeline retrofit reverse")
+                if h2_pipe_fwd in h2_pipes.index:
+                    if h2_pipe_rev in h2_pipes.index:
+                        pipeline_pairs.append((gas_pipe, h2_pipe_fwd, h2_pipe_rev))
+                    else:
+                        pipeline_pairs.append((gas_pipe, h2_pipe_fwd))
         else:
-            inflow_links = dr_links[dr_links.index.str.endswith("-dr-discharger")]
-            inflow = n.model["Link-p"].loc[:, inflow_links.index].groupby(inflow_links.bus1).sum()
-            inflow = inflow.rename({"bus1": "Bus"})  # align coordinate names
+            # For individual pipelines
+            pipeline_pairs = []
+            for gas_pipe in gas_pipes.index:
+                parts = gas_pipe.split(" gas pipeline ")
+                if len(parts) == 2:
+                    prefix = parts[0]
+                    suffix = parts[1]
+                    h2_pipe_fwd = f"{prefix} h2 pipeline retrofit {suffix}"
+                    h2_pipe_rev = f"{prefix} h2 pipeline retrofit reverse {suffix}"
+                    if h2_pipe_fwd in h2_pipes.index:
+                        if h2_pipe_rev in h2_pipes.index:
+                            pipeline_pairs.append((gas_pipe, h2_pipe_fwd, h2_pipe_rev))
+                        else:
+                            pipeline_pairs.append((gas_pipe, h2_pipe_fwd))
 
-            outflow_links = n.links[n.links.bus0.isin(inflow_links.bus1) & ~n.links.carrier.str.endswith("-dr")]
-            outflow = n.model["Link-p"].loc[:, outflow_links.index].groupby(outflow_links.bus0).sum()
-            outflow = outflow.rename({"bus0": "Bus"})  # align coordinate names
+        if binary_pipeline and pipeline_pairs:
+            # Add binary variables for pipeline retrofit decision (x1)
+            gas_pipes_list = [pair[0] for pair in pipeline_pairs]
+            gas_pipes_index = pd.Index(gas_pipes_list, name="pipeline")
 
-            lhs = outflow.mul(shift).div(100) - inflow
-            rhs = 0
+            n.model.add_variables(
+                coords=[gas_pipes_index],
+                name="pipeline_retrofit_binary",
+                binary=True,
+            )
+            retrofit_vars = n.model["pipeline_retrofit_binary"]
+
+            # Add binary variables for pipeline retirement decision (x2)
+            n.model.add_variables(
+                coords=[gas_pipes_index],
+                name="pipeline_retirement_binary",
+                binary=True,
+            )
+            retirement_vars = n.model["pipeline_retirement_binary"]
+
+        for pair in pipeline_pairs:
+            gas_pipe = pair[0]
+            h2_pipe_fwd = pair[1]
+            h2_pipe_rev = pair[2] if len(pair) > 2 else None
+
+            # Get original gas pipeline capacity
+            original_p_nom = gas_pipes.loc[gas_pipe, "p_nom_max"]
+            gas_p_nom = n.model["Link-p_nom"].loc[gas_pipe]
+
+            # Process H2 pipeline capacity
+            h2_p_nom = n.model["Link-p_nom"].loc[h2_pipe_fwd]
+
+            if binary_pipeline:
+                retrofit_var = retrofit_vars.loc[gas_pipe]  # x1
+                retirement_var = retirement_vars.loc[gas_pipe]  # x2
+
+                # Mutual exclusivity constraint: x1 + x2 <= 1
+                n.model.add_constraints(
+                    retrofit_var + retirement_var <= 1,
+                    name=f"pipeline_mutual_exclusivity_{gas_pipe.replace(' ', '_')}",
+                )
+
+                # gas_p_nom <= (1 - x1 - x2) * original_p_nom
+                n.model.add_constraints(
+                    gas_p_nom + retrofit_var * original_p_nom + retirement_var * original_p_nom <= original_p_nom,
+                    name=f"pipeline_retrofit_gas_{gas_pipe.replace(' ', '_')}",
+                )
+                # h2_p_nom <= x1 * original_p_nom * pipeline_retro_factor
+                n.model.add_constraints(
+                    h2_p_nom <= retrofit_var * original_p_nom * pipeline_retro_factor,
+                    name=f"pipeline_retrofit_h2_{gas_pipe.replace(' ', '_')}",
+                )
+            else:
+                n.model.add_constraints(
+                    h2_p_nom / pipeline_retro_factor + gas_p_nom <= original_p_nom,
+                    name=f"pipeline_retrofit_continuous_{gas_pipe.replace(' ', '_')}",
+                )
+
+
+def add_new_h2_storage_constraints(n, config):
+    """
+    Add constraints for new H2 storage components.
+
+    This function adds constraints for new H2 storage (carrier: "h2 storage new") including:
+    1. discharge_capacity / energy_capacity <= 5e-3
+    # 2. charge_capacity / discharge_capacity = 132 / 359
+
+    These constraints ensure proper sizing relationships between energy and power capacities
+    for new hydrogen storage infrastructure.
+
+    Parameters
+    ----------
+    n : pypsa.Network
+        PyPSA network object
+    config : dict
+        Configuration dictionary containing hydrogen options
+    """
+    # Get hydrogen configuration options
+    h2_options = config.get("sector", {}).get("hydrogen", {})
+
+    # Check if new_storage is enabled
+    if not h2_options.get("new_storage", True):
+        logger.info("New H2 storage is disabled, skipping constraints")
+        return
+
+    logger.info("Adding new H2 storage capacity constraints")
+
+    # Define constraint ratios
+    DISCHARGE_ENERGY_RATIO = 5e-3  # discharge capacity / energy capacity
+    # CHARGE_DISCHARGE_RATIO = 132 / 359  # charge capacity / discharge capacity
+
+    # Identify new H2 storage stores
+    h2_storage_new_stores = n.stores[n.stores.carrier == "h2 storage new"]
+
+    if h2_storage_new_stores.empty:
+        logger.info("No new H2 storage found in the network")
+        return
+
+    # Process each new H2 storage store
+    constraints_added = 0
+    for store_name in h2_storage_new_stores.index:
+        # Extract state from store name (format: "{state} h2 storage new")
+        state = store_name.replace(" h2 storage new", "")
+
+        # Define corresponding link names
+        charge_link = f"{state} charge h2 storage new"
+        discharge_link = f"{state} discharge h2 storage new"
+
+        # Check if corresponding links exist
+        if charge_link not in n.links.index:
+            logger.warning(f"Charge link {charge_link} not found for storage {store_name}")
+            continue
+        if discharge_link not in n.links.index:
+            logger.warning(f"Discharge link {discharge_link} not found for storage {store_name}")
+            continue
+
+        # Get optimization variables
+        store_e_nom = n.model["Store-e_nom"].loc[store_name]  # Energy capacity (MWh)
+        charge_p_nom = n.model["Link-p_nom"].loc[charge_link]  # Charge power capacity (MW)
+        discharge_p_nom = n.model["Link-p_nom"].loc[discharge_link]  # Discharge power capacity (MW)
+
+        # Constraint 1: discharge_p_nom <= store_e_nom * DISCHARGE_ENERGY_RATIO
+        constraint_name_1 = f"h2_storage_new_discharge_energy_ratio_{state.replace(' ', '_')}"
+        n.model.add_constraints(
+            discharge_p_nom <= store_e_nom * DISCHARGE_ENERGY_RATIO,
+            name=constraint_name_1,
+        )
+
+        # # Constraint 2: charge_p_nom = discharge_p_nom * CHARGE_DISCHARGE_RATIO
+        # constraint_name_2 = f"h2_storage_new_charge_discharge_ratio_{state.replace(' ', '_')}"
+        # n.model.add_constraints(
+        #     charge_p_nom == discharge_p_nom * CHARGE_DISCHARGE_RATIO,
+        #     name=constraint_name_2
+        # )
+
+        # constraints_added += 2
+        constraints_added += 1
+
+    logger.info(
+        f"Added {constraints_added} new H2 storage capacity constraints for {len(h2_storage_new_stores)} storage units",
+    )
+
+
+def add_power_soc_constraints(n):
+    """
+    Add power-SOC constraints for gas and H2 underground storage.
+
+    These constraints model the physical relationship between storage state of charge (SOC)
+    and maximum discharge rate. As SOC decreases, pressure differential decreases,
+    leading to reduced maximum discharge capacity.
+
+    Constraint: discharge_power_t <= energy_t * (p_nom / e_nom)
+
+    where:
+    - discharge_power_t: discharge link power at time t
+    - energy_t: storage energy level at time t
+    - (p_nom / e_nom): constant power-to-energy ratio for each storage
+
+    Parameters
+    ----------
+    n : pypsa.Network
+        PyPSA network object
+    config : dict
+        Configuration dictionary containing natural gas options
+    """
+    logger.info("Adding power-SOC constraints for gas and H2 storage")
+
+    # Identify gas and H2 storage components
+    gas_stores = n.stores[n.stores.carrier.str.contains("gas storage")]
+    h2_stores = n.stores[n.stores.carrier.str.contains("h2 storage")]
+
+    # Combine all storage units to process
+    all_stores = pd.concat([gas_stores, h2_stores])
+
+    # Process each storage unit
+    for store_name in all_stores.index:
+        # Determine carrier type
+        if "gas storage" in store_name:
+            carrier_type = "gas"
+            discharge_link = f"{store_name} discharge"
+        elif "h2 storage" in store_name:
+            carrier_type = "h2"
+            discharge_link = f"{store_name} discharge"
+
+        # Check if discharge link exists
+        if discharge_link not in n.links.index:
+            logger.warning(f"Discharge link {discharge_link} not found for storage {store_name}")
+            continue
+
+        # Calculate power-to-energy ratio (p_nom / e_nom)
+        # Get nominal capacities from the network components
+        store_e_nom_max = n.stores.loc[store_name, "e_nom_max"]
+        link_p_nom_max = n.links.loc[discharge_link, "p_nom_max"]
+
+        # Calculate the constant ratio
+        power_energy_ratio = link_p_nom_max / store_e_nom_max
+
+        # Add constraints for each investment period
+        for period in n.investment_periods:
+            # Get optimization variables
+            discharge_power = n.model["Link-p"].loc[period, discharge_link]
+            storage_energy = n.model["Store-e"].loc[period, store_name]
+
+            # Add constraint: discharge_power_t <= energy_t * power_energy_ratio
+            # This constraint applies to all timesteps in the investment period
+            lhs = discharge_power
+            rhs = storage_energy * power_energy_ratio
+
+            constraint_name = f"power_soc_{carrier_type}_{store_name.replace(' ', '_')}_{period}"
 
             n.model.add_constraints(
-                lhs >= rhs,
+                lhs <= rhs,
                 name=constraint_name,
             )
 
-    # helper to manage capacity constraint between non-carrier and carrier
 
-    def _apply_constraint(
-        n: pypsa.Network,
-        sector: str,
-        cfg: dict[str, Any],
-        carrier: str | None = None,
-    ):
-        shift = cfg.get("shift", 0)
-
-        if isinstance(shift, str):
-            if shift == "inf":
-                pass
-            else:
-                logger.info(f"Unknown arguement of {shift} for {sector} DR")
-                raise ValueError(shift)
-        elif isinstance(shift, int | float):
-            if shift < 0.001:
-                logger.info(f"Demand response not enabled for {sector}")
-            else:
-                add_capacity_constraint(n, sector, shift, carrier)
-        else:
-            logger.info(f"Unknown arguement of {shift} for {sector} DR")
-            raise ValueError(shift)
-
-    # demand response addition starts here
-
-    sectors = ["res", "com", "ind", "trn"]
-
-    for sector in sectors:
-        if sector in ["res", "com"]:
-            dr_config = config["sector"]["service_sector"].get("demand_response", {})
-        elif sector == "trn":
-            dr_config = config["sector"]["transport_sector"].get("demand_response", {})
-        elif sector == "ind":
-            dr_config = config["sector"]["industrial_sector"].get("demand_response", {})
-        else:
-            raise ValueError
-
-        if not dr_config:
-            continue
-
-        by_carrier = dr_config.get("by_carrier", False)
-
-        if by_carrier:
-            for carrier, carrier_config in dr_config.items():
-                # hacky check to make sure only carriers get passed in
-                # the actual constraint should check this as well
-                if carrier in ("elec", "heat", "space-heat", "water-heat", "cool"):
-                    _apply_constraint(n, sector, carrier_config, carrier)
-        else:
-            _apply_constraint(n, sector, dr_config)
-
-
-def add_ev_generation_constraint(n, config):
-    """Adds a limit to the maximum generation from EVs per mode and year.
-
-    Only applied if endogenous investments are tuned on as a mechanism to limit
-    growth rate of EVs. The constraint is:
-    - (EV_gen * eff) / dem <= policy (where policy is a percentage giving max gen)
-    - EV_gen <= dem * policy / eff
-
-    This is an approximation based on average EV efficiency for that investmenet period. This
-    is needed as EV production will be different than LPG production for the same unit input.
-
-    Default limits taken from:
-    - (Fig ES2) https://www.nrel.gov/docs/fy18osti/71500.pdf
-    - (Sheet 6.3 - high case) https://data.nrel.gov/submissions/90
+def add_h2_electrolysis_average_constraints(n, averaging_period="week"):
     """
-    mode_mapper = {
-        "light_duty": "lgt",
-        "med_duty": "med",
-        "heavy_duty": "hvy",
-        "bus": "bus",
+    Add constraints to ensure each h2 electrolysis link has equal average power over specified time periods.
+
+    For each h2 electrolysis link:
+    - If averaging_period is 'hour': Set p_max_pu = p_min_pu = 1 (constant operation)
+    - Otherwise: Calculate average power across all hours in each complete time block
+      and set constraint that all block averages are equal
+    - Partial blocks at the end are not constrained
+
+    This ensures consistent hydrogen production patterns across time periods for each electrolyzer.
+    Different electrolyzers are not constrained relative to each other.
+
+    Parameters
+    ----------
+    n : pypsa.Network
+        PyPSA network object
+    averaging_period : str
+        Time period for averaging: 'hour', 'day', 'week', 'month', 'season'
+        - 'hour': Constant operation (p_max_pu = p_min_pu = 1)
+        - 'day': 24-hour blocks
+        - 'week': 168-hour blocks (7 days)
+        - 'month': 720-hour blocks (30 days)
+        - 'season': 2190-hour blocks (91.25 days)
+    """
+    # Find all h2 electrolysis links
+    h2_elec_links = n.links[n.links.carrier == "h2 electrolysis"].index
+
+    if h2_elec_links.empty:
+        logger.info("No h2 electrolysis links found")
+        return
+
+    # Handle 'hour' case: set constant operation
+    if averaging_period == "hour":
+        logger.info("Setting h2 electrolysis to constant operation (p_max_pu = p_min_pu = 1)")
+
+        # Set p_max_pu and p_min_pu to 1 for all h2 electrolysis links
+        n.links.loc[h2_elec_links, "p_max_pu"] = 1.0
+        n.links.loc[h2_elec_links, "p_min_pu"] = 1.0
+
+        logger.info(f"Set constant operation for {len(h2_elec_links)} h2 electrolysis links")
+        return
+
+    # Define block sizes in HOURS for each averaging period
+    period_hours = {
+        "day": 24,
+        "week": 168,  # 7 * 24
+        "month": 720,  # 30 * 24
+        "season": 2190,  # 91.25 * 24
     }
 
-    policy = pd.read_csv(snakemake.input.ev_policy, index_col=0)
+    if averaging_period not in period_hours:
+        logger.warning(
+            f"Invalid averaging_period '{averaging_period}'. "
+            f"Must be one of {list(period_hours.keys()) + ['hour']}. Defaulting to 'week'.",
+        )
+        averaging_period = "week"
 
-    for mode in policy.columns:
-        evs = n.links[n.links.carrier == f"trn-elec-veh-{mode_mapper[mode]}"].index
-        dem_names = n.loads[n.loads.carrier == f"trn-veh-{mode_mapper[mode]}"].index
-        dem = n.loads_t["p_set"][dem_names]
+    block_hours = period_hours[averaging_period]
 
-        for investment_period in n.investment_periods:
-            ratio = policy.at[investment_period, mode] / 100  # input is percentage
-            eff = n.links.loc[evs].efficiency.mean()
-            lhs = n.model["Link-p"].loc[investment_period].sel(Link=evs).sum()
-            rhs = dem.loc[investment_period].sum().sum() * ratio / eff
+    logger.info(f"Adding {averaging_period}ly average constraints for h2 electrolysis")
 
-            n.model.add_constraints(lhs <= rhs, name=f"Link-ev_gen_{mode}_{investment_period}")
+    # Process each h2 electrolysis link separately
+    for link in h2_elec_links:
+        # Process each investment period separately
+        for period in n.investment_periods:
+            # Get snapshots for this period (just the timestamps, level 1)
+            timestamps = n.snapshots.get_level_values(1)[n.snapshots.get_level_values(0) == period]
+
+            # Calculate the actual time resolution (timestep in hours)
+            if len(timestamps) > 1:
+                time_deltas = pd.to_datetime(timestamps[1:]).values - pd.to_datetime(timestamps[:-1]).values
+                # Get the most common timestep (in case of irregular spacing)
+                timestep_hours = pd.Series(time_deltas).mode()[0] / np.timedelta64(1, "h")
+            else:
+                logger.warning(f"Only one timestamp found for period {period}, skipping")
+                continue
+
+            # Check if block_hours is divisible by timestep_hours
+            if block_hours % timestep_hours != 0:
+                logger.warning(
+                    f"Block size {block_hours}h is not divisible by timestep {timestep_hours}h. "
+                    f"Adjusting block size to nearest multiple: {int(block_hours / timestep_hours) * timestep_hours}h",
+                )
+                # Adjust block size to nearest multiple of timestep
+                block_hours_adjusted = int(block_hours / timestep_hours) * timestep_hours
+            else:
+                block_hours_adjusted = block_hours
+
+            # Calculate number of snapshots per block
+            snapshots_per_block = int(block_hours_adjusted / timestep_hours)
+
+            # Group timestamps into blocks
+            time_blocks = []
+            for i in range(0, len(timestamps), snapshots_per_block):
+                block_timestamps = timestamps[i : i + snapshots_per_block]
+                # Only include complete blocks
+                if len(block_timestamps) == snapshots_per_block:
+                    time_blocks.append(block_timestamps)
+
+            # Skip if less than 2 complete blocks (need at least 2 blocks to constrain)
+            if len(time_blocks) < 2:
+                logger.info(
+                    f"Skipping {link} in period {period}: "
+                    f"insufficient complete {averaging_period}s ({len(time_blocks)} blocks)",
+                )
+                continue
+
+            # Get the Link-p variable for this link and period
+            link_p = n.model["Link-p"].loc[period, link]
+
+            # Calculate block averages
+            block_averages = []
+            for block_idx, block_timestamps in enumerate(time_blocks):
+                # Sum power for these timestamps
+                block_power_sum = link_p.loc[block_timestamps].sum()
+
+                # Calculate average (sum / number of snapshots in that block)
+                block_avg = block_power_sum / len(block_timestamps)
+                block_averages.append(block_avg)
+
+            # Add constraints: block_avg[1] = block_avg[0], block_avg[2] = block_avg[0], ...
+            # This ensures all time blocks have the same average power
+            for i in range(1, len(block_averages)):
+                constraint_name = f"h2_elec_{averaging_period}ly_avg_{link.replace(' ', '_')}_{period}_block{i}"
+
+                n.model.add_constraints(
+                    block_averages[i] == block_averages[0],
+                    name=constraint_name,
+                )
+
+    logger.info(
+        f"Added {averaging_period}ly average constraints for {len(h2_elec_links)} h2 electrolysis links",
+    )
+
+
+def ban_fossil(n):
+    """
+    Ban certain gas and coal-fired generation technologies from the network by
+    setting their p_nom_min and p_nom_max to 0
+    """
+    # Define carriers to ban
+    banned_carriers = [
+        "OCGT",
+        "CCGT",
+        "CCGT-95CCS",
+        "CCGT-97CCS",
+        "coal",
+        "coal-95CCS",
+        "coal-99CCS",
+        "h2 smr",
+        "h2 smr-cc",
+    ]
+
+    # Find links with banned carriers
+    all_banned_links = n.links[n.links.carrier.isin(banned_carriers)]
+
+    # Set p_nom_min to 0 (minimum capacity)
+    n.links.loc[all_banned_links.index, "p_nom_min"] = 0
+    n.links.loc[all_banned_links.index, "p_nom_max"] = 0
+
+    logger.info(
+        f"Successfully banned {len(all_banned_links)} fossil fuel links",
+    )
+
+
+def ban_gasccs(n):
+    # Define carriers to ban
+    banned_carriers = ["CCGT-95CCS", "CCGT-97CCS"]
+
+    # Find links with banned carriers
+    all_banned_links = n.links[n.links.carrier.isin(banned_carriers)]
+
+    # Set p_nom_min to 0 (minimum capacity)
+    n.links.loc[all_banned_links.index, "p_nom_min"] = 0
+    n.links.loc[all_banned_links.index, "p_nom_max"] = 0
+
+    logger.info(
+        "Successfully banned Gas-CCS",
+    )
+
+
+def add_gas_turbine_retrofit_constraints(n, config):
+    """
+    Add constraints for H2 retrofit of gas turbines (CCGT/OCGT).
+
+    For each original CCGT/OCGT link with a corresponding retrofit link:
+    original_capacity >= gas_p_nom + h2_p_nom
+
+    This ensures the sum of gas and H2 operation doesn't exceed original capacity.
+    """
+    h2_options = config.get("sector", {}).get("hydrogen", {})
+    retro_turbine = h2_options.get("retro_turbine", False)
+
+    if not retro_turbine:
+        return
+
+    logger.info("Adding gas turbine retrofit constraints")
+
+    # Find all CCGT and OCGT links (without CCS) with build_year < 2050
+    gas_turbines = n.links[
+        (n.links.carrier.isin(["CCGT", "OCGT"]))  # Only non-CCS turbines
+        & (n.links.build_year < 2050)
+    ]
+
+    constraints_added = 0
+
+    for turbine_idx in gas_turbines.index:
+        retrofit_idx = f"{turbine_idx} retrofit"
+
+        # Check if corresponding retrofit link exists
+        if retrofit_idx not in n.links.index:
+            continue
+
+        # Get original capacity
+        original_capacity = n.links.loc[turbine_idx, "p_nom"]
+
+        # Get optimization variables
+        turbine_p_nom = n.model["Link-p_nom"].loc[turbine_idx]
+        retrofit_p_nom = n.model["Link-p_nom"].loc[retrofit_idx]
+
+        # Add constraint: turbine_p_nom + retrofit_p_nom <= original_capacity
+        constraint_name = f"turbine_retrofit_capacity_{turbine_idx.replace(' ', '_').replace('-', '_')}"
+
+        n.model.add_constraints(
+            turbine_p_nom + retrofit_p_nom <= original_capacity,
+            name=constraint_name,
+        )
+
+        constraints_added += 1
+
+    logger.info(f"Added {constraints_added} gas turbine retrofit capacity constraints")
 
 
 def extra_functionality(n, snapshots):
@@ -1669,47 +2804,41 @@ def extra_functionality(n, snapshots):
     """
     opts = n.opts
     config = n.config
-    if "RPS" in opts and n.generators.p_nom_extendable.any():
-        sector_rps = True if "sector" in opts else False
-        add_RPS_constraints(n, snapshots, config, sector_rps)
-    if "REM" in opts and n.generators.p_nom_extendable.any():
-        add_regional_co2limit(n, snapshots, config)
-    if "BAU" in opts and n.generators.p_nom_extendable.any():
-        add_BAU_constraints(n, config)
     if "PRM" in opts and n.generators.p_nom_extendable.any():
         add_PRM_constraints(n, config)
-    if "TCT" in opts and n.generators.p_nom_extendable.any():
-        add_technology_capacity_target_constraints(n, config)
-    reserve = config["electricity"].get("operational_reserve", {})
-    if reserve.get("activate"):
-        add_operational_reserve_margin(n, snapshots, config)
-    interface_limits = config["lines"].get("interface_transmission_limits", {})
-    if interface_limits:
-        add_interface_limits(n, snapshots, config)
-    dr_config = config["electricity"].get("demand_response", {})
-    if dr_config:
-        sector = True if "sector" in opts else False
-        add_demand_response_constraint(n, config, sector)
-    if "sector" in opts:
-        add_cooling_heat_pump_constraints(n, config)
-        if not config["sector"]["service_sector"].get("split_urban_rural", False):
-            add_gshp_capacity_constraint(n, config)
-        if config["sector"]["co2"].get("policy", {}):
-            add_sector_co2_constraints(n, config)
-        if config["sector"]["natural_gas"].get("imports", False):
-            add_ng_import_export_limits(n, config)
-        water_config = config["sector"]["service_sector"].get("water_heating", {})
-        if not water_config.get("simple_storage", True):
-            add_water_heater_constraints(n, config)
-        if config["sector"]["transport_sector"]["investment"]["ev_policy"]:
-            if not config["sector"]["transport_sector"]["investment"]["exogenous"]:
-                add_ev_generation_constraint(n, config)
-        add_sector_demand_response_constraints(n, config)
+    if "ERM" in opts and n.generators.p_nom_extendable.any():
+        add_ERM_constraints(n, config)
 
-    for o in opts:
-        if "EQ" in o:
-            add_EQ_constraints(n, o)
+    if "SimpSec" in opts:
+        if config["sector"]["co2"].get("policy", {}):
+            # Pass reference network path if available
+            reference_network_path = getattr(snakemake.input, "reference_network", None)
+            # Handle case where reference_network might be empty list
+            if isinstance(reference_network_path, list) and len(reference_network_path) == 0:
+                reference_network_path = None
+            add_co2_constraints(n, config, reference_network_path)
+        # if config["sector"]["natural_gas"].get("imports", False):
+        #     add_ng_import_export_limits(n, config)
+        if config["sector"]["natural_gas"].get("retro_storage_h2", False) or config["sector"]["natural_gas"].get(
+            "retro_storage_acaes", False
+        ):
+            add_gas_storage_retrofit_constraints(n, config)
+        if config["sector"]["natural_gas"].get("retro_pipeline", False):
+            add_gas_pipeline_retrofit_constraints(n, config)
+        h2_options = config.get("sector", {}).get("hydrogen", {})
+        if h2_options.get("new_storage", True):
+            add_new_h2_storage_constraints(n, config)
+        if config["sector"]["natural_gas"].get("varying_discharge", True):
+            add_power_soc_constraints(n)
+        h2_averaging = config.get("sector", {}).get("hydrogen", {}).get("constant_average", None)
+        if h2_averaging:
+            # h2_averaging can be 'day', 'week', 'month', or 'season'
+            add_h2_electrolysis_average_constraints(n, averaging_period=h2_averaging)
+        if h2_options.get("retro_turbine", False):
+            add_gas_turbine_retrofit_constraints(n, config)
+
     add_land_use_constraints(n)
+    add_bidirectional_link_constraints(n)
 
 
 def run_optimize(n, rolling_horizon, skip_iterations, cf_solving, **kwargs):
@@ -1723,8 +2852,8 @@ def run_optimize(n, rolling_horizon, skip_iterations, cf_solving, **kwargs):
         status, condition = n.optimize(**kwargs)
     else:
         kwargs["track_iterations"] = (cf_solving.get("track_iterations", False),)
-        kwargs["min_iterations"] = (cf_solving.get("min_iterations", 4),)
-        kwargs["max_iterations"] = (cf_solving.get("max_iterations", 6),)
+        kwargs["min_iterations"] = cf_solving.get("min_iterations", 4)
+        kwargs["max_iterations"] = cf_solving.get("max_iterations", 6)
         status, condition = n.optimize.optimize_transmission_expansion_iteratively(
             **kwargs,
         )
@@ -1742,8 +2871,8 @@ def solve_network(n, config, solving, opts="", **kwargs):
     set_of_options = solving["solver"]["options"]
     cf_solving = solving["options"]
 
-    foresight = snakemake.params.foresight
-    kwargs["multi_investment_periods"] = config["foresight"] == "perfect"
+    foresight = config["foresight"]
+    kwargs["multi_investment_periods"] = foresight == "perfect"
 
     kwargs["solver_options"] = solving["solver_options"][set_of_options] if set_of_options else {}
     kwargs["solver_name"] = solving["solver"]["name"]
@@ -1860,47 +2989,82 @@ if __name__ == "__main__":
 
         snakemake = mock_snakemake(
             "solve_network",
-            interconnect="western",
-            simpl="12",
-            clusters="4m",
-            ll="v1.0",
-            opts="4h",
-            sector="E-G",
-            planning_horizons="2030",
+            case="HighE_new_h2storage_tes",
+            transmission_network="reeds",
         )
     configure_logging(snakemake)
-    update_config_from_wildcards(snakemake.config, snakemake.wildcards)
-    if "sector_opts" in snakemake.wildcards.keys():
-        update_config_with_sector_opts(
-            snakemake.config,
-            snakemake.wildcards.sector_opts,
-        )
+    # update_config_from_wildcards(snakemake.config, snakemake.wildcards)
+    # if "sector_opts" in snakemake.wildcards.keys():
+    #     update_config_with_sector_opts(
+    #         snakemake.config,
+    #         snakemake.wildcards.sector_opts,
+    #     )
 
-    opts = snakemake.wildcards.opts
-    if "sector_opts" in snakemake.wildcards.keys():
-        opts += "-" + snakemake.wildcards.sector_opts
+    opts = snakemake.params.opts
+    # opts = "4h"
+    # if "sector_opts" in snakemake.wildcards.keys():
+    #     opts += "-" + snakemake.wildcards.sector_opts
     opts = [o for o in opts.split("-") if o != ""]
     solve_opts = snakemake.params.solving["options"]
 
     # sector specific co2 options
-    if snakemake.wildcards.sector != "E":
-        # sector co2 limits applied via config file, not through Co2L
-        opts = [x for x in opts if not x.startswith("Co2L")]
-        opts.append("sector")
+    # if snakemake.wildcards.sector != "E":
+    # sector co2 limits applied via config file, not through Co2L
+    opts = [x for x in opts if not x.startswith("Co2L")]
+    # if snakemake.wildcards.sector != "SimpSec":
+    #     opts.append("sector")
+    # else:
+    opts.append("SimpSec")
+
+    sector_config = snakemake.params.sector
+    solving_config = snakemake.params.solving
+    complete_config = {
+        "foresight": snakemake.params.foresight,
+        "sector": sector_config,
+        "scenario": {
+            "planning_horizons": snakemake.params.planning_horizons,
+            "opts": snakemake.params.opts,
+            "nza_scenario": getattr(snakemake.params, "nza_scenario", ""),
+        },
+        "solving": solving_config,
+        "co2_sequestration_potential": snakemake.params.co2_sequestration_potential,
+    }
 
     np.random.seed(solve_opts.get("seed", 123))
 
     n = pypsa.Network(snakemake.input.network)
 
+    # line_data = pd.read_csv("repo_data/lines.csv")
+    # line_data["Line"] = line_data["Line"].astype(str)
+    # line_data = line_data.set_index("Line")
+    # common = n.lines.index.intersection(line_data.index)
+    # n.lines.loc[common, "x"] = line_data.loc[common, "x"]
+    # n.lines.loc[common, "r"] = line_data.loc[common, "r"]
+    # n.calculate_dependent_values()
+
+    first_year = snakemake.params.planning_horizons[0]
+    costs = load_costs(f"resources/costs/costs_{first_year}.csv")
+    # Apply regional multipliers to generators and links
+    apply_regional_cost_multipliers(n, "repo_data/locational_multipliers/")
+    # Recalculate network infrastructure costs
+    recalculate_network_costs(n, costs)
+
+    n.links.loc[n.links[n.links.carrier == "coal"].index, "p_nom_min"] = 0
+    n.links.loc[n.links[n.links.carrier == "coal"].index, "p_nom_max"] = 0
+    if sector_config["fossil"].get("ban", False):
+        ban_fossil(n)
+    if sector_config["fossil"].get("ban_gasccs", False):
+        ban_gasccs(n)
+
     n = prepare_network(
         n,
         solve_opts,
     )
-
+    n.lines.s_nom_opt = n.lines.s_nom
     n = solve_network(
         n,
-        config=snakemake.config,
-        solving=snakemake.params.solving,
+        config=complete_config,
+        solving=solving_config,
         opts=opts,
         log_fn=snakemake.log.solver,
     )

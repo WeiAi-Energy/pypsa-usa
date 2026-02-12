@@ -18,7 +18,7 @@ from _helpers import (
     update_p_nom_max,
 )
 from add_electricity import update_transmission_costs
-from constants import REEDS_NERC_INTERCONNECT_MAPPER
+from constants import REEDS_NERC_INTERCONNECT_MAPPER, STATES_INTERCONNECT_MAPPER
 from pypsa.clustering.spatial import (
     busmap_by_greedy_modularity,
     busmap_by_hac,
@@ -365,7 +365,7 @@ def clustering_for_n_clusters(
     return clustering
 
 
-def add_itls(buses, itls, itl_cost, expansion=True):
+def add_itls(buses, itls, itl_cost):
     """
     Adds ITL limits to the network.
 
@@ -375,77 +375,56 @@ def add_itls(buses, itls, itl_cost, expansion=True):
     """
     if itl_cost is not None:
         itl_cost["interface"] = itl_cost.r + "||" + itl_cost.rr
-        itl_cost = itl_cost[itl_cost.interface.isin(itls.interface)]
-        itl_cost["USD2023perMW"] = itl_cost["USD2004perMW"] * (314.54 / 188.9)
-        itl_cost["USD2023perMWyr"] = calculate_annuity(60, 0.025) * itl_cost["USD2023perMW"]
+        dc_interface = clustering.network.links.bus0 + "||" + clustering.network.links.bus1
+        all_interfaces = set(itls.interface).union(set(dc_interface))
+        itl_cost = itl_cost[itl_cost.interface.isin(all_interfaces)]
+        itl_cost["USD2022perMW"] = itl_cost["USD2004perMW"] * 1.55
+        itl_cost["USD2022perMWyr"] = (calculate_annuity(40, 0.036) + 0.015) * itl_cost[
+            "USD2022perMW"
+        ]  # https://nrel.github.io/ReEDS-2.0/model_documentation.html#transmission
         itls = itls.merge(
-            itl_cost[["interface", "length_miles", "USD2023perMWyr"]],
+            itl_cost[["interface", "length_miles", "USD2022perMWyr"]],
             on="interface",
             how="left",
         )
     else:
         itls["length_miles"] = 0
-        itls["USD2023perMWyr"] = 0
+        itls["USD2022perMWyr"] = 0
 
-    itls["p_min_pu_Rev"] = (-1 * (itls.mw_r0 / itls.mw_f0)).fillna(0)
     itls["efficiency"] = 1 - ((itls.length_miles / 100) * 0.01)
 
-    # lines to add in reverse if forward direction is zero
-    itls_rev = itls[itls.mw_f0 == 0].copy()
-    itls_fwd = itls[itls.mw_f0 != 0]
-
-    clustering.network.madd(
-        "Link",
-        names=itls_fwd.interface,  # itl name
-        bus0=buses.loc[itls_fwd.r].index,
-        bus1=buses.loc[itls_fwd.rr].index,
-        p_nom=itls_fwd.mw_f0.values,
-        p_nom_min=itls_fwd.mw_f0.values,
-        p_max_pu=1.0,
-        p_min_pu=itls_fwd.p_min_pu_Rev.values,
-        length=0 if itl_cost is None else itls_fwd.length_miles.values,
-        capital_cost=0 if itl_cost is None else itls_fwd.USD2023perMWyr.values,
-        p_nom_extendable=False,
-        efficiency=1 if itl_cost is None else itls_fwd.efficiency.values,
-        carrier="AC",
-    )
-
-    clustering.network.madd(
-        "Link",
-        names=itls_rev.interface,  # itl name
-        suffix="rev",
-        bus0=buses.loc[itls_rev.r].index,
-        bus1=buses.loc[itls_rev.rr].index,
-        p_nom=itls_rev.mw_r0.values,
-        p_nom_min=itls_rev.mw_r0.values,
-        p_max_pu=0,
-        p_min_pu=-1,
-        length=0 if itl_cost is None else itls_rev.length_miles.values,
-        capital_cost=0 if itl_cost is None else itls_rev.USD2023perMWyr.values,
-        p_nom_extendable=False,
-        efficiency=1 if itl_cost is None else itls_rev.efficiency.values,
-        carrier="AC",
-    )
-
-    if not expansion:
-        return
-
-    # for tracking expansion of Zonal Links
     clustering.network.madd(
         "Link",
         names=itls.interface,  # itl name
-        suffix="exp",
+        suffix="_fwd",
         bus0=buses.loc[itls.r].index,
         bus1=buses.loc[itls.rr].index,
-        p_nom=0,
-        p_nom_min=0,
-        p_max_pu=1,
-        p_min_pu=-1,
-        length=0 if itl_cost is None else itls.length_miles.values,
-        capital_cost=0 if itl_cost is None else itls.USD2023perMWyr.values,
+        p_nom=itls.mw_f0.values,
+        p_nom_min=itls.mw_f0.values,
+        p_max_pu=1.0,
+        p_min_pu=0.0,
+        length=0 if itl_cost is None else itls.length_miles.values * 1.6093,
+        capital_cost=0 if itl_cost is None else itls.USD2022perMWyr.values / 2,
         p_nom_extendable=False,
         efficiency=1 if itl_cost is None else itls.efficiency.values,
-        carrier="AC_exp",
+        carrier="AC",
+    )
+
+    clustering.network.madd(
+        "Link",
+        names=itls.interface,  # itl name
+        suffix="_rev",
+        bus0=buses.loc[itls.rr].index,
+        bus1=buses.loc[itls.r].index,
+        p_nom=itls.mw_r0.values,
+        p_nom_min=itls.mw_r0.values,
+        p_max_pu=1.0,
+        p_min_pu=0.0,
+        length=0 if itl_cost is None else itls.length_miles.values * 1.6093,
+        capital_cost=0 if itl_cost is None else itls.USD2022perMWyr.values / 2,
+        p_nom_extendable=False,
+        efficiency=1 if itl_cost is None else itls.efficiency.values,
+        carrier="AC",
     )
 
 
@@ -468,10 +447,15 @@ def convert_to_transport(
     itls = pd.read_csv(itl_fn)
     itl_cost = pd.read_csv(itl_cost_fn)
     itls.columns = itls.columns.str.lower()
-    itls_filt = itls[
-        itls.r.isin(clustering.network.buses[f"{topological_boundaries}"])
-        & itls.rr.isin(clustering.network.buses[f"{topological_boundaries}"])
-    ]
+    if topological_boundaries == "state":
+        itls_filt = itls[
+            itls.r.isin(clustering.network.buses["reeds_state"]) & itls.rr.isin(clustering.network.buses["reeds_state"])
+        ]
+    else:
+        itls_filt = itls[
+            itls.r.isin(clustering.network.buses[f"{topological_boundaries}"])
+            & itls.rr.isin(clustering.network.buses[f"{topological_boundaries}"])
+        ]
     add_itls(buses, itls_filt, itl_cost)
 
     if itl_agg_fn:
@@ -518,7 +502,7 @@ def convert_to_transport(
 
         itl_lower_res = pd.concat([itl_lower_res, itls_between])
         itl_agg_costs = None if itl_agg_costs_fn is None else pd.concat([itl_cost, pd.read_csv(itl_agg_costs_fn)])
-        add_itls(buses, itl_lower_res, itl_agg_costs, expansion=True)
+        add_itls(buses, itl_lower_res, itl_agg_costs)
         itls = pd.concat([itls_filt, itl_lower_res])
     else:
         itls = itls_filt
@@ -582,9 +566,10 @@ if __name__ == "__main__":
 
         snakemake = mock_snakemake(
             "cluster_network",
-            simpl="",
-            clusters="7",
-            interconnect="texas",
+            transmission_network="tamu",
+            simpl="53",
+            clusters="53",
+            interconnect="usa",
         )
     configure_logging(snakemake)
 
@@ -607,7 +592,7 @@ if __name__ == "__main__":
     conventional_carriers = set(params.conventional_carriers)
 
     # Extract cluster information from wildcards
-    cluster_wc = snakemake.wildcards.get("clusters", None) or snakemake.wildcards.get("clusters_hires", None)
+    cluster_wc = "48" if transport_model else "53"
 
     if cluster_wc == "all":
         n_clusters = len(n.buses)
@@ -664,11 +649,34 @@ if __name__ == "__main__":
     if (n_clusters == len(n.buses)) and not transport_model:
         # Fast-path if no clustering is necessary
         busmap = n.buses.index.to_series()
+        prefix_counts = {}
+        new_names = []
+        # for bus_name in busmap.index:
+        #     prefix = bus_name[:2]
+        #     if prefix not in prefix_counts:
+        #         prefix_counts[prefix] = 0
+        #     new_name = f"{prefix}{prefix_counts[prefix]}"
+        #     new_names.append(new_name)
+        #     prefix_counts[prefix] += 1
+        for bus_name in busmap.index:
+            prefix = bus_name[:2]
+            new_names.append(prefix)
+        busmap = pd.Series(new_names, index=busmap.index)
         linemap = n.lines.index.to_series()
-        clustering = pypsa.clustering.spatial.Clustering(
+        n.buses = n.buses.drop(columns=["interconnect"])
+        n.lines = n.lines.drop(columns=["interconnect"])
+        clustering = get_clustering_from_busmap(
             n,
             busmap,
-            linemap,
+            aggregate_generators_weighted=True,
+            aggregate_generators_carriers=aggregate_carriers,
+            aggregate_one_ports=["Load", "StorageUnit"],
+            line_length_factor=params.length_factor,
+            line_strategies=params.aggregation_strategies.get("lines", dict()),
+            generator_strategies=params.aggregation_strategies.get("generators", dict()),
+            bus_strategies={"Pd": "sum"},
+            one_port_strategies=params.aggregation_strategies.get("one_ports", dict()),
+            scale_link_capital_costs=False,
         )
     else:
         costs = pd.read_csv(snakemake.input.tech_costs)
@@ -693,6 +701,10 @@ if __name__ == "__main__":
                 f"Aggregating to transport model with {topological_boundaries} zones.",
             )
             match topological_boundaries:
+                case "state":
+                    custom_busmap = n.buses.reeds_state.copy()
+                    itl_fn = snakemake.input.itl_state
+                    itl_cost_fn = snakemake.input.itl_costs_state
                 case "reeds_zone":
                     custom_busmap = n.buses.reeds_zone.copy()
                     itl_fn = snakemake.input.itl_reeds_zone
@@ -726,8 +738,14 @@ if __name__ == "__main__":
                     n.buses.loc[agg_busmap.index, "county"] = "na"
                 if key == "reeds_zone":
                     n.buses.loc[agg_busmap.index, "county"] = "na"
-                itl_agg_fn = snakemake.input[f"itl_{key}"]
-                itl_agg_costs_fn = snakemake.input.get(f"itl_costs_{key}", None)
+                if key == "reeds_state":
+                    n.buses.loc[agg_busmap.index, "county"] = "na"
+                if key == "reeds_state":
+                    itl_agg_fn = snakemake.input["itl_state"]
+                    itl_agg_costs_fn = snakemake.input.get("itl_costs_state", None)
+                else:
+                    itl_agg_fn = snakemake.input[f"itl_{key}"]
+                    itl_agg_costs_fn = snakemake.input.get(f"itl_costs_{key}", None)
 
             logger.info("Using Transport Model.")
             nodes_req = custom_busmap.unique()
@@ -736,8 +754,14 @@ if __name__ == "__main__":
                 nodes_req,
             ), f"Number of clusters must be {len(nodes_req)} for current configuration."
 
-            n.buses.interconnect = n.buses.nerc_reg.map(REEDS_NERC_INTERCONNECT_MAPPER)
+            if topological_boundaries != "state":  # nerc_reg was droped in the "state" case
+                n.buses.interconnect = n.buses.nerc_reg.map(REEDS_NERC_INTERCONNECT_MAPPER)
             n.lines = n.lines.drop(columns=["interconnect"])
+
+        if (
+            topological_boundaries == "state"
+        ):  # Some states span multiple interconnects and will affect clustering_for_n_clusters
+            n.buses = n.buses.drop(columns=["interconnect"])
 
         clustering = clustering_for_n_clusters(
             n,
@@ -753,6 +777,12 @@ if __name__ == "__main__":
             weighting_strategy=params.cluster_network.get("weighting_strategy", None),
         )
 
+        # add interconnect information back to clustered network
+        if topological_boundaries == "state":
+            clustering.network.buses["interconnect"] = clustering.network.buses["reeds_state"].map(
+                STATES_INTERCONNECT_MAPPER
+            )
+
         if transport_model:
             # Use Reeds Data
             clustering = convert_to_transport(
@@ -767,6 +797,83 @@ if __name__ == "__main__":
         else:
             # Use standard transmission cost estimates
             update_transmission_costs(clustering.network, costs)
+
+    if not transport_model:
+        logger.info("Applying ITL state corrections to transmission lines...")
+
+        # Read ITL state data
+        itl_state = pd.read_csv(snakemake.input.itl_state)
+        itl_state.columns = itl_state.columns.str.lower()
+
+        # Create mapping from interface to maximum capacity
+        # Use the larger value between forward and reverse divided by 0.7 as new s_nom
+        itl_state["max_capacity_mw"] = np.maximum(itl_state["mw_f0"], itl_state["mw_r0"])
+        itl_state["new_s_nom"] = itl_state["max_capacity_mw"] / 0.7
+
+        # Create mapping from region pairs to new s_nom
+        itl_capacity_map = {}
+        for _, row in itl_state.iterrows():
+            # Bidirectional mapping: r->rr and rr->r
+            key1 = f"{row['r']}-{row['rr']}"
+            key2 = f"{row['rr']}-{row['r']}"
+            itl_capacity_map[key1] = row["new_s_nom"]
+            itl_capacity_map[key2] = row["new_s_nom"]
+
+        # Get lines from the network
+        lines = clustering.network.lines.copy()
+        lines_not_in_itl = []
+        lines_updated = 0
+
+        for line_idx in lines.index:
+            line = lines.loc[line_idx]
+            bus0 = clustering.network.buses.loc[line.bus0]
+            bus1 = clustering.network.buses.loc[line.bus1]
+
+            # Determine which field to use based on topological_boundaries
+            if topological_boundaries == "state":
+                region0 = bus0.get("reeds_state", bus0.get("country", ""))
+                region1 = bus1.get("reeds_state", bus1.get("country", ""))
+            else:
+                region0 = bus0.get("country", "")
+                region1 = bus1.get("country", "")
+
+            line_key = f"{region0}-{region1}"
+
+            if line_key in itl_capacity_map:
+                # Update line parameters
+                old_s_nom = line["s_nom"] if line["s_nom"] > 0 else 1.0  # Avoid division by zero
+                new_s_nom = itl_capacity_map[line_key]
+                capacity_ratio = new_s_nom / old_s_nom
+
+                # Update s_nom
+                clustering.network.lines.loc[line_idx, "s_nom"] = new_s_nom
+
+                # Update other parameters based on power system principles
+                if capacity_ratio != 1.0:
+                    # r (resistance) and x (reactance) are inversely proportional to capacity
+                    # (capacity increase through increased conductor cross-section)
+                    if line["r"] > 0:
+                        clustering.network.lines.loc[line_idx, "r"] = line["r"] / capacity_ratio
+                    if line["x"] > 0:
+                        clustering.network.lines.loc[line_idx, "x"] = line["x"] / capacity_ratio
+
+                    # b (susceptance) and g (conductance) are proportional to capacity
+                    clustering.network.lines.loc[line_idx, "b"] = line["b"] * capacity_ratio
+                    clustering.network.lines.loc[line_idx, "g"] = line["g"] * capacity_ratio
+
+                    lines_updated += 1
+            else:
+                # Lines not present in ITL state, mark for removal
+                lines_not_in_itl.append(line_idx)
+
+        # Remove lines not in ITL state
+        if lines_not_in_itl:
+            clustering.network.mremove("Line", lines_not_in_itl)
+
+        logger.info(
+            f"ITL state corrections completed: {lines_updated} lines updated with ITL data, "
+            f"{len(lines_not_in_itl)} lines removed (not in ITL state)",
+        )
 
     update_p_nom_max(clustering.network)
     clustering.network.generators.land_region = clustering.network.generators.land_region.fillna(

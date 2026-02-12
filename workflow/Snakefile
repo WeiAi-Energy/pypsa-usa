@@ -11,241 +11,160 @@ from os.path import normpath
 from itertools import chain
 from pathlib import Path
 import pandas as pd
-
-FIGURES_MAPS = [
-    "capacity_map_base.pdf",
-    "capacity_map_optimized.pdf",
-    "capacity_map_new.pdf",
-    "emissions_map.pdf",
-    "renewable_potential_map.pdf",
-    "demand_map.pdf",
-    # "lmp_map.pdf",
-]
-
-FIGURES_EMISSIONS = [
-    "emissions_area.pdf",
-    "emissions_accumulated.pdf",
-    "emissions_accumulated_tech.pdf",
-    "bar_regional_emissions.pdf",
-    "bar_emissions.pdf",
-]
-
-FIGURES_PRODUCTION = [
-    "production_area.pdf",
-]
-
-FIGURES_SYSTEM = [
-    "production_bar.pdf",
-    "capacity_additions_bar.pdf",
-    "bar_regional_capacity_additions.pdf",
-    "bar_regional_production.pdf",
-    "global_constraint_shadow_prices.pdf",
-    "generator_data_panel.pdf",
-    "fuel_costs.pdf",
-    "region_lmps.pdf",
-]
-
-FIGURES_VALIDATE = [
-    "daily_stacked_comparison.pdf",
-    "carrier_production_bar.pdf",
-    "val_bar_state_emissions.pdf",
-    "val_generator_data_panel.pdf",
-    "val_box_region_lmps.pdf",
-    "val_map_load_shedding.pdf",
-    "val_generator_stack.pdf",
-    "val_map_line_loading.pdf",
-    "val_state_generation_deviation.pdf",
-    "val_heatmap_state_generation_carrier.pdf",
-    "val_cap_state_generation.pdf",
-    "val_fuel_costs.pdf",
-]
+import copy
 
 
-# --------------------------- Workflow constraints --------------------------- #
-localrules:
-    dag,
-    clean,
-
-
-wildcard_constraints:
-    interconnect="usa|texas|western|eastern",
-    simpl="[a-zA-Z0-9]*|all",
-    clusters="[0-9]+m?+a?+c?|all",
-    ll="(v|c)([0-9\.]+|opt|all)|all",
-    opts="[-+a-zA-Z0-9\.]*",
-    sector="([EG]-)*[EG]",
-
-
-# -------------------------- Config and Subworkflows ------------------------- #
-
-
-# Merge subworkflow configs and main config
+# ======================== Configuration Files ========================
 configfile: "config/config.cluster.yaml"
 configfile: "config/config.common.yaml"
 configfile: "config/config.plotting.yaml"
 configfile: "config/config.api.yaml"
 configfile: "config/config.sector.yaml"
+configfile: "config/config.default.yaml"
+configfile: "config/config.yaml"
 
 
-# configfile: "config/config.default.yaml"
-
-
-run = config.get("run", {})
-RDIR = run["name"] + "/" if run.get("name") else ""
-CDIR = RDIR if not run.get("shared_cutouts") else ""
-
-LOGS = "logs/" + RDIR
-BENCHMARKS = "benchmarks/" + RDIR
+# ======================== Path Definitions ========================
+RESOURCES = "resources/"  # Shared resources up to add_extra_components
 DATA = "data/"
-RESOURCES = "resources/" + RDIR if not run.get("shared_resources") else "resources/"
-RESULTS = "results/" + RDIR
+LOGS = "logs/"
+RESULTS = "results/"  # Case-specific results
+
+# ======================== Wildcard Constraints ========================
+CASES = list(config["cases"].keys())
 
 
+wildcard_constraints:
+    case="|".join(CASES),
+    interconnect="usa|texas|western|eastern",
+    simpl="[a-zA-Z0-9]*|all",
+    clusters="[0-9]+m?+a?+c?|all",
+    ll="(v|c)([0-9\.]+|opt|all|inf)|all",
+    opts="[-+a-zA-Z0-9\.]*",
+    sector="SimpSec|[EGH](?:-[EGH])*",
+    transmission_network="reeds|tamu",
+
+
+# ======================== Local Rules ========================
+localrules:
+    all,
+    dag,
+    clean,
+
+
+# ======================== Include Rule Files ========================
 include: "rules/common.smk"
+
+
+CASE_CONFIGS = build_case_configs(config, config["cases"])
+
+
 include: "rules/retrieve.smk"
 include: "rules/build_electricity.smk"
 include: "rules/build_sector.smk"
 include: "rules/solve_electricity.smk"
 include: "rules/postprocess.smk"
-include: "rules/postprocess_sector.smk"
-include: "rules/validate.smk"
 
 
-if "E" not in config["scenario"]["sector"]:
+# ======================== Sector Configuration ========================
+if config["scenario"]["sector"] == "SimpSec":
+    pass
+elif "E" not in config["scenario"]["sector"]:
     if not config["scenario"]["sector"]:
         config["scenario"]["sector"] = "E"
     else:
         config["scenario"]["sector"] = f"E-{config['scenario']['sector']}"
 
-# ----------------------------------- Rules ---------------------------------- #
 
+# ======================== Rule All ========================
+def get_all_outputs(wildcards):
+    """Generate all required output files across all cases."""
+    outputs = []
 
-def electricity_figures(wildcards):
-    figs = []
-    if "G" in config["scenario"]["sector"].split("-"):
-        return []
-    elif not config["run"]["validation"]:
-        # maps
-        figs.append(
-            expand(
-                RESULTS
-                + "{interconnect}/figures/s{simpl}_cluster_{clusters}/l{ll}_{opts}_{sector}/maps/{figure}",
-                **config["scenario"],
-                figure=FIGURES_MAPS,
-            )
-        )
-        # emissions
-        figs.append(
-            expand(
-                RESULTS
-                + "{interconnect}/figures/s{simpl}_cluster_{clusters}/l{ll}_{opts}_{sector}/emissions/{figure}",
-                **config["scenario"],
-                figure=FIGURES_EMISSIONS,
-            )
-        )
-        # production
-        figs.append(
-            expand(
-                RESULTS
-                + "{interconnect}/figures/s{simpl}_cluster_{clusters}/l{ll}_{opts}_{sector}/production/{figure}",
-                **config["scenario"],
-                figure=FIGURES_PRODUCTION,
-            )
-        )
-        # system
-        figs.append(
-            expand(
-                RESULTS
-                + "{interconnect}/figures/s{simpl}_cluster_{clusters}/l{ll}_{opts}_{sector}/system/{figure}",
-                **config["scenario"],
-                figure=FIGURES_SYSTEM,
-            )
-        )
-        return list(chain(*figs))  # expand list of lists to single list
-    else:
-        return []
+    # Get default transmission network from global config
+    default_transmission_network = config.get("model_topology", {}).get(
+        "transmission_network", "tamu"
+    )
 
+    for case_name in CASES:
+        # Only generate outputs for cases that are defined in config
+        if case_name not in config["cases"]:
+            continue
 
-def sector_figures(wildcards):
+        # Get case-specific configuration
+        case_config = config["cases"][case_name]
 
-    figs = []
+        # Get transmission network for this specific case
+        # Use case-specific value if it exists, otherwise use default
+        transmission_network = case_config.get("model_topology", {}).get(
+            "transmission_network", default_transmission_network
+        )
 
-    if "G" in config["scenario"]["sector"].split("-"):
-        figs.append(
-            expand(
-                RESULTS
-                + "{interconnect}/figures/s{simpl}_c{clusters}/l{ll}_{opts}_{sector}/system/natural_gas/{figure}.png",
-                **config["scenario"],
-                figure=FIGURES_SECTOR_NATURAL_GAS,
-            )
+        # Capacity figures
+        outputs.extend(
+            [
+                f"{RESULTS}{transmission_network}/{case_name}/figures/capacity/generation_capacities.png",
+                f"{RESULTS}{transmission_network}/{case_name}/figures/capacity/transport_capacities.png",
+                f"{RESULTS}{transmission_network}/{case_name}/figures/capacity/storage_energy_capacities.png",
+                f"{RESULTS}{transmission_network}/{case_name}/figures/capacity/storage_power_capacities.png",
+            ]
         )
-        figs.append(
-            expand(
-                RESULTS
-                + "{interconnect}/figures/s{simpl}_c{clusters}/l{ll}_{opts}_{sector}/system/emissions/{figure}.png",
-                **config["scenario"],
-                figure=FIGURES_SECTOR_EMISSIONS,
-            )
-        )
-        figs.append(
-            expand(
-                RESULTS
-                + "{interconnect}/figures/s{simpl}_c{clusters}/l{ll}_{opts}_{sector}/system/production/res/{figure}.png",
-                **config["scenario"],
-                figure=FIGURES_SECTOR_PRODUCTION,
-            )
-        )
-        figs.append(
-            expand(
-                RESULTS
-                + "{interconnect}/figures/s{simpl}_c{clusters}/l{ll}_{opts}_{sector}/system/capacity/res/{figure}.png",
-                **config["scenario"],
-                figure=FIGURES_SECTOR_CAPACITY,
-            )
-        )
-        figs.append(
-            expand(
-                RESULTS
-                + "{interconnect}/figures/s{simpl}_c{clusters}/l{ll}_{opts}_{sector}/system/sankey/{figure}.html",
-                **config["scenario"],
-                figure=FIGURES_SECTOR_SANKEY,
-            )
-        )
-        # figs.append(
-        #     expand(
-        #         RESULTS
-        #         + "{interconnect}/figures/s{simpl}_c{clusters}/l{ll}_{opts}_{sector}/system/validate/{figure}.png",
-        #         **config["scenario"],
-        #         figure=FIGURES_SECTOR_VALIDATE,
-        #     )
-        # )
-        return list(chain(*figs))
-    return figs
 
-
-def validation_figures(wildcards):
-    if config["run"]["validation"]:
-        return expand(
-            RESULTS
-            + "{interconnect}/figures/s{simpl}_cluster_{clusters}/l{ll}_{opts}_{sector}/{figure}",
-            **config["scenario"],
-            figure=FIGURES_VALIDATE,
+        # Dispatch figures
+        outputs.extend(
+            [
+                f"{RESULTS}{transmission_network}/{case_name}/figures/dispatch/electricity_dispatch.png",
+                f"{RESULTS}{transmission_network}/{case_name}/figures/dispatch/gas_dispatch.png",
+                f"{RESULTS}{transmission_network}/{case_name}/figures/dispatch/hydrogen_dispatch.png",
+                f"{RESULTS}{transmission_network}/{case_name}/figures/dispatch/storage_soc.png",
+            ]
         )
-    else:
-        return []
+
+        # Network maps
+        outputs.extend(
+            [
+                f"{RESULTS}{transmission_network}/{case_name}/figures/maps/elec_cap_network.png",
+                f"{RESULTS}{transmission_network}/{case_name}/figures/maps/gas_cap_network.png",
+                f"{RESULTS}{transmission_network}/{case_name}/figures/maps/h2_cap_network.png",
+                f"{RESULTS}{transmission_network}/{case_name}/figures/maps/large_storage_cap_network.png",
+                f"{RESULTS}{transmission_network}/{case_name}/figures/maps/small_storage_cap_network.png",
+                f"{RESULTS}{transmission_network}/{case_name}/figures/maps/demand_cap_network.png",
+            ]
+        )
+
+        # Cost figures
+        outputs.append(
+            f"{RESULTS}{transmission_network}/{case_name}/figures/cost/system_costs.png"
+        )
+        outputs.append(
+            f"{RESULTS}{transmission_network}/{case_name}/figures/cost/lmps.png"
+        )
+
+        # Flexibility figures
+        outputs.extend(
+            [
+                # Week-based flexibility
+                f"{RESULTS}{transmission_network}/{case_name}/figures/flexibility/flexibility_contribution_Interconnection_week.png",
+                # Month-based flexibility
+                f"{RESULTS}{transmission_network}/{case_name}/figures/flexibility/flexibility_contribution_Interconnection_month.png",
+                # Season-based flexibility
+                f"{RESULTS}{transmission_network}/{case_name}/figures/flexibility/flexibility_contribution_Interconnection_season.png",
+            ]
+        )
+
+    return outputs
 
 
 rule all:
     input:
-        electricity_figures,
-        sector_figures,
-        validation_figures,
-        #"repo_data/dag.jpg",
+        get_all_outputs,
+    default_target: True
 
 
+# ======================== Utility Rules ========================
 # Create DAG with-
-# snakemake --rulegraph all | sed -n "/digraph/,\$p" | dot -Tpng -o repo_data/dag.jpg
-# snakemake --dag -F | sed -n "/digraph/,\$p" | dot -Tpng -o repo_data/dag.jpg
+# snakemake --dag > dag.dot
+# dot -Tpng dag.dot -o dag.png
 rule dag:
     message:
         "Creating DAG of workflow."
@@ -267,4 +186,22 @@ rule clean:
 
         shutil.rmtree("resources", ignore_errors=True)
         shutil.rmtree("results", ignore_errors=True)
+        shutil.rmtree("logs", ignore_errors=True)
         print("Data downloaded to data/ has not been cleaned.")
+
+
+# ======================== Case-specific Target Rules ========================
+rule run_case:
+    """
+    Run a specific case completely.
+    Usage: snakemake --cores 1 run_case --config case=E+
+    """
+    input:
+        lambda w: [
+            f"{RESULTS}{config['cases'][w.case].get('model_topology', {}).get('transmission_network', config.get('model_topology', {}).get('transmission_network', 'tamu'))}/{w.case}/figures/capacity/generation_capacities.png",
+            f"{RESULTS}{config['cases'][w.case].get('model_topology', {}).get('transmission_network', config.get('model_topology', {}).get('transmission_network', 'tamu'))}/{w.case}/figures/dispatch/electricity_dispatch.png",
+            f"{RESULTS}{config['cases'][w.case].get('model_topology', {}).get('transmission_network', config.get('model_topology', {}).get('transmission_network', 'tamu'))}/{w.case}/figures/maps/elec_cap_network.png",
+            f"{RESULTS}{config['cases'][w.case].get('model_topology', {}).get('transmission_network', config.get('model_topology', {}).get('transmission_network', 'tamu'))}/{w.case}/figures/cost/system_costs.png",
+        ],
+    message:
+        "Completed case: {wildcards.case}"

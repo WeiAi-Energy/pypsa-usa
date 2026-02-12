@@ -149,8 +149,8 @@ def build_pudl_fuel_costs(snapshots: pd.DatetimeIndex, start_date: str, end_date
         const.NERC_REGION_MAPPER,
     )
 
-    if snakemake.wildcards.interconnect != "usa":
-        fuel_cost_temporal = fuel_cost_temporal[fuel_cost_temporal["interconnect"] == snakemake.wildcards.interconnect]
+    # if snakemake.wildcards.interconnect != "usa":
+    #     fuel_cost_temporal = fuel_cost_temporal[fuel_cost_temporal["interconnect"] == snakemake.wildcards.interconnect]
 
     fuel_cost_temporal["generator_name"] = (
         fuel_cost_temporal["plant_name_eia"].astype(str)
@@ -181,7 +181,7 @@ def build_pudl_fuel_costs(snapshots: pd.DatetimeIndex, start_date: str, end_date
 
 if __name__ == "__main__":
     if "snakemake" not in globals():
-        snakemake = mock_snakemake("build_fuel_prices", interconnect="texas")
+        snakemake = mock_snakemake("build_fuel_prices", interconnect="usa")
     configure_logging(snakemake)
 
     eia_api = snakemake.params.api_eia

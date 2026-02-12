@@ -1,99 +1,109 @@
 """Rules for post procesing solved networks"""
 
 
-rule plot_network_maps:
-    input:
-        network=RESULTS
-        + "{interconnect}/networks/elec_s{simpl}_c{clusters}_ec_l{ll}_{opts}_{sector}.nc",
-        regions_onshore=(
-            config["custom_files"]["files_path"]
-            + "regions_onshore_s{simpl}_{clusters}.geojson"
-            if config["custom_files"].get("activate", False)
-            else RESOURCES
-            + "{interconnect}/Geospatial/regions_onshore_s{simpl}_{clusters}.geojson"
-        ),
-        regions_offshore=(
-            config["custom_files"]["files_path"]
-            + "regions_offshore_s{simpl}_{clusters}.geojson"
-            if config["custom_files"].get("activate", False)
-            else RESOURCES
-            + "{interconnect}/Geospatial/regions_offshore_s{simpl}_{clusters}.geojson"
-        ),
+rule plot_simpsec_capacity:
     params:
-        electricity=config["electricity"],
-        plotting=config["plotting"],
-        retirement=config["electricity"].get("retirement", "technical"),
-    output:
-        **{
-            fig: RESULTS
-            + "{interconnect}/figures/s{simpl}_cluster_{clusters}/l{ll}_{opts}_{sector}/maps/%s"
-            % fig
-            for fig in FIGURES_MAPS
-        },
-    log:
-        "logs/plot_figures/{interconnect}_{simpl}_{clusters}_l{ll}_{opts}_{sector}.log",
-    threads: 1
-    resources:
-        mem_mb=7000,
-    script:
-        "../scripts/plot_network_maps.py"
-
-
-rule plot_statistics:
+        sector=get_case_sector,
     input:
-        network=RESULTS
-        + "{interconnect}/networks/elec_s{simpl}_c{clusters}_ec_l{ll}_{opts}_{sector}.nc",
-        regions_onshore=(
-            config["custom_files"]["files_path"]
-            + "regions_onshore_s_{clusters}.geojson"
-            if config["custom_files"].get("activate", False)
-            else RESOURCES
-            + "{interconnect}/Geospatial/regions_onshore_s{simpl}_{clusters}.geojson"
-        ),
-        regions_offshore=(
-            config["custom_files"]["files_path"]
-            + "regions_offshore_s_{clusters}.geojson"
-            if config["custom_files"].get("activate", False)
-            else RESOURCES
-            + "{interconnect}/Geospatial/regions_offshore_s{simpl}_{clusters}.geojson"
-        ),
-    params:
-        electricity=config["electricity"],
-        plotting=config["plotting"],
-        retirement=config["electricity"].get("retirement", "technical"),
+        network=RESULTS + "{transmission_network}/{case}/networks/solved_network.nc",
     output:
-        **{
-            fig: RESULTS
-            + "{interconnect}/figures/s{simpl}_cluster_{clusters}/l{ll}_{opts}_{sector}/emissions/%s"
-            % fig
-            for fig in FIGURES_EMISSIONS
-        },
-        **{
-            fig: RESULTS
-            + "{interconnect}/figures/s{simpl}_cluster_{clusters}/l{ll}_{opts}_{sector}/production/%s"
-            % fig
-            for fig in FIGURES_PRODUCTION
-        },
-        **{
-            fig: RESULTS
-            + "{interconnect}/figures/s{simpl}_cluster_{clusters}/l{ll}_{opts}_{sector}/system/%s"
-            % fig
-            for fig in FIGURES_SYSTEM
-        },
-        statistics_summary=RESULTS
-        + "{interconnect}/figures/s{simpl}_cluster_{clusters}/l{ll}_{opts}_{sector}/statistics/statistics.csv",
-        statistics_dissaggregated=RESULTS
-        + "{interconnect}/figures/s{simpl}_cluster_{clusters}/l{ll}_{opts}_{sector}/statistics/statistics_dissaggregated.csv",
-        generators=RESULTS
-        + "{interconnect}/figures/s{simpl}_cluster_{clusters}/l{ll}_{opts}_{sector}/statistics/generators.csv",
-        storage_units=RESULTS
-        + "{interconnect}/figures/s{simpl}_cluster_{clusters}/l{ll}_{opts}_{sector}/statistics/storage_units.csv",
-        links=RESULTS
-        + "{interconnect}/figures/s{simpl}_cluster_{clusters}/l{ll}_{opts}_{sector}/statistics/links.csv",
+        generation_capacities=RESULTS
+        + "{transmission_network}/{case}/figures/capacity/generation_capacities.png",
+        transport_capacities=RESULTS
+        + "{transmission_network}/{case}/figures/capacity/transport_capacities.png",
+        storage_energy_capacities=RESULTS
+        + "{transmission_network}/{case}/figures/capacity/storage_energy_capacities.png",
+        storage_power_capacities=RESULTS
+        + "{transmission_network}/{case}/figures/capacity/storage_power_capacities.png",
     log:
-        "logs/plot_figures/{interconnect}_{simpl}_{clusters}_l{ll}_{opts}_{sector}.log",
+        LOGS + "{transmission_network}/{case}/plot_capacity.log",
     threads: 1
     resources:
         mem_mb=5000,
     script:
-        "../scripts/plot_statistics.py"
+        "../scripts/plot_simpsec_capacity.py"
+
+
+rule plot_simpsec_dispatch:
+    input:
+        network=RESULTS + "{transmission_network}/{case}/networks/solved_network.nc",
+    output:
+        electricity_dispatch=RESULTS
+        + "{transmission_network}/{case}/figures/dispatch/electricity_dispatch.png",
+        gas_dispatch=RESULTS
+        + "{transmission_network}/{case}/figures/dispatch/gas_dispatch.png",
+        hydrogen_dispatch=RESULTS
+        + "{transmission_network}/{case}/figures/dispatch/hydrogen_dispatch.png",
+        storage_soc=RESULTS
+        + "{transmission_network}/{case}/figures/dispatch/storage_soc.png",
+    log:
+        LOGS + "{transmission_network}/{case}/plot_dispatch.log",
+    threads: 1
+    resources:
+        mem_mb=8000,
+    script:
+        "../scripts/plot_simpsec_dispatch.py"
+
+
+rule plot_simpsec_network:
+    params:
+        sector=get_case_sector,
+        line_max_extension=config["lines"]["max_extension"],
+    input:
+        network=RESULTS + "{transmission_network}/{case}/networks/solved_network.nc",
+        regions_onshore=RESOURCES
+        + "{transmission_network}/Geospatial/regions_onshore_clustered.geojson",
+    output:
+        elec_cap_network=RESULTS
+        + "{transmission_network}/{case}/figures/maps/elec_cap_network.png",
+        gas_cap_network=RESULTS
+        + "{transmission_network}/{case}/figures/maps/gas_cap_network.png",
+        h2_cap_network=RESULTS
+        + "{transmission_network}/{case}/figures/maps/h2_cap_network.png",
+        large_storage_cap_network=RESULTS
+        + "{transmission_network}/{case}/figures/maps/large_storage_cap_network.png",
+        small_storage_cap_network=RESULTS
+        + "{transmission_network}/{case}/figures/maps/small_storage_cap_network.png",
+        demand_cap_network=RESULTS
+        + "{transmission_network}/{case}/figures/maps/demand_cap_network.png",
+    log:
+        LOGS + "{transmission_network}/{case}/plot_network.log",
+    threads: 1
+    resources:
+        mem_mb=8000,
+    script:
+        "../scripts/plot_simpsec_network.py"
+
+
+rule plot_simpsec_cost:
+    input:
+        network=RESULTS + "{transmission_network}/{case}/networks/solved_network.nc",
+    output:
+        costs=RESULTS + "{transmission_network}/{case}/figures/cost/system_costs.png",
+        lmps=RESULTS + "{transmission_network}/{case}/figures/cost/lmps.png",
+    log:
+        LOGS + "{transmission_network}/{case}/plot_cost.log",
+    threads: 1
+    resources:
+        mem_mb=5000,
+    script:
+        "../scripts/plot_simpsec_cost.py"
+
+
+rule plot_simpsec_flexibility:
+    input:
+        network=RESULTS + "{transmission_network}/{case}/networks/solved_network.nc",
+    output:
+        flexibility_interconnection_week=RESULTS
+        + "{transmission_network}/{case}/figures/flexibility/flexibility_contribution_Interconnection_week.png",
+        flexibility_interconnection_month=RESULTS
+        + "{transmission_network}/{case}/figures/flexibility/flexibility_contribution_Interconnection_month.png",
+        flexibility_interconnection_season=RESULTS
+        + "{transmission_network}/{case}/figures/flexibility/flexibility_contribution_Interconnection_season.png",
+    log:
+        LOGS + "{transmission_network}/{case}/plot_flexibility.log",
+    threads: 1
+    resources:
+        mem_mb=5000,
+    script:
+        "../scripts/plot_simpsec_flexibility.py"

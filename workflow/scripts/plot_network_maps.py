@@ -584,17 +584,20 @@ if __name__ == "__main__":
 
         snakemake = mock_snakemake(
             "plot_network_maps",
-            interconnect="western",
-            clusters="4m",
-            simpl="70",
+            interconnect="usa",
+            clusters="48",
+            simpl="53",
             ll="v1.0",
-            opts="1h-TCT",
-            sector="E",
+            opts="4h",
+            sector="SimpSec",
         )
     configure_logging(snakemake)
 
     # extract shared plotting files
-    n = pypsa.Network(snakemake.input.network)
+    # n = pypsa.Network(snakemake.input.network)
+    n = pypsa.Network(
+        "D:\\Research\\Hydrogen_storage_project\\pypsa-usa\\workflow\\results\\agg_yes_bi_no\\usa\\networks\\elec_s53_c48_ec_lv1.0_4h_SimpSec.nc",
+    )
     onshore_regions = gpd.read_file(snakemake.input.regions_onshore)
 
     sanitize_carriers(n, snakemake.config)

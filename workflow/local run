@@ -1,0 +1,1 @@
+snakemake -j1 --configfile config/config.default.yaml --configfile config/config.yaml

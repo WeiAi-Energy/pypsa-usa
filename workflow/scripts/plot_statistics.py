@@ -33,14 +33,11 @@ import math
 from datetime import datetime
 from pathlib import Path
 
-import geopandas as gpd
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pypsa
 import seaborn as sns
-from _helpers import configure_logging
-from add_electricity import sanitize_carriers
 from plot_network_maps import get_color_palette
 from summary import (
     get_demand_timeseries,
@@ -900,43 +897,48 @@ def plot_fuel_costs(
 
 
 if __name__ == "__main__":
-    if "snakemake" not in globals():
-        from _helpers import mock_snakemake
-
-        snakemake = mock_snakemake(
-            "plot_statistics",
-            interconnect="texas",
-            clusters=7,
-            ll="v1.00",
-            opts="REM-400SEG",
-            sector="E",
-        )
-    configure_logging(snakemake)
+    # if "snakemake" not in globals():
+    #     from _helpers import mock_snakemake
+    #
+    #     snakemake = mock_snakemake(
+    #         "plot_statistics",
+    #         interconnect="usa",
+    #         simpl=53,
+    #         clusters=48,
+    #         ll="vinf",
+    #         opts="4h",
+    #         sector="SimpSec",
+    #     )
+    # configure_logging(snakemake)
 
     # extract shared plotting files
-    n = pypsa.Network(snakemake.input.network)
-    onshore_regions = gpd.read_file(snakemake.input.regions_onshore)
-    retirement_method = snakemake.params.retirement
-
-    sanitize_carriers(n, snakemake.config)
+    # n = pypsa.Network(snakemake.input.network)
+    n = pypsa.Network(
+        "D:\\Research\\Hydrogen_storage_project\\pypsa-usa\\workflow\\results\\lossy\\E+_vinf_E+lossy\\networks\\solved_network.nc"
+    )
+    # onshore_regions = gpd.read_file(snakemake.input.regions_onshore)
+    # retirement_method = snakemake.params.retirement
+    #
+    # sanitize_carriers(n, snakemake.config)
 
     # mappers
     generating_link_carrier_map = {"fuel cell": "H2", "battery discharger": "battery"}
 
     # carriers to plot
-    carriers = (
-        snakemake.params.electricity["conventional_carriers"]
-        + snakemake.params.electricity["renewable_carriers"]
-        + snakemake.params.electricity["extendable_carriers"]["Generator"]
-        + snakemake.params.electricity["extendable_carriers"]["StorageUnit"]
-        + snakemake.params.electricity["extendable_carriers"]["Store"]
-        + snakemake.params.electricity["extendable_carriers"]["Link"]
-        + ["battery_charger", "battery_discharger"]
-    )
-    carriers = list(set(carriers))  # remove any duplicates
+    # carriers = (
+    #     snakemake.params.electricity["conventional_carriers"]
+    #     + snakemake.params.electricity["renewable_carriers"]
+    #     + snakemake.params.electricity["extendable_carriers"]["Generator"]
+    #     + snakemake.params.electricity["extendable_carriers"]["StorageUnit"]
+    #     + snakemake.params.electricity["extendable_carriers"]["Store"]
+    #     + snakemake.params.electricity["extendable_carriers"]["Link"]
+    #     + ["battery_charger", "battery_discharger"]
+    # )
+    # carriers = list(set(carriers))  # remove any duplicates
 
     # Export Statistics Tables
     groupers = n.statistics.groupers
+    df = n.statistics(groupby=groupers.get_name_bus_and_carrier).round(3)
     n.statistics(groupby=groupers.get_name_bus_and_carrier).round(3).to_csv(
         snakemake.output.statistics_dissaggregated,
     )

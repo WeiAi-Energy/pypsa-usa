@@ -209,7 +209,7 @@ def trim_shape_to_interconnect(
 
 
 def main(snakemake):
-    interconnect = snakemake.wildcards.interconnect
+    interconnect = getattr(snakemake.wildcards, "interconnect", "usa")
     breakthrough_zones = pd.read_csv(snakemake.input.zone)
     logger.info("Building GIS Shapes for %s Interconnect", interconnect)
 

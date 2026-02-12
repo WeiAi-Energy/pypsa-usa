@@ -1,198 +1,176 @@
-"""Rules for building sector coupling network"""
+def sector_input_files_part1(wildcards):
+    """Input files for Part 1: sector foundation and natural gas"""
+    network_path = (
+        RESOURCES
+        + f"{wildcards.transmission_network}/{wildcards.case}/prepared_network.nc"
+    )
+    costs_path = (
+        RESOURCES + f"costs/costs_{config['scenario']['planning_horizons'][0]}.csv"
+    )
 
-
-def sector_input_files(wildcards):
     input_files = {
-        "network": RESOURCES
-        + "{interconnect}/elec_s{simpl}_c{clusters}_ec_l{ll}_{opts}.nc",
-        "tech_costs": RESOURCES
-        + f"costs/sector_costs_{config['scenario']['planning_horizons'][0]}.csv",
+        "network": network_path,
+        "costs": costs_path,
+        "addi_costs": f"repo_data/costs/SimpSec_costs_{config['scenario']['planning_horizons'][0]}.csv",
+        "county": DATA + "counties/cb_2020_us_county_500k.shp",
+        "gas_distribution": RESOURCES + "gas_capacity_distribution.csv",
     }
-    sectors = wildcards.sector.split("-")
-    if "G" in sectors:
-        ng_files = {
-            "county": DATA + "counties/cb_2020_us_county_500k.shp",
-            "pipeline_capacity": DATA
-            + "natural_gas/EIA-StatetoStateCapacity_Feb2024.xlsx",
-            "pipeline_shape": DATA + "natural_gas/pipelines.geojson",
-            "eia_757": DATA + "natural_gas/EIA-757.csv",
-            "cop_soil_total": RESOURCES
-            + "{interconnect}/cop_soil_total_elec_s{simpl}_c{clusters}.nc",
-            "cop_soil_rural": RESOURCES
-            + "{interconnect}/cop_soil_rural_elec_s{simpl}_c{clusters}.nc",
-            "cop_soil_urban": RESOURCES
-            + "{interconnect}/cop_soil_urban_elec_s{simpl}_c{clusters}.nc",
-            "cop_air_total": RESOURCES
-            + "{interconnect}/cop_air_total_elec_s{simpl}_c{clusters}.nc",
-            "cop_air_rural": RESOURCES
-            + "{interconnect}/cop_air_rural_elec_s{simpl}_c{clusters}.nc",
-            "cop_air_urban": RESOURCES
-            + "{interconnect}/cop_air_urban_elec_s{simpl}_c{clusters}.nc",
-            "clustered_pop_layout": RESOURCES
-            + "{interconnect}/pop_layout_elec_s{simpl}_c{clusters}.csv",
-            "ev_policy": config["sector"]["transport_sector"]["investment"][
-                "ev_policy"
-            ],
-            "residential_stock": "repo_data/sectors/residential_stock",
-            "commercial_stock": "repo_data/sectors/commercial_stock",
-            "industrial_stock": "repo_data/sectors/industrial_stock/Table5_6.xlsx",
+
+    # PHS files (if needed for attach_phs_storageunits)
+    phs_files = {
+        f"phs_shp_{hour}": "repo_data/"
+        + f"psh/40-100-dam-height-{hour}hr-no-croplands-no-ephemeral-no-highways.gpkg"
+        for phs_tech in config["electricity"]["PHS_exp"]
+        if "PHS" in phs_tech
+        for hour in phs_tech.split("hr_")
+        if hour.isdigit()
+    }
+    input_files.update(phs_files)
+
+    # Regions onshore (needed for PHS)
+    if phs_files:
+        regions_onshore_files = {
+            "regions_onshore": RESOURCES
+            + "{transmission_network}/Geospatial/regions_onshore_clustered.geojson",
         }
-        input_files.update(ng_files)
+        input_files.update(regions_onshore_files)
+
+    # Natural gas files
+    ng_files = {
+        "pipeline_capacity": DATA + "natural_gas/EIA-StatetoStateCapacity_Feb2024.xlsx",
+        "pipeline_shape": DATA + "natural_gas/pipelines.geojson",
+        "gas_storage_plants": "repo_data/Natural gas storage plant.csv",
+    }
+    input_files.update(ng_files)
+
+    # CO2 storage file (needed for build_co2_tracking)
+    co2_storage_file = {
+        "co2_storage_file": RESOURCES + "{transmission_network}/co2_storage.csv"
+    }
+    input_files.update(co2_storage_file)
 
     return input_files
 
 
-rule add_sectors:
+def sector_input_files_part2(wildcards):
+    """Input files for Part 2: hydrogen, biomass, DAC, CO2, LDES, derates"""
+    case_config = config["cases"][wildcards.case]
+    nza_scenario = case_config["scenario"]["nza_scenario"]
+
+    input_files = {
+        "network": RESOURCES
+        + f"{wildcards.transmission_network}/{wildcards.case}/sector_network_part1.nc",
+        "costs": RESOURCES
+        + f"costs/costs_{config['scenario']['planning_horizons'][0]}.csv",
+        "addi_costs": f"repo_data/costs/SimpSec_costs_{config['scenario']['planning_horizons'][0]}.csv",
+    }
+
+    # Biomass files based on nza_scenario
+    if nza_scenario in ("E+", "E-", "E+RE-", "E+RE+"):
+        bio_files = {
+            "agri": "repo_data/biomass/billionton_23_agri_NT.csv",
+            "forestry": "repo_data/biomass/billionton_23_forestry_NT.csv",
+            "wastes": "repo_data/biomass/billionton_23_wastes_NT.csv",
+        }
+    else:
+        bio_files = {
+            "agri": "repo_data/biomass/billionton_23_agri_mm-med.csv",
+            "forestry": "repo_data/biomass/billionton_23_forestry_mm-med.csv",
+            "wastes": "repo_data/biomass/billionton_23_wastes_mm-med.csv",
+        }
+    input_files.update(bio_files)
+
+    # CO2 storage file
+    co2_storage_file = {
+        "co2_storage_file": RESOURCES + "{transmission_network}/co2_storage.csv"
+    }
+    input_files.update(co2_storage_file)
+
+    # Derates files
+    derates_file = {
+        "state_derates": RESOURCES + "state_derates.csv",
+        "national_derates": RESOURCES + "national_derates.csv",
+    }
+    input_files.update(derates_file)
+
+    return input_files
+
+
+rule add_simple_sectors_part1:
+    """
+    First part: Add sector foundation and natural gas infrastructure
+    """
     params:
-        electricity=config["electricity"],
-        costs=config["costs"],
-        plotting=config["plotting"],
-        snapshots=config["snapshots"],
-        api=config["api"],
-        sector=config["sector"],
+        scenario=get_case_scenario,
+        electricity=get_case_electricity,
+        sector=get_case_sector,
+        costs=case_config_provider("costs"),
+        plotting=case_config_provider("plotting"),
+        snapshots=case_config_provider("snapshots"),
+        api=case_config_provider("api"),
     input:
-        unpack(sector_input_files),
+        unpack(sector_input_files_part1),
     output:
-        network=RESOURCES
-        + "{interconnect}/elec_s{simpl}_c{clusters}_ec_l{ll}_{opts}_{sector}.nc",
+        network=RESOURCES + "{transmission_network}/{case}/sector_network_part1.nc",
     log:
-        "logs/add_sectors/{interconnect}/elec_s{simpl}_c{clusters}_ec_l{ll}_{opts}_{sector}.log",
+        LOGS + "{transmission_network}/{case}/add_simple_sectors_part1.log",
     group:
         "prepare"
     threads: 1
     resources:
         mem_mb=4000,
     script:
-        "../scripts/add_sectors.py"
+        "../scripts/add_simple_sectors_part1.py"
 
 
-rule build_population_layouts:
-    input:
-        county_shapes=DATA + "counties/cb_2020_us_county_500k.shp",
-        urban_percent=DATA + "urbanization/DECENNIALDHC2020.H2-Data.csv",
-        population=DATA + "population/DECENNIALDHC2020.P1-Data.csv",
-        cutout=lambda wildcards: expand(
-            "cutouts/" + CDIR + "usa_era5_" + "{renewable_weather_year}" + ".nc",
-            renewable_weather_year=config["renewable_weather_years"],
-        ),
-    output:
-        pop_layout_total=RESOURCES + "{interconnect}/pop_layout_total.nc",
-        pop_layout_urban=RESOURCES + "{interconnect}/pop_layout_urban.nc",
-        pop_layout_rural=RESOURCES + "{interconnect}/pop_layout_rural.nc",
-    log:
-        LOGS + "{interconnect}/build_population_layouts.log",
-    resources:
-        mem_mb=20000,
-    benchmark:
-        BENCHMARKS + "{interconnect}/build_population_layouts"
-    threads: 8
-    conda:
-        "../envs/environment.yaml"
-    script:
-        "../scripts/build_population_layouts.py"
+def get_reference_network_for_only_power(wildcards):
+    """
+    Get reference network path for only_power mode.
+    Returns the solved network from the non-only_power case if only_power is enabled.
+    The reference case name is derived by removing "_power" suffix from the case name.
+    """
+    case_cfg = get_case_config(wildcards)
+    only_power_enabled = (
+        case_cfg.get("sector", {}).get("only_power", {}).get("enable", False)
+    )
 
+    if only_power_enabled:
+        # Remove "_power" suffix to get reference case name
+        reference_case = wildcards.case.replace("_power", "")
 
-rule build_temperature_profiles:
-    wildcard_constraints:
-        scope="urban|rural|total",
-    params:
-        snapshots=config["snapshots"],
-    input:
-        pop_layout=RESOURCES + "{interconnect}/pop_layout_{scope}.nc",
-        regions_onshore=RESOURCES
-        + "{interconnect}/Geospatial/regions_onshore_s{simpl}_{clusters}.geojson",
-        cutout=lambda wildcards: expand(
-            "cutouts/" + CDIR + "usa_era5_" + "{renewable_weather_year}" + ".nc",
-            renewable_weather_year=config["renewable_weather_years"],
-        ),
-    output:
-        temp_soil=RESOURCES
-        + "{interconnect}/temp_soil_{scope}_elec_s{simpl}_c{clusters}.nc",
-        temp_air=RESOURCES
-        + "{interconnect}/temp_air_{scope}_elec_s{simpl}_c{clusters}.nc",
-    resources:
-        mem_mb=20000,
-    threads: 8
-    log:
-        LOGS
-        + "{interconnect}/build_temperature_profiles_{scope}_{simpl}_{clusters}.log",
-    benchmark:
-        (
-            BENCHMARKS
-            + "{interconnect}/build_temperature_profiles/{scope}_s{simpl}_c{clusters}"
+        # Return the path to the reference network
+        return (
+            RESULTS
+            + f"{wildcards.transmission_network}/{reference_case}/networks/solved_network.nc"
         )
-    conda:
-        "../envs/environment.yaml"
-    script:
-        "../scripts/build_temperature_profiles.py"
+    else:
+        # Return empty list if only_power is not enabled
+        return []
 
 
-rule build_clustered_population_layouts:
-    input:
-        pop_layout_total=RESOURCES + "{interconnect}/pop_layout_total.nc",
-        pop_layout_urban=RESOURCES + "{interconnect}/pop_layout_urban.nc",
-        pop_layout_rural=RESOURCES + "{interconnect}/pop_layout_rural.nc",
-        regions_onshore=RESOURCES
-        + "{interconnect}/Geospatial/regions_onshore_s{simpl}_{clusters}.geojson",
-        cutout=lambda wildcards: expand(
-            "cutouts/" + CDIR + "usa_era5_" + "{renewable_weather_year}" + ".nc",
-            renewable_weather_year=config["renewable_weather_years"],
-        ),
-    output:
-        clustered_pop_layout=RESOURCES
-        + "{interconnect}/pop_layout_elec_s{simpl}_c{clusters}.csv",
-    log:
-        LOGS
-        + "{interconnect}/build_clustered_population_layouts_{simpl}_{clusters}.log",
-    resources:
-        mem_mb=50000,
-    benchmark:
-        (
-            BENCHMARKS
-            + "{interconnect}/build_clustered_population_layouts/s{simpl}_c{clusters}"
-        )
-    conda:
-        "../envs/environment.yaml"
-    script:
-        "../scripts/build_clustered_population_layouts.py"
-
-
-rule build_cop_profiles:
+rule add_simple_sectors_part2:
+    """
+    Second part: Add hydrogen, biomass, DAC, CO2, LDES, and apply derates
+    """
     params:
-        heat_pump_sink_T=config["sector"]["heating"]["heat_pump_sink_T"],
+        scenario=get_case_scenario,
+        electricity=get_case_electricity,
+        sector=get_case_sector,
+        costs=case_config_provider("costs"),
+        plotting=case_config_provider("plotting"),
+        snapshots=case_config_provider("snapshots"),
+        api=case_config_provider("api"),
     input:
-        temp_soil_total=RESOURCES
-        + "{interconnect}/temp_soil_total_elec_s{simpl}_c{clusters}.nc",
-        temp_soil_rural=RESOURCES
-        + "{interconnect}/temp_soil_rural_elec_s{simpl}_c{clusters}.nc",
-        temp_soil_urban=RESOURCES
-        + "{interconnect}/temp_soil_urban_elec_s{simpl}_c{clusters}.nc",
-        temp_air_total=RESOURCES
-        + "{interconnect}/temp_air_total_elec_s{simpl}_c{clusters}.nc",
-        temp_air_rural=RESOURCES
-        + "{interconnect}/temp_air_rural_elec_s{simpl}_c{clusters}.nc",
-        temp_air_urban=RESOURCES
-        + "{interconnect}/temp_air_urban_elec_s{simpl}_c{clusters}.nc",
+        unpack(sector_input_files_part2),
+        reference_network=get_reference_network_for_only_power,
     output:
-        cop_soil_total=RESOURCES
-        + "{interconnect}/cop_soil_total_elec_s{simpl}_c{clusters}.nc",
-        cop_soil_rural=RESOURCES
-        + "{interconnect}/cop_soil_rural_elec_s{simpl}_c{clusters}.nc",
-        cop_soil_urban=RESOURCES
-        + "{interconnect}/cop_soil_urban_elec_s{simpl}_c{clusters}.nc",
-        cop_air_total=RESOURCES
-        + "{interconnect}/cop_air_total_elec_s{simpl}_c{clusters}.nc",
-        cop_air_rural=RESOURCES
-        + "{interconnect}/cop_air_rural_elec_s{simpl}_c{clusters}.nc",
-        cop_air_urban=RESOURCES
-        + "{interconnect}/cop_air_urban_elec_s{simpl}_c{clusters}.nc",
-    resources:
-        mem_mb=20000,
+        network=RESOURCES + "{transmission_network}/{case}/sector_network.nc",
     log:
-        LOGS + "{interconnect}/build_cop_profiles_s{simpl}_c{clusters}.log",
-    benchmark:
-        BENCHMARKS + "{interconnect}/build_cop_profiles/s{simpl}_c{clusters}"
-    conda:
-        "../envs/environment.yaml"
+        LOGS + "{transmission_network}/{case}/add_simple_sectors.log",
+    group:
+        "prepare"
+    threads: 1
+    resources:
+        mem_mb=4000,
     script:
-        "../scripts/build_cop_profiles.py"
+        "../scripts/add_simple_sectors_part2.py"

@@ -543,7 +543,7 @@ class DataExtractor(ABC):
         )
         session.mount("https://", HTTPAdapter(max_retries=retries))
 
-        response = session.get(url, timeout=30)
+        response = session.get(url, timeout=120)
         if response.status_code == 200:
             return response.json()  # Assumes the response is in JSON format
         else:
@@ -612,7 +612,7 @@ class _GasCosts(DataExtractor):
 
     def build_url(self) -> str:
         base_url = "natural-gas/pri/sum/data/"
-        facets = f"frequency=monthly&data[0]=value&facets[process][]={self.industry_codes[self.industry]}&start={self.year}-01&end={self.year + 1}-01&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=5000"
+        facets = f"frequency=monthly&data[0]=value&facets[process][]={self.industry_codes[self.industry]}&start={self.year}-01&end={self.year + 1}-01&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=3000"
         return f"{API_BASE}{base_url}?api_key={self.api_key}&{facets}"
 
     def format_data(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -670,7 +670,7 @@ class _CoalCosts(DataExtractor):
 
     def build_url(self) -> str:
         base_url = "coal/shipments/receipts/data/"
-        facets = f"frequency=quarterly&data[0]=price&facets[coalRankId][]=TOT&start={self.year}-Q1&end={self.year + 1}-Q1&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=5000"
+        facets = f"frequency=quarterly&data[0]=price&facets[coalRankId][]=TOT&start={self.year}-Q1&end={self.year + 1}-Q1&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=3000"
         return f"{API_BASE}{base_url}?api_key={self.api_key}&{facets}"
 
     def format_data(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -789,7 +789,7 @@ class _LpgCosts(DataExtractor):
 
     def build_url(self) -> str:
         base_url = "petroleum/pri/gnd/data/"
-        facets = f"frequency=weekly&data[0]=value&facets[product][]={self.grade_codes[self.grade]}&facets[duoarea][]=R1X&facets[duoarea][]=R1Y&facets[duoarea][]=R1Z&facets[duoarea][]=R20&facets[duoarea][]=R30&facets[duoarea][]=R40&facets[duoarea][]=R50&start={self.year}-01-01&end={self.year}-12-31&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=5000"
+        facets = f"frequency=weekly&data[0]=value&facets[product][]={self.grade_codes[self.grade]}&facets[duoarea][]=R1X&facets[duoarea][]=R1Y&facets[duoarea][]=R1Z&facets[duoarea][]=R20&facets[duoarea][]=R30&facets[duoarea][]=R40&facets[duoarea][]=R50&start={self.year}-01-01&end={self.year}-12-31&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=3000"
         return f"{API_BASE}{base_url}?api_key={self.api_key}&{facets}"
 
     def format_data(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -822,7 +822,7 @@ class _HeatingFuelCosts(DataExtractor):
 
     def build_url(self) -> str:
         base_url = "petroleum/pri/wfr/data/"
-        facets = f"frequency=weekly&data[0]=value&facets[process][]=PRS&start={self.year}-01-01&end={self.year}-12-31&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=5000"
+        facets = f"frequency=weekly&data[0]=value&facets[process][]=PRS&start={self.year}-01-01&end={self.year}-12-31&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=3000"
         return f"{API_BASE}{base_url}?api_key={self.api_key}&{facets}"
 
     def format_data(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -878,7 +878,7 @@ class _HeatingFuelCosts(DataExtractor):
 
 #     def build_url(self) -> str:
 #         base_url = "total-energy/data/"
-#         facets = f"frequency=monthly&data[0]=value&facets[msn][]={self.sector_codes[self.sector]}CBUS&start={self.year}-01&end={self.year}-12&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=5000"
+#         facets = f"frequency=monthly&data[0]=value&facets[msn][]={self.sector_codes[self.sector]}CBUS&start={self.year}-01&end={self.year}-12&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=3000"
 #         return f"{API_BASE}{base_url}?api_key={self.api_key}&{facets}"
 
 #     def format_data(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -920,7 +920,7 @@ class _HistoricalSectorEnergyDemand(DataExtractor):
 
     def build_url(self) -> str:
         base_url = "total-energy/data/"
-        facets = f"frequency=annual&data[0]=value&facets[msn][]={self.sector_codes[self.sector]}CBUS&start={self.year}&end=2023&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=5000"
+        facets = f"frequency=annual&data[0]=value&facets[msn][]={self.sector_codes[self.sector]}CBUS&start={self.year}&end=2023&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=3000"
         return f"{API_BASE}{base_url}?api_key={self.api_key}&{facets}"
 
     def format_data(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -973,7 +973,7 @@ class _ProjectedSectorEnergyDemand(DataExtractor):
 
     def build_url(self) -> str:
         base_url = "aeo/2023/data/"
-        facets = f"frequency=annual&data[0]=value&facets[scenario][]={self.scenario_codes[self.scenario]}&facets[seriesId][]={self.sector_codes[self.sector]}&start=2024&end={self.year}&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=5000"
+        facets = f"frequency=annual&data[0]=value&facets[scenario][]={self.scenario_codes[self.scenario]}&facets[seriesId][]={self.sector_codes[self.sector]}&start=2024&end={self.year}&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=3000"
         return f"{API_BASE}{base_url}?api_key={self.api_key}&{facets}"
 
     def format_data(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -1034,7 +1034,7 @@ class _HistoricalTransportTravelDemand(DataExtractor):
         base_url = f"aeo/{aeo}/data/"
         scenario = f"ref{aeo}"
 
-        facets = f"frequency=annual&data[0]=value&facets[scenario][]={scenario}&facets[seriesId][]={self.vehicle_codes[self.vehicle]}&start={self.year}&end={self.year}&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=5000"
+        facets = f"frequency=annual&data[0]=value&facets[scenario][]={scenario}&facets[seriesId][]={self.vehicle_codes[self.vehicle]}&start={self.year}&end={self.year}&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=3000"
         return f"{API_BASE}{base_url}?api_key={self.api_key}&{facets}"
 
     def format_data(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -1088,7 +1088,7 @@ class _ProjectedTransportTravelDemand(DataExtractor):
 
     def build_url(self) -> str:
         base_url = "aeo/2023/data/"
-        facets = f"frequency=annual&data[0]=value&facets[scenario][]={self.scenario_codes[self.scenario]}&facets[seriesId][]={self.vehicle_codes[self.vehicle]}&start=2024&end={self.year}&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=5000"
+        facets = f"frequency=annual&data[0]=value&facets[scenario][]={self.scenario_codes[self.scenario]}&facets[seriesId][]={self.vehicle_codes[self.vehicle]}&start=2024&end={self.year}&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=3000"
         return f"{API_BASE}{base_url}?api_key={self.api_key}&{facets}"
 
     def format_data(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -1156,7 +1156,7 @@ class _HistoricalTransportBtuDemand(DataExtractor):
         base_url = f"aeo/{aeo}/data/"
         scenario = f"ref{aeo}"
 
-        facets = f"frequency=annual&data[0]=value&facets[scenario][]={scenario}&facets[seriesId][]={self.vehicle_codes[self.vehicle]}&start={self.year}&end={self.year}&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=5000"
+        facets = f"frequency=annual&data[0]=value&facets[scenario][]={scenario}&facets[seriesId][]={self.vehicle_codes[self.vehicle]}&start={self.year}&end={self.year}&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=3000"
         return f"{API_BASE}{base_url}?api_key={self.api_key}&{facets}"
 
     def format_data(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -1215,7 +1215,7 @@ class _ProjectedTransportBtuDemand(DataExtractor):
 
     def build_url(self) -> str:
         base_url = "aeo/2023/data/"
-        facets = f"frequency=annual&data[0]=value&facets[scenario][]={self.scenario_codes[self.scenario]}&facets[seriesId][]={self.vehicle_codes[self.vehicle]}&start=2024&end={self.year}&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=5000"
+        facets = f"frequency=annual&data[0]=value&facets[scenario][]={self.scenario_codes[self.scenario]}&facets[seriesId][]={self.vehicle_codes[self.vehicle]}&start=2024&end={self.year}&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=3000"
         return f"{API_BASE}{base_url}?api_key={self.api_key}&{facets}"
 
     def format_data(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -1300,11 +1300,11 @@ class _HistoricalProjectedTransportFuelUse(DataExtractor):
         scenario = f"ref{aeo}"
 
         if self.year >= 2024:
-            facets = f"frequency=annual&data[0]=value&facets[scenario][]={self.scenario_codes[self.scenario]}&facets[seriesId][]={''.join(self.vehicle_codes[self.vehicle])}&start=2024&end={self.year}&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=5000"
+            facets = f"frequency=annual&data[0]=value&facets[scenario][]={self.scenario_codes[self.scenario]}&facets[seriesId][]={''.join(self.vehicle_codes[self.vehicle])}&start=2024&end={self.year}&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=3000"
         elif self.year >= 2022:  # switch years in api call
-            facets = f"frequency=annual&data[0]=value&facets[scenario][]={self.scenario_codes[self.scenario]}&facets[seriesId][]={''.join(self.vehicle_codes[self.vehicle])}&start={self.year}&end={self.year}&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=5000"
+            facets = f"frequency=annual&data[0]=value&facets[scenario][]={self.scenario_codes[self.scenario]}&facets[seriesId][]={''.join(self.vehicle_codes[self.vehicle])}&start={self.year}&end={self.year}&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=3000"
         else:
-            facets = f"frequency=annual&data[0]=value&facets[scenario][]={scenario}&facets[seriesId][]={''.join(self.vehicle_codes[self.vehicle])}&start={self.year}&end={self.year}&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=5000"
+            facets = f"frequency=annual&data[0]=value&facets[scenario][]={scenario}&facets[seriesId][]={''.join(self.vehicle_codes[self.vehicle])}&start={self.year}&end={self.year}&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=3000"
 
         return f"{API_BASE}{base_url}?api_key={self.api_key}&{facets}"
 
@@ -1358,7 +1358,7 @@ class _FutureCosts(DataExtractor):
 
     def build_url(self) -> str:
         base_url = "aeo/2023/data/"
-        facets = f"frequency=annual&data[0]=value&facets[scenario][]={self.scenario_codes[self.scenario]}&facets[seriesId][]={self.fuel_codes[self.fuel]}&start=2024&end={self.year}&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=5000"
+        facets = f"frequency=annual&data[0]=value&facets[scenario][]={self.scenario_codes[self.scenario]}&facets[seriesId][]={self.fuel_codes[self.fuel]}&start=2024&end={self.year}&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=3000"
         return f"{API_BASE}{base_url}?api_key={self.api_key}&{facets}"
 
     def format_data(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -1401,7 +1401,7 @@ class _InternationalGasTrade(DataExtractor):
 
     def build_url(self) -> str:
         base_url = "natural-gas/move/ist/data/"
-        facets = f"frequency=annual&data[0]=value&facets[process][]={self.direction_codes[self.direction]}&start={self.year - 1}&end={self.year}&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=5000"
+        facets = f"frequency=annual&data[0]=value&facets[process][]={self.direction_codes[self.direction]}&start={self.year - 1}&end={self.year}&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=3000"
         return f"{API_BASE}{base_url}?api_key={self.api_key}&{facets}"
 
     def format_data(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -1467,7 +1467,7 @@ class _DomesticGasTrade(DataExtractor):
 
     def build_url(self) -> str:
         base_url = "natural-gas/move/ist/data/"
-        facets = f"frequency=annual&data[0]=value&facets[process][]={self.direction_codes[self.direction]}&start={self.year - 1}&end={self.year}&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=5000"
+        facets = f"frequency=annual&data[0]=value&facets[process][]={self.direction_codes[self.direction]}&start={self.year - 1}&end={self.year}&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=3000"
         return f"{API_BASE}{base_url}?api_key={self.api_key}&{facets}"
 
     def format_data(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -1530,7 +1530,7 @@ class _GasStorage(DataExtractor):
 
     def build_url(self) -> str:
         base_url = "natural-gas/stor/sum/data/"
-        facets = f"frequency=monthly&data[0]=value&facets[process][]={self.storage_codes[self.storage]}&start={self.year}-01&end={self.year + 1}-01&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=5000"
+        facets = f"frequency=monthly&data[0]=value&facets[process][]={self.storage_codes[self.storage]}&start={self.year}-01&end={self.year + 1}-01&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=3000"
         return f"{API_BASE}{base_url}?api_key={self.api_key}&{facets}"
 
     def format_data(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -1577,7 +1577,7 @@ class _GasProduction(DataExtractor):
 
     def build_url(self) -> str:
         base_url = "natural-gas/prod/sum/data/"
-        facets = f"frequency=monthly&data[0]=value&facets[process][]={self.production_codes[self.production]}&start={self.year}-01&end={self.year + 1}-01&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=5000"
+        facets = f"frequency=monthly&data[0]=value&facets[process][]={self.production_codes[self.production]}&start={self.year}-01&end={self.year + 1}-01&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=3000"
         return f"{API_BASE}{base_url}?api_key={self.api_key}&{facets}"
 
     def format_data(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -1651,7 +1651,7 @@ class _StateEmissions(DataExtractor):
 
     def build_url(self) -> str:
         base_url = "co2-emissions/co2-emissions-aggregates/data/"
-        facets = f"frequency=annual&data[0]=value&facets[sectorId][]={self.sector_codes[self.sector]}&facets[fuelId][]={self.fuel_codes[self.fuel]}&start={self.year}&end={self.year}&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=5000"
+        facets = f"frequency=annual&data[0]=value&facets[sectorId][]={self.sector_codes[self.sector]}&facets[fuelId][]={self.fuel_codes[self.fuel]}&start={self.year}&end={self.year}&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=3000"
         return f"{API_BASE}{base_url}?api_key={self.api_key}&{facets}"
 
     def format_data(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -1703,7 +1703,7 @@ class _SedsConsumption(DataExtractor):
 
     def build_url(self) -> str:
         base_url = "seds/data/"
-        facets = f"frequency=annual&data[0]=value&facets[seriesId][]={self.sector_codes[self.sector]}&start={self.year - 1}&end={self.year}&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=5000"
+        facets = f"frequency=annual&data[0]=value&facets[seriesId][]={self.sector_codes[self.sector]}&start={self.year - 1}&end={self.year}&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=3000"
         return f"{API_BASE}{base_url}?api_key={self.api_key}&{facets}"
 
     def format_data(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -1762,7 +1762,7 @@ class _ElectricPowerOperationalData(DataExtractor):
 
     def build_url(self) -> str:
         base_url = "electricity/electric-power-operational-data/data/"
-        facets = f"frequency=annual&data[0]=generation&facets[sectorid][]={self.sector_codes[self.sector]}&start={self.year - 1}&end={self.year}&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=5000"
+        facets = f"frequency=annual&data[0]=generation&facets[sectorid][]={self.sector_codes[self.sector]}&start={self.year - 1}&end={self.year}&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=3000"
         return f"{API_BASE}{base_url}?api_key={self.api_key}&{facets}"
 
     def format_data(self, df: pd.DataFrame) -> pd.DataFrame:

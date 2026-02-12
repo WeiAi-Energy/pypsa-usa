@@ -22,6 +22,7 @@ from _helpers import (
     set_scenario_config,
     update_config_from_wildcards,
 )
+from build_base_network import haversine_np
 
 idx = pd.IndexSlice
 
@@ -93,6 +94,245 @@ def set_line_s_max_pu(n, transport_model, s_max_pu=0.7):
         n.lines["s_max_pu"] = s_max_pu
 
 
+def add_new_hvdc_links(n, costs, length_factor=1.25):
+    """
+    Add new expandable HVDC links between specified state pairs.
+    # The Value of Increased HVDC Capacity Between Eastern and Western U.S. Grids: The Interconnections Seam Study
+    New connections to add (excluding WA-CA which already exists):
+    - CA-CO (California-Colorado)
+    - CA-TX (California-Texas)
+    - TX-CO (Texas-Colorado)
+    - TX-MO (Texas-Missouri)
+    - TX-GA (Texas-Georgia)
+    - GA-FL (Georgia-Florida)
+
+    Parameters
+    ----------
+    n : pypsa.Network
+        Network object
+    costs : pd.DataFrame
+        Cost data containing HVDC cost parameters
+    length_factor : float
+        Multiplier for distance calculations
+
+    Returns
+    -------
+    pypsa.Network
+        Network with new HVDC links added
+    """
+    # Define new state pairs to connect
+    new_connections = [
+        ("CA", "CO"),  # California - Colorado
+        ("CA", "TX"),  # California - Texas
+        ("TX", "CO"),  # Texas - Colorado
+        ("TX", "MO"),  # Texas - Missouri
+        ("TX", "GA"),  # Texas - Georgia
+        ("GA", "FL"),  # Georgia - Florida
+    ]
+
+    # Get HVDC costs from cost data
+    hvdc_overhead_cost = costs.at["HVDC overhead", "annualized_capex_per_mw_km"]
+    hvdc_inverter_cost = costs.at["HVDC inverter pair", "annualized_capex_per_mw"]
+
+    # Ensure underwater_fraction column exists
+    if "underwater_fraction" not in n.links.columns:
+        n.links["underwater_fraction"] = 0.0
+
+    links_added = 0
+    new_link_names = []
+
+    for state1, state2 in new_connections:
+        # Find state identifier column in buses
+        state_col = "reeds_state"
+
+        # Find buses for each state
+        buses_state1 = n.buses[n.buses[state_col] == state1]
+        buses_state2 = n.buses[n.buses[state_col] == state2]
+
+        if buses_state1.empty or buses_state2.empty:
+            logger.warning(f"Could not find buses for {state1}-{state2}, skipping")
+            continue
+
+        # Use first available bus as representative for each state
+        bus1 = buses_state1.index[0]
+        bus2 = buses_state2.index[0]
+
+        # Get coordinates
+        lon1, lat1 = n.buses.at[bus1, "x"], n.buses.at[bus1, "y"]
+        lon2, lat2 = n.buses.at[bus2, "x"], n.buses.at[bus2, "y"]
+
+        # Calculate haversine distance
+        distance = haversine_np(lon1, lat1, lon2, lat2) * length_factor
+
+        # Calculate efficiency
+        efficiency = 1 - 0.014 - 0.031 * distance / 1000
+
+        # Calculate capital cost (distance cost + inverter pair cost, divided by 2 for each direction)
+        capital_cost = (distance * hvdc_overhead_cost + hvdc_inverter_cost) / 2
+
+        # Create link names
+        link_base = f"{state1}_{state2}_new_hvdc"
+        link_fwd = f"{link_base}_fwd"
+        link_rev = f"{link_base}_rev"
+
+        # Check if links already exist
+        if link_fwd in n.links.index or link_rev in n.links.index:
+            continue
+
+        # Add forward direction link (without underwater_fraction)
+        n.add(
+            "Link",
+            link_fwd,
+            bus0=bus1,
+            bus1=bus2,
+            carrier="DC",
+            p_nom=0,  # Start with zero capacity
+            p_nom_min=0,
+            p_nom_extendable=True,  # Allow expansion
+            p_max_pu=1.0,
+            p_min_pu=0.0,
+            length=distance,
+            efficiency=efficiency,
+            capital_cost=capital_cost,
+        )
+
+        # Add reverse direction link (without underwater_fraction)
+        n.add(
+            "Link",
+            link_rev,
+            bus0=bus2,
+            bus1=bus1,
+            carrier="DC",
+            p_nom=0,
+            p_nom_min=0,
+            p_nom_extendable=True,
+            p_max_pu=1.0,
+            p_min_pu=0.0,
+            length=distance,
+            efficiency=efficiency,
+            capital_cost=capital_cost,
+        )
+
+        # Store new link names for later attribute setting
+        new_link_names.extend([link_fwd, link_rev])
+
+    # Set underwater_fraction for all new links after adding them
+    if new_link_names:
+        n.links.loc[new_link_names, "underwater_fraction"] = 0.0
+
+    return n
+
+
+def recalculate_dctransmission_length(n, length_factor):
+    dc_links = n.links.carrier == "DC"
+
+    if dc_links.any():
+        hvdc_links = n.links.loc[dc_links].copy()
+
+        # Get bus coordinates
+        bus_df = n.buses[["x", "y"]]
+
+        # ----------------------------------------------------------------
+        # Step 2.1: Merge duplicate HVDC links
+        # ----------------------------------------------------------------
+
+        # Separate links based on suffix
+        fwd_links = hvdc_links[hvdc_links.index.str.endswith("_fwd")].copy()
+        rev_links = hvdc_links[hvdc_links.index.str.endswith("_rev")].copy()
+
+        links_to_remove = []
+        links_to_update = {}
+
+        # Combine fwd and rev links to group them by physical path
+        directional_links = pd.concat([fwd_links, rev_links])
+
+        if not directional_links.empty:
+            # Create a direction-agnostic bus pair for grouping
+            directional_links["bus_pair"] = [
+                tuple(sorted(b)) for b in zip(directional_links.bus0, directional_links.bus1)
+            ]
+
+            # Group by the physical connection (bus_pair)
+            for bus_pair, group in directional_links.groupby("bus_pair"):
+                # Within each physical connection group, separate fwd and rev links
+                fwd_group = group[group.index.str.contains("_fwd")]
+                rev_group = group[group.index.str.contains("_rev")]
+
+                # --- Process Forward Links for this bus_pair ---
+                if len(fwd_group) > 1:
+                    total_p_nom = fwd_group["p_nom"].sum()
+                    weights = fwd_group["p_nom"].replace(0, 1)
+                    avg_length = (fwd_group["length"] * weights).sum() / weights.sum()
+                    avg_efficiency = (fwd_group["efficiency"] * weights).sum() / weights.sum()
+                    is_extendable = fwd_group["p_nom_extendable"].any()
+
+                    primary_link = fwd_group.index[0]
+                    links_to_remove.extend(fwd_group.index[1:].tolist())
+
+                    links_to_update[primary_link] = {
+                        "p_nom": total_p_nom,
+                        "length": avg_length,
+                        "efficiency": avg_efficiency,
+                        "p_nom_extendable": is_extendable,
+                        "p_nom_min": total_p_nom if not is_extendable else fwd_group["p_nom_min"].sum(),
+                    }
+
+                # --- Process Reverse Links for this bus_pair ---
+                if len(rev_group) > 1:
+                    total_p_nom = rev_group["p_nom"].sum()
+                    weights = rev_group["p_nom"].replace(0, 1)
+                    avg_length = (rev_group["length"] * weights).sum() / weights.sum()
+                    avg_efficiency = (rev_group["efficiency"] * weights).sum() / weights.sum()
+                    is_extendable = rev_group["p_nom_extendable"].any()
+
+                    primary_link = rev_group.index[0]
+                    links_to_remove.extend(rev_group.index[1:].tolist())
+
+                    links_to_update[primary_link] = {
+                        "p_nom": total_p_nom,
+                        "length": avg_length,
+                        "efficiency": avg_efficiency,
+                        "p_nom_extendable": is_extendable,
+                        "p_nom_min": total_p_nom if not is_extendable else rev_group["p_nom_min"].sum(),
+                    }
+
+        # Apply merge updates
+        if links_to_update:
+            for link_idx, updates in links_to_update.items():
+                for param, value in updates.items():
+                    n.links.at[link_idx, param] = value
+
+        # Remove duplicates
+        if links_to_remove:
+            n.mremove("Link", links_to_remove)
+
+        # Update dc_links mask after removal
+        dc_links = n.links.carrier == "DC"
+
+        if dc_links.any():
+            # ----------------------------------------------------------------
+            # Step 2.2: Recalculate HVDC length and efficiency
+            # ----------------------------------------------------------------
+            hvdc_links = n.links.loc[dc_links]
+            bus0_coords = bus_df.loc[hvdc_links.bus0].values
+            bus1_coords = bus_df.loc[hvdc_links.bus1].values
+
+            distances = haversine_np(
+                bus0_coords[:, 0],
+                bus0_coords[:, 1],
+                bus1_coords[:, 0],
+                bus1_coords[:, 1],
+            )
+
+            # Update lengths and efficiency
+            n.links.loc[dc_links, "length"] = distances * length_factor
+            n.links.loc[dc_links, "efficiency"] = 1 - 0.014 - 0.031 * distances * length_factor / 1000
+
+            # Ensure underwater_fraction exists
+            if "underwater_fraction" not in n.links.columns:
+                n.links.loc[dc_links, "underwater_fraction"] = 0.0
+
+
 def set_transmission_limit(n, ll_type, factor):
     """
     Set transmission limits according to ll wildcard.
@@ -106,10 +346,7 @@ def set_transmission_limit(n, ll_type, factor):
     logger.info(f"Setting transmission limit for {ll_type} to {factor}")
 
     dc_links = n.links.carrier == "DC" if not n.links.empty else pd.Series()
-    ac_links_exp = n.links.carrier == "AC_exp" if not n.links.empty else pd.Series()
     ac_links_existing = n.links.carrier == "AC" if not n.links.empty else pd.Series()
-
-    n.links.loc[ac_links_exp, "carrier"] = "AC"  # rename AC_exp carrier to AC
 
     lines_s_nom = n.lines.s_nom
     col = "capital_cost" if ll_type == "c" else "length"
@@ -129,8 +366,8 @@ def set_transmission_limit(n, ll_type, factor):
         n.links.loc[dc_links, "p_nom_min"] = n.links.loc[dc_links, "p_nom"]
         n.links.loc[dc_links, "p_nom_extendable"] = True
 
-        n.links.loc[ac_links_exp, "p_nom_min"] = n.links.loc[ac_links_exp, "p_nom"]
-        n.links.loc[ac_links_exp, "p_nom_extendable"] = True
+        n.links.loc[ac_links_existing, "p_nom_min"] = n.links.loc[ac_links_existing, "p_nom"]
+        n.links.loc[ac_links_existing, "p_nom_extendable"] = True
     if factor != "opt":
         con_type = "expansion_cost" if ll_type == "c" else "volume_expansion"
         if transport_model:
@@ -141,14 +378,15 @@ def set_transmission_limit(n, ll_type, factor):
         else:
             rhs = float(factor) * ref
 
-        n.add(
-            "GlobalConstraint",
-            f"l{ll_type}_limit",
-            type=f"transmission_{con_type}_limit",
-            sense="<=",
-            constant=rhs,
-            carrier_attribute="AC, DC",
-        )
+        if factor != "inf":
+            n.add(
+                "GlobalConstraint",
+                f"l{ll_type}_limit",
+                type=f"transmission_{con_type}_limit",
+                sense="<=",
+                constant=rhs,
+                carrier_attribute="AC, DC",
+            )
 
     return n
 
@@ -182,6 +420,66 @@ def average_every_nhours(n, offset):
         for k, df in c.pnl.items():
             if not df.empty:
                 pnl[k] = resample_multi_index(df, offset, "mean")
+    return m
+
+
+def sample_every_nhours(n, n_hours):
+    """
+    Randomly samples one snapshot every n_hours from the network.
+
+    For each n-hour interval, one snapshot is chosen at random. Its data is
+    used to represent the entire interval. The snapshot_weighting is adjusted
+    to match the interval duration (n_hours).
+
+    Parameters
+    ----------
+    n : pypsa.Network
+        The network to be resampled.
+    n_hours : int
+        The number of hours in each sampling interval.
+    """
+    offset = f"{n_hours}H"
+    logging.info(
+        f"Randomly sampling the network to one snapshot every {offset} ",
+    )
+    m = n.copy(with_time=False)
+
+    def sample_multi_index(df, offset):
+        sampled_dfs = []
+        for year in df.index.levels[0]:
+            df_year = df.loc[year]
+
+            # Use groupby with Grouper to create time windows, then sample 1 from each
+            # Pass the random_state parameter to .sample() for reproducibility
+            sampled_year = df_year.groupby(pd.Grouper(freq=offset)).apply(
+                lambda x: x.sample(n=1, random_state=123),
+            )
+
+            sampled_year = sampled_year.reset_index(level=0, drop=True)
+            sns = sampled_year.index
+            sns = sns[~((sns.month == 2) & (sns.day == 29))]
+            sampled_year = sampled_year.loc[sns]
+            sampled_dfs.append(sampled_year)
+
+        sampled_df = pd.concat(sampled_dfs)
+        sampled_df.index = pd.MultiIndex.from_arrays(
+            [sampled_df.index.year, sampled_df.index],
+            names=["period", "timestep"],
+        )
+        return sampled_df
+
+    snapshot_weightings = sample_multi_index(n.snapshot_weightings, offset)
+    snapshot_weightings *= n_hours
+
+    m.set_snapshots(snapshot_weightings.index)
+    m.snapshot_weightings = snapshot_weightings
+    m.investment_periods = n.investment_periods
+
+    for c in n.iterate_components():
+        pnl = getattr(m, c.list_name + "_t")
+        for k, df in c.pnl.items():
+            if not df.empty:
+                pnl[k] = sample_multi_index(df, offset)
     return m
 
 
@@ -296,11 +594,8 @@ if __name__ == "__main__":
 
         snakemake = mock_snakemake(
             "prepare_network",
-            # simpl="",
-            clusters="100",
-            interconnect="western",
-            ll="v1.0",
-            opts="500SEG",
+            case="HighE_oldloss",
+            transmission_network="tamu",
         )
     configure_logging(snakemake)
     set_scenario_config(snakemake)
@@ -331,7 +626,8 @@ if __name__ == "__main__":
     is_string = isinstance(time_resolution, str)
     if is_string and time_resolution.lower().endswith("h"):
         n = average_every_nhours(n, time_resolution)
-
+        # n_hours = int(time_resolution.lower().replace("h", ""))
+        # n = sample_every_nhours(n, n_hours)
     # segments with package tsam
 
     if is_string and time_resolution.lower().endswith("seg"):
@@ -352,7 +648,13 @@ if __name__ == "__main__":
             dict(co2=params.costs["emission_prices"]["co2"]),
         )
 
-    ll_type, factor = snakemake.wildcards.ll[0], snakemake.wildcards.ll[1:]
+    # Add new expandable HVDC links before recalculating existing ones
+    # logger.info("Adding new expandable HVDC links...")
+    # n = add_new_hvdc_links(n, costs, params.links.get("length_factor", 1.25))
+
+    recalculate_dctransmission_length(n, params.links.get("length_factor", 1.25))
+
+    ll_type, factor = snakemake.params.ll[0], snakemake.params.ll[1:]
     set_transmission_limit(n, ll_type, factor)
 
     set_line_nom_max(

@@ -11,6 +11,7 @@ from pathlib import Path
 import pandas as pd
 import pypsa
 from _helpers import configure_logging, get_multiindex_snapshots, mock_snakemake
+from add_electricity import add_missing_carriers
 from constants_sector import (
     AirTransport,
     BoatTransport,
@@ -36,6 +37,63 @@ VEHICLE_MAPPER = {
 }
 
 
+def parse_adj_scenario(adj_scenario: str) -> tuple:
+    """
+    Parse adj_scenario string into components.
+
+    Format: x-L-y where:
+    - x: fraction of hydrogen demand to adjust (float)
+    - L: letter indicating adjustment type (E/G/O)
+    - y: conversion factor (float)
+
+    Returns
+    -------
+    tuple: (fraction, adjustment_type, conversion_factor)
+        Returns (0.0, None, 0.0) if adj_scenario is empty or invalid
+
+    Examples
+    --------
+    - "0.5-E-0.75" -> (0.5, 'E', 0.75)
+    - "1.0-G-0.5" -> (1.0, 'G', 0.5)
+    - "0.7-O-1.0" -> (0.7, 'O', 1.0)
+    """
+    if not adj_scenario or adj_scenario == "":
+        return (0.0, None, 0.0)
+
+    try:
+        parts = adj_scenario.split("-")
+        if len(parts) != 3:
+            logger.warning(f"Invalid adj_scenario format: {adj_scenario}. Expected format: x-L-y")
+            return (0.0, None, 0.0)
+
+        # Parse components
+        fraction = float(parts[0])
+        adj_type = parts[1].upper()
+        conversion_factor = float(parts[2])
+
+        # Validate adjustment type
+        if adj_type not in ["E", "G", "O"]:
+            logger.warning(f"Invalid adjustment type: {adj_type}. Must be E, G, or O")
+            return (0.0, None, 0.0)
+
+        # Validate fraction range
+        if not (0.0 <= fraction <= 1.0):
+            logger.warning(f"Fraction {fraction} out of range [0.0, 1.0]")
+            return (0.0, None, 0.0)
+
+        # Validate conversion factor is positive
+        if conversion_factor < 0.0:
+            logger.warning(f"Conversion factor {conversion_factor} must be non-negative")
+            return (0.0, None, 0.0)
+
+        logger.info(f"Parsed adj_scenario: fraction={fraction}, type={adj_type}, factor={conversion_factor}")
+        return (fraction, adj_type, conversion_factor)
+
+    except (ValueError, IndexError) as e:
+        logger.warning(f"Error parsing adj_scenario '{adj_scenario}': {e}")
+        return (0.0, None, 0.0)
+
+
 def attach_demand(n: pypsa.Network, df: pd.DataFrame, carrier: str, suffix: str):
     """
     Add demand to network from specified configuration setting.
@@ -57,9 +115,55 @@ def attach_demand(n: pypsa.Network, df: pd.DataFrame, carrier: str, suffix: str)
     )
 
 
+def process_simpsec_data(demand_files, planning_horizons):
+    """
+    Process raw SimpSec demand files and organize by carrier.
+
+    Returns
+    -------
+    dict: {carrier: DataFrame} mapping
+    """
+    carrier_data = {}
+
+    for demand_file in demand_files:
+        filename = str(demand_file)
+
+        # Extract carrier and year from filename
+        # Expected format: repo_data/MY_simpsec_demand/{scenario}/{carrier}_{year}.csv
+        if "electricity" in filename:
+            carrier = "electricity"
+        elif "natural_gas" in filename:
+            carrier = "natural_gas"
+        elif "hydrogen" in filename:
+            carrier = "hydrogen"
+        elif "biomass" in filename:
+            carrier = "biomass"
+        else:
+            logger.warning(f"Unknown carrier in filename {filename}")
+            continue
+
+        # Read the data
+        try:
+            df = pd.read_csv(demand_file, index_col=0)
+            logger.info(f"Loaded raw {carrier} data from {demand_file}")
+
+            if carrier not in carrier_data:
+                carrier_data[carrier] = df
+            else:
+                # If multiple years, concatenate (though typically we'd have one file per year)
+                carrier_data[carrier] = pd.concat([carrier_data[carrier], df])
+
+        except Exception as e:
+            logger.error(f"Error reading raw data file {demand_file}: {e}")
+            raise
+
+    return carrier_data
+
+
 if __name__ == "__main__":
     if "snakemake" not in globals():
-        snakemake = mock_snakemake("add_demand", interconnect="western")
+        # snakemake = mock_snakemake("add_demand", interconnect="usa")
+        snakemake = mock_snakemake("add_demand", interconnect="usa", simpl="53", clusters="53")
     configure_logging(snakemake)
 
     demand_files = snakemake.input.demand
@@ -71,8 +175,10 @@ if __name__ == "__main__":
     sns_config = snakemake.params.snapshots
     planning_horizons = snakemake.params.planning_horizons
 
-    n.snapshots = get_multiindex_snapshots(sns_config, planning_horizons)
-    n.set_investment_periods(periods=planning_horizons)
+    if list(n.snapshots) == ["now"]:
+        # add snapshots
+        n.snapshots = get_multiindex_snapshots(sns_config, planning_horizons)
+        n.set_investment_periods(periods=planning_horizons)
 
     if isinstance(demand_files, str):
         demand_files = [demand_files]
@@ -87,7 +193,69 @@ if __name__ == "__main__":
         attach_demand(n, df, carrier, suffix)
         logger.info("Electricity demand added to network")
 
-    else:  # sector files
+    elif sectors == "SimpSec":
+        logger.info("Processing SimpSec demand")
+        # Process raw data files directly
+        carrier_data = process_simpsec_data(demand_files, planning_horizons)
+        # Parse adj_scenario
+        adj_scenario = snakemake.params.get("adj_scenario", "")
+        fraction, adj_type, conversion_factor = parse_adj_scenario(adj_scenario)
+        # Calculate hydrogen demand adjustments if needed
+        total_h2_reduction_mwh = 0.0
+        emission_cap_reduction = 0.0
+
+        if fraction > 0.0 and adj_type is not None:
+            logger.info(
+                f"Applying adj_scenario: {adj_scenario} (fraction={fraction}, type={adj_type}, factor={conversion_factor})",
+            )
+            # Get original hydrogen demand
+            h2_original = carrier_data["hydrogen"].copy()
+            # Calculate total annual hydrogen reduction (across all states and timesteps)
+            total_h2_reduction_mwh = h2_original.sum().sum() * fraction
+            logger.info(f"Total hydrogen demand reduction: {total_h2_reduction_mwh:.2f} MWh/year")
+            # Reduce hydrogen demand proportionally across all states and timesteps
+            carrier_data["hydrogen"] = h2_original * (1.0 - fraction)
+            # Calculate the reduction for each state and timestep (proportional)
+            h2_reduction = h2_original * fraction
+
+            if adj_type == "E":
+                # Replace with electricity demand
+                logger.info(f"Converting {fraction * 100}% H2 to electricity with factor {conversion_factor}")
+                carrier_data["electricity"] = carrier_data["electricity"] + h2_reduction * conversion_factor
+            elif adj_type == "G":
+                # Replace with natural gas demand
+                logger.info(f"Converting {fraction * 100}% H2 to natural gas")
+                carrier_data["natural_gas"] = carrier_data["natural_gas"] + h2_reduction
+                # Calculate emission cap reduction: MWh * 0.2002 ton/MWh * y
+                emission_cap_reduction = total_h2_reduction_mwh * (0.2002 * conversion_factor + 0.0282)
+                logger.info(f"Emission cap reduction (G): {emission_cap_reduction:.2f} ton CO2")
+            elif adj_type == "O":
+                # Just reduce hydrogen, no replacement
+                logger.info(f"Reducing {fraction * 100}% H2 demand without replacement")
+                # Calculate emission cap reduction: MWh * 0.27 ton/MWh * y
+                emission_cap_reduction = total_h2_reduction_mwh * 0.27 * conversion_factor
+                logger.info(f"Emission cap reduction (O): {emission_cap_reduction:.2f} ton CO2")
+
+        # Store emission cap reduction in network attributes for use in solve_network
+        n.adj_scenario_emission_reduction = emission_cap_reduction
+
+        # Define carrier mappings and attach demand
+        carrier_mappings = {
+            "electricity": "AC",
+            "natural_gas": "gas",
+            "hydrogen": "h2",
+        }
+
+        for carrier_key, carrier_name in carrier_mappings.items():
+            suffix = f" {carrier_name}"
+
+            df = carrier_data[carrier_key]
+
+            attach_demand(n, df, carrier_name, suffix)
+
+        add_missing_carriers(n, ["gas", "h2"])
+
+    else:  # detailed sector files
         for demand_file in demand_files:
             parsed_name = Path(demand_file).name.split("_")
             parsed_name[-1] = parsed_name[-1].split(".pkl")[0]

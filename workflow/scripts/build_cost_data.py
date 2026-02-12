@@ -22,9 +22,9 @@ EMISSIONS_DATA = [
     {"pypsa-name": "oil", "parameter": "co2_emissions", "value": 0.34851},
     {"pypsa-name": "geothermal", "parameter": "co2_emissions", "value": 0.04029},
     {"pypsa-name": "waste", "parameter": "co2_emissions", "value": 0.1016},
-    {"pypsa-name": "gas", "parameter": "co2_emissions", "value": 0.18058},
-    {"pypsa-name": "CCGT", "parameter": "co2_emissions", "value": 0.18058},
-    {"pypsa-name": "OCGT", "parameter": "co2_emissions", "value": 0.18058},
+    {"pypsa-name": "gas", "parameter": "co2_emissions", "value": 0.2002},  # LHV
+    {"pypsa-name": "CCGT", "parameter": "co2_emissions", "value": 0.2002},  # LHV
+    {"pypsa-name": "OCGT", "parameter": "co2_emissions", "value": 0.2002},  # LHV
     {
         "pypsa-name": "geothermal",
         "parameter": "heat_rate_mmbtu_per_mwh",
@@ -38,15 +38,19 @@ LIFETIME_DATA = [
     # Confirm with Jabs / NREL. 30 is way too small
     {"pypsa-name": "geothermal", "parameter": "lifetime", "value": 70},
     {"pypsa-name": "waste", "parameter": "lifetime", "value": 55},  # using gas CT
-    {"pypsa-name": "CCGT", "parameter": "lifetime", "value": 55},
-    {"pypsa-name": "OCGT", "parameter": "lifetime", "value": 55},
-    {"pypsa-name": "CCGT-95CCS", "parameter": "lifetime", "value": 55},
-    {"pypsa-name": "CCGT-97CCS", "parameter": "lifetime", "value": 55},
+    {
+        "pypsa-name": "CCGT",
+        "parameter": "lifetime",
+        "value": 40,
+    },  # www.eia.gov/analysis/studies/powerplants/capitalcost/pdf/capital_cost_AEO2025.pdf
+    {"pypsa-name": "OCGT", "parameter": "lifetime", "value": 40},
+    {"pypsa-name": "CCGT-95CCS", "parameter": "lifetime", "value": 40},
+    {"pypsa-name": "CCGT-97CCS", "parameter": "lifetime", "value": 40},
     {"pypsa-name": "coal-95CCS", "parameter": "lifetime", "value": 70},
     {"pypsa-name": "coal-99CCS", "parameter": "lifetime", "value": 70},
     {"pypsa-name": "SMR", "parameter": "lifetime", "value": 40},
     {"pypsa-name": "nuclear", "parameter": "lifetime", "value": 60},
-    {"pypsa-name": "biomass", "parameter": "lifetime", "value": 30},
+    {"pypsa-name": "biomass", "parameter": "lifetime", "value": 40},
     {"pypsa-name": "offwind_floating", "parameter": "lifetime", "value": 30},
     {"pypsa-name": "offwind", "parameter": "lifetime", "value": 30},
     {"pypsa-name": "onwind", "parameter": "lifetime", "value": 30},
@@ -225,7 +229,7 @@ if __name__ == "__main__":
     if "snakemake" not in globals():
         from _helpers import mock_snakemake
 
-        snakemake = mock_snakemake("build_cost_data", year=2030)
+        snakemake = mock_snakemake("build_cost_data", year=2050)
         rootpath = ".."
     else:
         rootpath = "."
@@ -281,7 +285,16 @@ if __name__ == "__main__":
     else:
         pudl_atb = pudl_atb_filt
 
-    pudl_atb = pudl_atb[pudl_atb.scenario_atb == atb_params.get("scenario", "Moderate")]
+    # pudl_atb = pudl_atb[pudl_atb.scenario_atb == atb_params.get("scenario", "Moderate")]
+    # pudl_atb = pudl_atb[pudl_atb.model_case_nrelatb == atb_params.get("model_case", "Market")]
+
+    pudl_atb = pudl_atb[
+        (pudl_atb["pypsa-name"].str.contains("battery", case=False, na=False) & (pudl_atb.scenario_atb == "Advanced"))
+        | (
+            ~pudl_atb["pypsa-name"].str.contains("battery", case=False, na=False)
+            & (pudl_atb.scenario_atb == atb_params.get("scenario", "Moderate"))
+        )
+    ]
     pudl_atb = pudl_atb[pudl_atb.model_case_nrelatb == atb_params.get("model_case", "Market")]
 
     pudl_premelt = pudl_atb.copy()
@@ -314,32 +327,36 @@ if __name__ == "__main__":
     emissions_data = EMISSIONS_DATA
 
     # Impute Transmission Data
-    # TEPCC 2023
+    # https://docs.nrel.gov/docs/fy21osti/78195.pdf
     # WACC & Lifetime: https://emp.lbl.gov/publications/improving-estimates-transmission
     # Subsea costs: Purvins et al. (2018): https://doi.org/10.1016/j.jclepro.2018.03.095
     transmission_data = [
         {
             "pypsa-name": "HVAC overhead",
             "parameter": "capex_per_mw_km",
-            "value": 2481.43,
+            "value": 926.29,  # https://docs.nrel.gov/docs/fy21osti/78195.pdf, 704.35 * (0.0476 + 0.015) / 0.0476
         },
         {
             "pypsa-name": "HVAC overhead",
             "parameter": "cost_recovery_period_years",
-            "value": 60,
+            "value": 40,
         },
-        {"pypsa-name": "HVAC overhead", "parameter": "wacc_real", "value": 0.044},
+        {
+            "pypsa-name": "HVAC overhead",
+            "parameter": "wacc_real",
+            "value": 0.036,
+        },  # https://www.cell.com/cms/10.1016/j.joule.2020.11.013/attachment/9256a54d-7e00-4176-884f-c1521e8d6de4/mmc2.pdf
         {
             "pypsa-name": "HVDC overhead",
             "parameter": "capex_per_mw_km",
-            "value": 1026.53,
+            "value": 725.00,  # min of transmission_distance_cost_500kVdc_ba.csv, 551.29 * (0.0476 + 0.015) / 0.0476
         },
         {
             "pypsa-name": "HVDC overhead",
             "parameter": "cost_recovery_period_years",
-            "value": 60,
+            "value": 40,
         },
-        {"pypsa-name": "HVDC overhead", "parameter": "wacc_real", "value": 0.044},
+        {"pypsa-name": "HVDC overhead", "parameter": "wacc_real", "value": 0.036},
         {
             "pypsa-name": "HVDC submarine",
             "parameter": "capex_per_mw_km",
@@ -348,20 +365,20 @@ if __name__ == "__main__":
         {
             "pypsa-name": "HVDC submarine",
             "parameter": "cost_recovery_period_years",
-            "value": 60,
+            "value": 40,
         },
-        {"pypsa-name": "HVDC submarine", "parameter": "wacc_real", "value": 0.044},
+        {"pypsa-name": "HVDC submarine", "parameter": "wacc_real", "value": 0.036},
         {
             "pypsa-name": "HVDC inverter pair",
             "parameter": "capex_per_kw",
-            "value": 173.730,
+            "value": 409.25,  # https://docs.nrel.gov/docs/fy21osti/78195.pdf, 311.19 * (0.0476 + 0.015) / 0.0476
         },
         {
             "pypsa-name": "HVDC inverter pair",
             "parameter": "cost_recovery_period_years",
-            "value": 60,
+            "value": 40,
         },
-        {"pypsa-name": "HVDC inverter pair", "parameter": "wacc_real", "value": 0.044},
+        {"pypsa-name": "HVDC inverter pair", "parameter": "wacc_real", "value": 0.036},
     ]
     pudl_atb = pd.concat(
         [
@@ -440,19 +457,49 @@ if __name__ == "__main__":
         values="value",
     ).reset_index()
 
-    # Create Hydrogen Combustion Turbine from OCGT using assumptions per ReEDS
+    # Create biomass-CCS, NZA
+    biomass_CCS = pivot_atb[pivot_atb["pypsa-name"] == "biomass"].copy()
+    biomass_CCS["pypsa-name"] = "biomass-CCS"
+    biomass_CCS["capex_overnight_per_kw"] = 3905.95 * 1.14  # reeds
+    biomass_CCS["capex_per_kw"] = (
+        biomass_CCS["capex_overnight_per_kw"]
+        + biomass_CCS["capex_grid_connection_per_kw"]
+        + biomass_CCS["capex_construction_finance_factor"]
+    )
+    biomass_CCS["opex_fixed_per_kw"] = 143.22 * 1.14
+    biomass_CCS["heat_rate_mmbtu_per_mwh"] = (10.9103,)
+    biomass_CCS["opex_variable_per_mwh"] = 12.62 * 1.14
+    biomass_CCS["efficiency"] = 3.412 / 10.9103  # MWh_e/MWh_th
+    biomass_CCS["co2_emissions"] = -0.288  # tCO2/MWh_th
+    pivot_atb = pd.concat([pivot_atb, biomass_CCS], ignore_index=True)
+
+    # Create Hydrogen Combustion Turbine from CCGT using assumptions per ReEDS
     # https://nrel.github.io/ReEDS-2.0/model_documentation.html#hydrogen
-    hydrogen_ct = pivot_atb[pivot_atb["pypsa-name"] == "OCGT"].copy()
+    hydrogen_ct = pivot_atb[pivot_atb["pypsa-name"] == "CCGT"].copy()
     hydrogen_ct["pypsa-name"] = "hydrogen_ct"
-    hydrogen_ct["capex_overnight_per_kw"] *= 1.2
+    hydrogen_ct["capex_overnight_per_kw"] *= 1.1
     hydrogen_ct["capex_per_kw"] = (
-        (hydrogen_ct["capex_overnight_per_kw"] + hydrogen_ct["capex_grid_connection_per_kw"])
-        * hydrogen_ct["capex_construction_finance_factor"]
-        / 100
+        hydrogen_ct["capex_overnight_per_kw"]
+        + hydrogen_ct["capex_grid_connection_per_kw"]
+        + hydrogen_ct["capex_construction_finance_factor"]
     )
     hydrogen_ct["fuel_cost_real_per_mwhth"] = 20 * 3.412  # 20 USD/MMBtu * 3.412 MMBtu/MWh_th
     hydrogen_ct["co2_emissions"] = 0
     pivot_atb = pd.concat([pivot_atb, hydrogen_ct], ignore_index=True)
+
+    # Apply heat rate corrections
+    heat_rate_corrections = {
+        "hydrogen_ct": 1.1472,
+        "OCGT": 1.039104223,
+        "CCGT": 1.076422072,
+        "CCGT-95CCS": 1.076422072,
+        "CCGT-97CCS": 1.076422072,
+    }
+
+    for tech, correction_factor in heat_rate_corrections.items():
+        mask = pivot_atb["pypsa-name"] == tech
+        if mask.any():
+            pivot_atb.loc[mask, "heat_rate_mmbtu_per_mwh"] *= correction_factor
 
     pivot_atb["efficiency"] = 3.412 / pivot_atb["heat_rate_mmbtu_per_mwh"]
     pivot_atb["fuel_cost"] = pivot_atb["fuel_cost_real_per_mwhth"] / pivot_atb["efficiency"]

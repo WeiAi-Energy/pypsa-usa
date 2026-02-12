@@ -5,7 +5,6 @@ import logging
 from functools import reduce
 
 import dill as pickle
-import geopandas as gpd
 import numpy as np
 import pandas as pd
 import pypsa
@@ -95,18 +94,20 @@ def aggregate_to_substations(
     logger.info("Aggregating buses to substation level...")
 
     generator_strategies = aggregation_strategies.get("generators", dict())
+    one_port_strategies = aggregation_strategies.get("one_ports", dict())
 
     clustering = get_clustering_from_busmap(
         network,
         busmap,
         aggregate_generators_weighted=True,
         aggregate_one_ports=["Load", "StorageUnit"],
-        line_length_factor=1.0,
+        line_length_factor=1.25,
         bus_strategies={
             "type": "max",
             "Pd": "sum",
         },
         generator_strategies=generator_strategies,
+        one_port_strategies=one_port_strategies,
     )
 
     substations = network.buses[
@@ -119,6 +120,7 @@ def aggregate_to_substations(
             "balancing_area",
             "reeds_zone",
             "reeds_ba",
+            "reeds_state",
             "x",
             "y",
         ]
@@ -132,6 +134,8 @@ def aggregate_to_substations(
             zone = substations.county
         case "reeds_zone":
             zone = substations.reeds_zone
+        case "state":
+            zone = substations.reeds_state
         case _:
             raise ValueError(
                 "zonal_aggregation must be either balancing_area, country, or state",
@@ -147,7 +151,34 @@ def aggregate_to_substations(
 
     network_s.lines["type"] = np.nan
 
-    if topological_boundaries != "reeds_zone" and topological_boundaries != "county":
+    if topological_boundaries == "reeds_zone":
+        cols2drop = [
+            "balancing_area",
+            "substation_off",
+            "sub_id",
+            "state",
+        ]
+    elif topological_boundaries == "county":
+        cols2drop = [
+            "balancing_area",
+            "substation_off",
+            "sub_id",
+            "state",
+        ]
+    elif topological_boundaries == "state":
+        cols2drop = [
+            "balancing_area",
+            "substation_off",
+            "sub_id",
+            "county",
+            "reeds_zone",
+            "reeds_ba",
+            "nerc_reg",
+            "trans_reg",
+            "trans_grp",
+            "state",
+        ]
+    else:
         cols2drop = [
             "balancing_area",
             "state",
@@ -160,41 +191,11 @@ def aggregate_to_substations(
             "trans_grp",
             "reeds_state",
         ]
-    else:
-        cols2drop = [
-            "balancing_area",
-            "substation_off",
-            "sub_id",
-            "state",
-        ]
 
     # Only drop columns that exist in the DataFrame
     cols2drop = [col for col in cols2drop if col in network_s.buses.columns]
     network_s.buses = network_s.buses.drop(columns=cols2drop)
     return network_s, clustering.busmap
-
-
-def assign_line_lengths(n, line_length_factor):
-    """
-    Assign line lengths to network.
-
-    Uses haversine function to calculate line lengths.
-    """
-    logger.info("Assigning line lengths using haversine function...")
-
-    n.lines.length = pypsa.geo.haversine_pts(
-        n.buses.loc[n.lines.bus0][["x", "y"]],
-        n.buses.loc[n.lines.bus1][["x", "y"]],
-    )
-    n.lines.length *= line_length_factor
-
-    n.links.length = pypsa.geo.haversine_pts(
-        n.buses.loc[n.links.bus0][["x", "y"]],
-        n.buses.loc[n.links.bus1][["x", "y"]],
-    )
-    n.links.length *= line_length_factor
-
-    return n
 
 
 if __name__ == "__main__":
@@ -203,8 +204,8 @@ if __name__ == "__main__":
 
         snakemake = mock_snakemake(
             "simplify_network",
-            interconnect="texas",
-            simpl="50",
+            interconnect="usa",
+            simpl="53",
         )
     configure_logging(snakemake)
     params = snakemake.params
@@ -214,6 +215,53 @@ if __name__ == "__main__":
 
     # n = pypsa.Network(snakemake.input.network)
     n = pickle.load(open(snakemake.input.network, "rb"))
+
+    # --- Calculate state-level CCGT/OCGT capacity distribution ---
+    logger.info("Calculating state-level CCGT/OCGT capacity distribution...")
+    # Get state mapping for each generator
+    gen_states = n.generators.bus.map(n.buses.reeds_state)
+    # Calculate state-level capacity for CCGT and OCGT
+    ccgt_mask = n.generators.carrier == "CCGT"
+    ocgt_mask = n.generators.carrier == "OCGT"
+    ccgt_state_capacity = n.generators.loc[ccgt_mask].groupby(gen_states[ccgt_mask]).p_nom.sum()
+    ocgt_state_capacity = n.generators.loc[ocgt_mask].groupby(gen_states[ocgt_mask]).p_nom.sum()
+    # Calculate total capacity
+    total_ccgt = ccgt_state_capacity.sum()
+    total_ocgt = ocgt_state_capacity.sum()
+    # Calculate distribution percentages
+    ccgt_distribution = (ccgt_state_capacity / total_ccgt * 100).round(4) if total_ccgt > 0 else pd.Series()
+    ocgt_distribution = (ocgt_state_capacity / total_ocgt * 100).round(4) if total_ocgt > 0 else pd.Series()
+    # Create distribution dataframe
+    distribution_df = pd.DataFrame(
+        {
+            "state": ccgt_distribution.index.union(ocgt_distribution.index),
+        }
+    )
+    distribution_df = distribution_df.set_index("state")
+    distribution_df["CCGT_capacity_MW"] = ccgt_state_capacity
+    distribution_df["CCGT_percent"] = ccgt_distribution
+    distribution_df["OCGT_capacity_MW"] = ocgt_state_capacity
+    distribution_df["OCGT_percent"] = ocgt_distribution
+    distribution_df = distribution_df.fillna(0)
+    # Save to CSV
+    distribution_df.to_csv(snakemake.output.gas_distribution)
+
+    logger.info(f"State-level gas capacity distribution saved to {snakemake.output.gas_distribution}")
+
+    # --- Identify all generators retiring before 2050 ---
+    mask_retire_before_2050 = (
+        n.generators["build_year"].notnull()
+        & n.generators["lifetime"].notnull()
+        & (n.generators["build_year"] + n.generators["lifetime"] < 2050)
+    )
+
+    mask_ccgt_ocgt = n.generators["carrier"].isin(["CCGT", "OCGT"])
+    mask_ccgt_ocgt_retire = mask_retire_before_2050 & mask_ccgt_ocgt
+
+    removed_capacity_ccgt_ocgt = n.generators.loc[mask_ccgt_ocgt_retire, "p_nom"].sum()
+    logger.info(f"Total CCGT/OCGT capacity retiring before 2050: {removed_capacity_ccgt_ocgt / 1e3:.2f} GW")
+    n.mremove("Generator", n.generators.index[mask_retire_before_2050])
+    logger.info(f"Removed {mask_retire_before_2050.sum()} generators retiring before 2050.")
 
     n.generators = n.generators.drop(
         columns=["ba_eia", "ba_ads"],
@@ -230,7 +278,6 @@ if __name__ == "__main__":
     busmaps = [trafo_map, busmap_to_sub.sub_id]
     busmaps = reduce(lambda x, y: x.map(y), busmaps[1:], busmaps[0])
 
-    n = assign_line_lengths(n, 1.25)  # Eventually replace with GIS analysis.
     n.links["underwater_fraction"] = 0
 
     n.buses.drop(columns=["substation_off"], inplace=True)
@@ -243,46 +290,46 @@ if __name__ == "__main__":
         params.aggregation_strategies,
     )
 
-    if topological_boundaries == "reeds_zone":
+    if topological_boundaries in ["reeds_zone", "state"] and "county" in n.buses.columns:
         n.buses = n.buses.drop(columns=["county"])
 
-    if snakemake.wildcards.simpl:
-        n.set_investment_periods(periods=snakemake.params.planning_horizons)
+    # if snakemake.wildcards.simpl:
+    n.set_investment_periods(periods=snakemake.params.planning_horizons)
 
-        n.loads_t.p = n.loads_t.p.iloc[:, 0:0]
-        n.loads_t.q = n.loads_t.q.iloc[:, 0:0]
-        attr = [
-            "p",
-            "q",
-            "state_of_charge",
-            "mu_state_of_charge_set",
-            "mu_energy_balance",
-            "mu_lower",
-            "mu_upper",
-            "spill",
-            "p_dispatch",
-            "p_store",
-        ]
-        for attr in attr:
-            n.storage_units_t[attr] = n.storage_units_t[attr].iloc[:, 0:0]
+    n.loads_t.p = n.loads_t.p.iloc[:, 0:0]
+    n.loads_t.q = n.loads_t.q.iloc[:, 0:0]
+    attr = [
+        "p",
+        "q",
+        "state_of_charge",
+        "mu_state_of_charge_set",
+        "mu_energy_balance",
+        "mu_lower",
+        "mu_upper",
+        "spill",
+        "p_dispatch",
+        "p_store",
+    ]
+    for attr in attr:
+        n.storage_units_t[attr] = n.storage_units_t[attr].iloc[:, 0:0]
 
-        clustering = clustering_for_n_clusters(
-            n,
-            int(snakemake.wildcards.simpl),
-            focus_weights=params.focus_weights,
-            solver_name=solver_name,
-            algorithm=params.simplify_network["algorithm"],
-            feature=params.simplify_network["feature"],
-            aggregation_strategies=params.aggregation_strategies,
-            weighting_strategy=params.simplify_network.get("weighting_strategy", None),
-        )
-        n = clustering.network
+    clustering = clustering_for_n_clusters(
+        n,
+        53,  # int(snakemake.wildcards.simpl)
+        focus_weights=params.focus_weights,
+        solver_name=solver_name,
+        algorithm=params.simplify_network["algorithm"],
+        feature=params.simplify_network["feature"],
+        aggregation_strategies=params.aggregation_strategies,
+        weighting_strategy=params.simplify_network.get("weighting_strategy", None),
+    )
+    n = clustering.network
 
-        cluster_regions((clustering.busmap,), snakemake.input, snakemake.output)
-    else:
-        for which in ("regions_onshore", "regions_offshore"):  # pass through regions
-            regions = gpd.read_file(getattr(snakemake.input, which))
-            regions.to_file(getattr(snakemake.output, which))
+    cluster_regions((clustering.busmap,), snakemake.input, snakemake.output)
+    # else:
+    #     for which in ("regions_onshore", "regions_offshore"):  # pass through regions
+    #         regions = gpd.read_file(getattr(snakemake.input, which))
+    #         regions.to_file(getattr(snakemake.output, which))
 
     update_p_nom_max(n)
 

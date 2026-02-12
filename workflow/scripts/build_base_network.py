@@ -123,9 +123,25 @@ def add_dclines_from_file(n: pypsa.Network, fn_dclines: str) -> pypsa.Network:
     n.madd(
         "Link",
         dclines.index,
+        suffix="_fwd",
         bus0=dclines.from_bus_id,
         bus1=dclines.to_bus_id,
         p_nom=dclines.Pt,
+        p_min_pu=0,
+        p_max_pu=1,
+        carrier="DC",
+        underwater_fraction=0.0,  # DC line in bay is underwater, but does network have this line?
+    )
+
+    n.madd(
+        "Link",
+        dclines.index,
+        suffix="_rev",
+        bus0=dclines.to_bus_id,
+        bus1=dclines.from_bus_id,
+        p_nom=dclines.Pt,
+        p_min_pu=0,
+        p_max_pu=1,
         carrier="DC",
         underwater_fraction=0.0,  # DC line in bay is underwater, but does network have this line?
     )
@@ -171,13 +187,23 @@ def map_bus_to_region(
     return gpd.sjoin(buses, shape_filtered, how="left").drop(columns=["index_right"])
 
 
-def assign_line_length(n: pypsa.Network):
+def assign_line_length(n: pypsa.Network, length_factor: float):
     """Assigns line length to each line in the network using Haversine distance."""
     bus_df = n.buses[["x", "y"]]
     bus0 = bus_df.loc[n.lines.bus0].values
     bus1 = bus_df.loc[n.lines.bus1].values
     distances = haversine_np(bus0[:, 0], bus0[:, 1], bus1[:, 0], bus1[:, 1])
-    n.lines["length"] = distances
+    n.lines["length"] = distances * length_factor
+
+
+def assign_link_length_and_efficiency(n: pypsa.Network, length_factor: float):
+    """Assigns link length and efficiency to each link (DC transmission line) in the network using Haversine distance."""
+    bus_df = n.buses[["x", "y"]]
+    bus0 = bus_df.loc[n.links.bus0].values
+    bus1 = bus_df.loc[n.links.bus1].values
+    distances = haversine_np(bus0[:, 0], bus0[:, 1], bus1[:, 0], bus1[:, 1])
+    n.links["length"] = distances * length_factor
+    n.links["efficiency"] = 1 - 0.014 - 0.031 * distances * length_factor / 1000  # reeds
 
 
 def create_grid(polygon, cell_size):
@@ -467,7 +493,7 @@ def main(snakemake):
     n.name = "PyPSA-USA"
 
     model_topology = snakemake.params.model_topology
-    interconnect = snakemake.wildcards.interconnect
+    interconnect = getattr(snakemake.wildcards, "interconnect", "usa")
     # interconnect in raw data given with an uppercase first letter
     if interconnect != "usa":
         interconnect = interconnect[0].upper() + interconnect[1:]
@@ -546,13 +572,11 @@ def main(snakemake):
     # Assign Lines Types and Missing Region Memberships
     add_custom_line_type(n)
     assign_line_types(n)
-    assign_line_length(n)
+    length_factor = snakemake.params.length_factor
+    assign_line_length(n, length_factor)
+    assign_link_length_and_efficiency(n, length_factor)
     assign_missing_regions(n)
     assign_reeds_memberships(n, snakemake.input.reeds_memberships)
-
-    p_max_pu = 1
-    n.links["p_max_pu"] = p_max_pu
-    n.links["p_min_pu"] = -p_max_pu
 
     # Filter Network to Only Specified Regions
     if model_topology is not None:
@@ -641,6 +665,6 @@ if __name__ == "__main__":
     if "snakemake" not in globals():
         from _helpers import mock_snakemake
 
-        snakemake = mock_snakemake("build_base_network", interconnect="texas")
+        snakemake = mock_snakemake("build_base_network", interconnect="usa")
     configure_logging(snakemake)
     main(snakemake)

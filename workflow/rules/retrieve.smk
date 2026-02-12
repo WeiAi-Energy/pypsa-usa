@@ -48,7 +48,7 @@ rule retrieve_zenodo_databundles:
     resources:
         mem_mb=5000,
     log:
-        "logs/retrieve/retrieve_databundles.log",
+        LOGS + "retrieve_databundles.log",
     script:
         "../scripts/retrieve_databundles.py"
 
@@ -70,7 +70,7 @@ rule retrieve_nrel_efs_data:
     resources:
         mem_mb=5000,
     log:
-        "logs/retrieve/retrieve_efs_{efs_case}_{efs_speed}.log",
+        LOGS + "retrieve_efs_{efs_case}_{efs_speed}.log",
     script:
         "../scripts/retrieve_databundles.py"
 
@@ -115,7 +115,7 @@ rule retrieve_gridemissions_data:
     output:
         expand(DATA + "GridEmissions/{file}", file=DATAFILES_GE),
     log:
-        "logs/retrieve/retrieve_gridemissions_data.log",
+        LOGS + "retrieve_gridemissions_data.log",
     resources:
         mem_mb=5000,
     script:
@@ -153,7 +153,7 @@ COMSTOCK_FILES = [
 
 rule retrieve_res_eulp:
     log:
-        "logs/retrieve/retrieve_res_eulp/{state}.log",
+        LOGS + "retrieve_res_eulp/{state}.log",
     params:
         stock="res",
         profiles=RESSTOCK_FILES,
@@ -167,7 +167,7 @@ rule retrieve_res_eulp:
 
 rule retrieve_com_eulp:
     log:
-        "logs/retrieve/retrieve_com_eulp/{state}.log",
+        LOGS + "retrieve_com_eulp/{state}.log",
     params:
         stock="com",
         profiles=COMSTOCK_FILES,
@@ -179,24 +179,6 @@ rule retrieve_com_eulp:
         "../scripts/retrieve_eulp.py"
 
 
-rule retrieve_ship_raster:
-    input:
-        HTTP.remote(
-            "https://zenodo.org/record/6953563/files/shipdensity_global.zip",
-            keep_local=True,
-            static=True,
-        ),
-    output:
-        DATA + "shipdensity_global.zip",
-    log:
-        LOGS + "retrieve_ship_raster.log",
-    resources:
-        mem_mb=5000,
-    retries: 2
-    run:
-        move(input[0], output[0])
-
-
 if not config["enable"].get("build_cutout", False):
 
     rule retrieve_cutout:
@@ -206,9 +188,9 @@ if not config["enable"].get("build_cutout", False):
                 static=True,
             ),
         output:
-            "cutouts/" + CDIR + "usa_{cutout}.nc",
+            "cutouts/" + "usa_{cutout}.nc",
         log:
-            "logs/" + CDIR + "retrieve_cutout_usa_{cutout}.log",
+            LOGS + "retrieve_cutout_usa_{cutout}.log",
         resources:
             mem_mb=5000,
         retries: 2
@@ -226,7 +208,7 @@ rule retrieve_caiso_data:
     log:
         LOGS + "retrieve_caiso_data.log",
     shadow:
-        "minimal"
+        "copy-minimal"
     resources:
         mem_mb=2000,
     script:
@@ -250,13 +232,13 @@ if "EGS" in config["electricity"]["extendable_carriers"]["Generator"]:
     rule retrieve_egs:
         params:
             dispatch=config["renewable"]["EGS"]["dispatch"],
-            subdir=DATA + "EGS/{interconnect}",
+            subdir=DATA + "EGS",
         output:
-            DATA + "EGS/{interconnect}/specs_EGS.nc",
-            DATA + "EGS/{interconnect}/profile_EGS.nc",
+            DATA + "EGS/specs_EGS.nc",
+            DATA + "EGS/profile_EGS.nc",
         resources:
             mem_mb=5000,
         log:
-            LOGS + "retrieve_EGS_{interconnect}.log",
+            LOGS + "retrieve_EGS.log",
         script:
             "../scripts/retrieve_egs.py"

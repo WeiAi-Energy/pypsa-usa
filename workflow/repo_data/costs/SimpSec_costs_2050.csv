@@ -1,0 +1,69 @@
+pypsa-name,parameter,value,unit,source,further description
+electrolysis,FOM,1.5,%/year,https://www.iea.org/data-and-statistics/charts/global-average-levelised-cost-of-hydrogen-production-by-energy-source-and-technology-2019-and-2050,""
+electrolysis,elec-input,1.351,"",https://www.iea.org/data-and-statistics/charts/global-average-levelised-cost-of-hydrogen-production-by-energy-source-and-technology-2019-and-2050,""
+electrolysis,investment,369,USD/kW_e,https://www.nature.com/articles/s41597-025-05951-4,0.331 - 1 - 1.846
+electrolysis,lifetime,20,years,https://www.iea.org/data-and-statistics/charts/global-average-levelised-cost-of-hydrogen-production-by-energy-source-and-technology-2019-and-2050,""
+electrolysis,currency_year,2024,,https://www.nature.com/articles/s41597-025-05951-4,""
+CH4 (g) pipeline,FOM,1.5,%/year,Assume same as for H2 (g) pipeline in 2050 (CH4 pipeline as mature technology).,""
+CH4 (g) pipeline,electricity-input,0.01,MW_e/1000km/MW_CH4,"Danish Energy Agency, Technology Data for Energy Transport (2021), Excel datasheet: 112 6 gas Main distri line.",""
+CH4 (g) pipeline,investment,87.22,EUR/MW/km,Guesstimate.,""
+CH4 (g) pipeline,lifetime,40,years,Assume same as for H2 (g) pipeline in 2050 (CH4 pipeline as mature technology).,""
+CH4 (g) pipeline,currency_year,2020,,,
+H2 (g) pipeline,FOM,1.5,%/year,"Danish Energy Agency, Technology Data for Energy Transport (2021), Excel datasheet: H2 140.",""
+H2 (g) pipeline,electricity-input,0.017,MW_e/1000km/MW_H2,"Danish Energy Agency, Technology Data for Energy Transport (2021), Excel datasheet: H2 140.",""
+H2 (g) pipeline,investment,303.6845,EUR/MW/km,European Hydrogen Backbone Report (June 2021): https://gasforclimate2050.eu/wp-content/uploads/2021/06/EHB_Analysing-the-future-demand-supply-and-transport-of-hydrogen_June-2021.pdf Table 35. Implementation roadmap - Cross border projects and costs updates: https://ehb.eu/files/downloads/EHB-2023-20-Nov-FINAL-design.pdf Table 1,""
+H2 (g) pipeline,lifetime,40,years,"Danish Energy Agency, Technology Data for Energy Transport (2021), Excel datasheet: H2 140.",""
+H2 (g) pipeline,currency_year,2023,,,
+H2 (g) pipeline repurposed,FOM,1.5,%/year,"Danish Energy Agency, Technology Data for Energy Transport (2021), Excel datasheet: H2 140.",""
+H2 (g) pipeline repurposed,electricity-input,0.017,MW_e/1000km/MW_H2,"Danish Energy Agency, Technology Data for Energy Transport (2021), Excel datasheet: H2 140.",""
+H2 (g) pipeline repurposed,investment,129.4682,EUR/MW/km,European Hydrogen Backbone Report (June 2021): https://gasforclimate2050.eu/wp-content/uploads/2021/06/EHB_Analysing-the-future-demand-supply-and-transport-of-hydrogen_June-2021.pdf Table 35. Implementation roadmap - Cross border projects and costs updates: https://ehb.eu/files/downloads/EHB-2023-20-Nov-FINAL-design.pdf Table 1,""
+H2 (g) pipeline repurposed,lifetime,40,years,"Danish Energy Agency, Technology Data for Energy Transport (2021), Excel datasheet: H2 140.",""
+H2 (g) pipeline repurposed,currency_year,2023,,,
+hydrogen storage underground,FOM,0,%/year,"Danish Energy Agency, inputs/technology_data_catalogue_for_energy_storage.xlsx",""
+hydrogen storage underground,VOM,0,EUR/MWh,"Danish Energy Agency, inputs/technology_data_catalogue_for_energy_storage.xlsx",""
+hydrogen storage underground cavern,investment,0.044,USD/kWh,https://restservice.epri.com/publicdownload/000000003002028357/0/Product,""
+hydrogen storage underground field,investment,0.084,USD/kWh,https://restservice.epri.com/publicdownload/000000003002028357/0/Product,""
+hydrogen storage underground aquifer,investment,0.084,USD/kWh,https://restservice.epri.com/publicdownload/000000003002028357/0/Product,""
+hydrogen storage underground cavern new,investment,0.6,USD/kWh,https://restservice.epri.com/publicdownload/000000003002028357/0/Product,""
+hydrogen storage underground,lifetime,40,years,"Danish Energy Agency, inputs/technology_data_catalogue_for_energy_storage.xlsx",""
+hydrogen storage underground,currency_year,2023,,,
+direct air capture,FOM,1.3,%/year,https://github.com/PyPSA/technology-data/blob/master/outputs/US/costs_2050.csv,""
+direct air capture,VOM,0,USD/tCO2,https://github.com/PyPSA/technology-data/blob/master/outputs/US/costs_2050.csv,""
+direct air capture,elec-input,1.56,MWh/tCO2,https://github.com/PyPSA/technology-data/blob/master/outputs/US/costs_2050.csv,""
+direct air capture,investment,10516860,USD/(tCO2/h),https://github.com/PyPSA/technology-data/blob/master/outputs/US/costs_2050.csv,""
+direct air capture,lifetime,20,years,https://github.com/PyPSA/technology-data/blob/master/outputs/US/costs_2050.csv,""
+direct air capture,currency_year,2023,,https://github.com/PyPSA/technology-data/blob/master/outputs/US/costs_2050.csv,
+hydrogen storage compressor,FOM,4,%/year,"Based on Stöckl et al (2021): https://doi.org/10.48550/arXiv.2005.03464, table SI.4.",-
+hydrogen storage compressor,compression-electricity-input,0.05,MWh_el/MWh_H2,"Based on Stöckl et al (2021): https://doi.org/10.48550/arXiv.2005.03464, table SI.4.",""
+hydrogen storage compressor,investment,87.69,EUR/kW_H2,"Based on Stöckl et al (2021): https://doi.org/10.48550/arXiv.2005.03464, table SI.4.",""
+hydrogen storage compressor,lifetime,15,years,"Based on Stöckl et al (2021): https://doi.org/10.48550/arXiv.2005.03464, table SI.4.",-
+hydrogen storage compressor,currency_year,2020,,,
+hydrogen storage well and compressor new,investment,264.27,USD/kW_H2_dis,https://restservice.epri.com/publicdownload/000000003002028357/0/Product,""
+hydrogen storage well and compressor new,currency_year,2023,"",https://restservice.epri.com/publicdownload/000000003002028357/0/Product,""
+natural gas storage compressor,FOM,4,%/year,Calculated based on hydrogen storage compressor costs,
+natural gas storage compressor,compression-electricity-input,0.0175,MWh_el/MWh_H2,Calculated based on hydrogen storage compressor costs,
+natural gas storage compressor,investment,30.625,EUR/kW_CH4,Calculated based on hydrogen storage compressor costs,
+natural gas storage compressor,lifetime,15,years,Calculated based on hydrogen storage compressor costs,
+natural gas storage compressor,currency_year,2020,,,
+SMR-CCS,FOM,5,%/year,https://github.com/PyPSA/technology-data/blob/master/outputs/US/costs_2050.csv,
+SMR-CCS,efficiency,0.69,"",https://github.com/PyPSA/technology-data/blob/master/outputs/US/costs_2050.csv,
+SMR-CCS,investment,605753.2171,EUR/MW_CH4,https://github.com/PyPSA/technology-data/blob/master/outputs/US/costs_2050.csv,""
+SMR-CCS,lifetime,20,years,https://github.com/PyPSA/technology-data/blob/master/outputs/US/costs_2050.csv,""
+SMR-CCS,currency_year,2015,,https://github.com/PyPSA/technology-data/blob/master/outputs/US/costs_2050.csv,
+H2 production biomass gasification CC,FOM,0.69,%/year,Net-Zero America,
+H2 production biomass gasification CC,VOM,11.26,USD/MWh_H2,Net-Zero America,""
+H2 production biomass gasification CC,electricity-input,0.027,MWh_el/MWh_H2,Net-Zero America,""
+H2 production biomass gasification CC,investment,2599,USD/kW_H2,Net-Zero America,""
+H2 production biomass gasification CC,lifetime,20,years,Net-Zero America,
+H2 production biomass gasification CC,wood-input,1.775,MWh_wood/MWh_H2,Net-Zero America,convert from LHV to HHV
+H2 production biomass gasification CC,currency_year,2016,,"",""
+TES,charge_cost,110075,USD/MW_el,(7700-Resistance + 383-Lift) * 0.80785 + 70% extra cost,https://thundersaidenergy.com/downloads/battery-storage-costs-the-economics/#:~:text=The%20costs%20of%20a%20grid
+TES,charge_efficiency,0.99,,"Modeling electrical particle thermal energy storage systems for long-duration, grid-electricity storage applications",""
+TES,discharge_cost,394738,USD/MW_th,(40740-HX + 650000-PowerCycle * Eff) * 0.80785 + 70% extra cost,https://thundersaidenergy.com/downloads/battery-storage-costs-the-economics/#:~:text=The%20costs%20of%20a%20grid
+TES,discharge_efficiency,0.524,,"Modeling electrical particle thermal energy storage systems for long-duration, grid-electricity storage applications",""
+TES,energy_cost,3400,USD/MWh_th,Electric-thermal energy storage using solid particles as storage media,
+TES,FOM,2.25,% of capital cost,ATB NGCC,
+TES,VOM,0.00015,% of capital cost,ATB NGCC,
+TES,loss,0.00017,,2%/5days,
+TES,currency_year,2019,,,
+TES,lifetime,30,,,

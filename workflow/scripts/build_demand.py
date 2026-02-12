@@ -146,7 +146,7 @@ class ReadStrategy(ABC):
         self.filepath = filepath
 
     @property
-    def units():  # noqa: D102
+    def units(self):  # noqa: D102
         return "MW"
 
     @abstractmethod
@@ -195,10 +195,18 @@ class ReadStrategy(ABC):
             for x in df.index.get_level_values("sector").unique()
         )
 
-        assert all(
-            x in ["all", "electricity", "heat", "cool", "lpg", "space_heat", "water_heat"]
-            for x in df.index.get_level_values("fuel").unique()
-        )
+        allowed_fuels = [
+            "all",
+            "electricity",
+            "heat",
+            "cool",
+            "lpg",
+            "space_heat",
+            "water_heat",
+            "natural_gas",
+            "hydrogen",
+        ]
+        assert all(x in allowed_fuels for x in df.index.get_level_values("fuel").unique())
 
     @staticmethod
     def _format_snapshot_index(df: pd.DataFrame) -> pd.DataFrame:
@@ -1455,6 +1463,181 @@ class ReadTransportAeo(ReadStrategy):
         return pd.concat(dfs)
 
 
+class ReadSimpSec(ReadStrategy):
+    """Reads pre-computed demand profiles from MY_simpsec_demand directory."""
+
+    def __init__(self, filepath: list[str]) -> None:
+        super().__init__(filepath)
+        self._zone = "state"
+        self.carrier_files = self._organize_files_by_carrier()
+
+    @property
+    def zone(self):
+        return self._zone
+
+    def _organize_files_by_carrier(self) -> dict[str, dict[int, str]]:
+        """Organize input files by carrier and year."""
+        carrier_files = {
+            "electricity": {},
+            "natural_gas": {},
+            "hydrogen": {},
+        }
+
+        for filepath in self.filepath:
+            # Extract carrier and year from filename
+            # Expected format: repo_data/MY_simpsec_demand/{scenario}/{carrier}_{year}.csv
+            filename = Path(filepath).stem  # e.g., "electricity_2030"
+            parts = filename.split("_")
+            if len(parts) >= 2:
+                carrier = "_".join(parts[:-1])  # Handle "natural_gas"
+                year = int(parts[-1])
+                if carrier in carrier_files:
+                    carrier_files[carrier][year] = filepath
+
+        return carrier_files
+
+    def _read_data(self) -> dict[str, dict[int, pd.DataFrame]]:
+        """Read all carrier demand files."""
+        demand_data = {}
+
+        for carrier, year_files in self.carrier_files.items():
+            demand_data[carrier] = {}
+            for year, filepath in year_files.items():
+                logger.info(f"Reading SimpSec {carrier} demand for year {year} from {filepath}")
+
+                # Read CSV file, support timestamp column name or first column as index
+                try:
+                    # Try to read file with timestamp column name
+                    df = pd.read_csv(filepath, index_col="timestamp", parse_dates=True)
+                except KeyError:
+                    # If no timestamp column, assume first column is timestamp
+                    df = pd.read_csv(filepath, index_col=0, parse_dates=True)
+
+                # Standardize timezone handling - consistent with other sector strategies
+                if df.index.tz is not None:
+                    # If timezone info exists, remove it (consistent with other ReadStrategy)
+                    df.index = df.index.tz_localize(None)
+                    logger.info(f"Removed timezone info from {carrier} {year} data")
+
+                # Ensure index is DatetimeIndex
+                if not isinstance(df.index, pd.DatetimeIndex):
+                    df.index = pd.to_datetime(df.index)
+
+                # Set correct index name
+                df.index.name = "timestamp"
+
+                demand_data[carrier][year] = df
+
+        return demand_data
+
+    def _format_data(self, data: dict[str, dict[int, pd.DataFrame]]) -> pd.DataFrame:
+        """Format SimpSec data into the required multi-index structure."""
+        formatted_dfs = []
+
+        # State abbreviation to full name mapping (from constants module)
+        STATE_ABBR_TO_NAME = {
+            "AL": "Alabama",
+            "AK": "Alaska",
+            "AZ": "Arizona",
+            "AR": "Arkansas",
+            "CA": "California",
+            "CO": "Colorado",
+            "CT": "Connecticut",
+            "DE": "Delaware",
+            "FL": "Florida",
+            "GA": "Georgia",
+            "HI": "Hawaii",
+            "ID": "Idaho",
+            "IL": "Illinois",
+            "IN": "Indiana",
+            "IA": "Iowa",
+            "KS": "Kansas",
+            "KY": "Kentucky",
+            "LA": "Louisiana",
+            "ME": "Maine",
+            "MD": "Maryland",
+            "MA": "Massachusetts",
+            "MI": "Michigan",
+            "MN": "Minnesota",
+            "MS": "Mississippi",
+            "MO": "Missouri",
+            "MT": "Montana",
+            "NE": "Nebraska",
+            "NV": "Nevada",
+            "NH": "New Hampshire",
+            "NJ": "New Jersey",
+            "NM": "New Mexico",
+            "NY": "New York",
+            "NC": "North Carolina",
+            "ND": "North Dakota",
+            "OH": "Ohio",
+            "OK": "Oklahoma",
+            "OR": "Oregon",
+            "PA": "Pennsylvania",
+            "RI": "Rhode Island",
+            "SC": "South Carolina",
+            "SD": "South Dakota",
+            "TN": "Tennessee",
+            "TX": "Texas",
+            "UT": "Utah",
+            "VT": "Vermont",
+            "VA": "Virginia",
+            "WA": "Washington",
+            "WV": "West Virginia",
+            "WI": "Wisconsin",
+            "WY": "Wyoming",
+        }
+
+        for carrier, year_data in data.items():
+            for year, df in year_data.items():
+                # Create a copy of the dataframe
+                df_copy = df.copy()
+
+                # Convert state abbreviations to full names in column names
+                df_copy.columns = [STATE_ABBR_TO_NAME.get(col, col) for col in df_copy.columns]
+
+                # Ensure index is datetime type and has no timezone info
+                if not isinstance(df_copy.index, pd.DatetimeIndex):
+                    df_copy.index = pd.to_datetime(df_copy.index)
+
+                # If timezone info exists, remove it
+                if df_copy.index.tz is not None:
+                    df_copy.index = df_copy.index.tz_localize(None)
+
+                # Set correct index name
+                df_copy.index.name = "snapshot"
+
+                # To match network snapshots, need to adjust year to corresponding planning year
+                # If data year differs from network planning year, adjust timestamp year
+                df_copy.index = df_copy.index.map(lambda x: x.replace(year=year))
+
+                # Create additional index levels as Series
+                n_rows = len(df_copy)
+                sector_series = pd.Series(["all"] * n_rows, index=df_copy.index, name="sector")
+                subsector_series = pd.Series(["all"] * n_rows, index=df_copy.index, name="subsector")
+                fuel_series = pd.Series([carrier] * n_rows, index=df_copy.index, name="fuel")
+
+                # Create the multi-index
+                multi_index = pd.MultiIndex.from_arrays(
+                    [
+                        df_copy.index,  # snapshot
+                        sector_series,  # sector
+                        subsector_series,  # subsector
+                        fuel_series,  # fuel
+                    ],
+                    names=["snapshot", "sector", "subsector", "fuel"],
+                )
+
+                # Set the multi-index
+                df_copy.index = multi_index
+
+                formatted_dfs.append(df_copy)
+
+        # Combine all carriers and years
+        combined_df = pd.concat(formatted_dfs, axis=0)
+        return combined_df.sort_index()
+
+
 ###
 # WRITE STRATEGIES
 ###
@@ -1564,8 +1747,37 @@ class WriteStrategy(ABC):
         sns: pd.DatetimeIndex,
     ) -> pd.DataFrame:
         """Filters demand on network snapshots."""
-        filtered = df[df.index.get_level_values("snapshot").isin(sns)].copy()
-        filtered = filtered[~filtered.index.duplicated(keep="last")]  # issue-272
+        # Get snapshot level from data
+        data_snapshots = df.index.get_level_values("snapshot")
+
+        # Ensure both DatetimeIndexes have no timezone info or same timezone info
+        if hasattr(sns, "tz") and sns.tz is not None:
+            sns = sns.tz_localize(None)
+
+        if hasattr(data_snapshots, "tz") and data_snapshots.tz is not None:
+            data_snapshots = data_snapshots.tz_localize(None)
+
+        # Create boolean index to filter data
+        mask = data_snapshots.isin(sns)
+        filtered = df[mask].copy()
+
+        # If filtered data is empty, try other matching strategies
+        if filtered.empty:
+            logger.warning("Direct timestamp matching failed, trying alternative matching strategies...")
+
+            # Strategy 1: only compare date and hour, ignore year
+            sns_normalized = pd.to_datetime([dt.replace(year=2018) for dt in sns])
+            data_normalized = pd.to_datetime([dt.replace(year=2018) for dt in data_snapshots])
+
+            # Recreate mask
+            mask = data_normalized.isin(sns_normalized)
+            filtered = df[mask].copy()
+
+            if not filtered.empty:
+                logger.info(f"Successfully matched {len(filtered)} timestamps using normalized year strategy")
+            else:
+                logger.warning("All timestamp matching strategies failed")
+
         return filtered
 
     @staticmethod
@@ -1597,6 +1809,24 @@ class WriteStrategy(ABC):
             df = filtered.reset_index()
             df = df.groupby(["snapshot", "sector", "subsector", "fuel"]).sum()
             assert filtered.shape == df.shape  # no data should have changed
+
+        # Special handling for SimpSec mode
+        # For SimpSec, the sector and subsector in data are "all" but the passed values are "no-end-use"
+        if sectors == "no-end-use" or (isinstance(sectors, list) and "no-end-use" in sectors):
+            logger.info("SimpSec mode detected: mapping 'no-end-use' sector to 'all'")
+            # For SimpSec, map "no-end-use" to "all" since that's how the data is structured
+            if isinstance(sectors, str):
+                sectors = "all"
+            elif isinstance(sectors, list):
+                sectors = ["all" if s == "no-end-use" else s for s in sectors]
+
+        # Also handle subsector for SimpSec consistency
+        if subsectors == "no-end-use" or (isinstance(subsectors, list) and "no-end-use" in subsectors):
+            logger.info("SimpSec mode detected: mapping 'no-end-use' subsector to 'all'")
+            if isinstance(subsectors, str):
+                subsectors = "all"
+            elif isinstance(subsectors, list):
+                subsectors = ["all" if s == "no-end-use" else s for s in subsectors]
 
         if sectors:
             if isinstance(sectors, str):
@@ -2243,6 +2473,10 @@ def get_demand_params(
                 logger.warning(
                     f"No scaling method available for {demand_profile} profile. Setting to 'aeo_electricity'",
                 )
+        case "no-end-use":  # SimpSec - simplified sector modeling
+            demand_profile = "simpsec"
+            demand_disaggregation = "pop"
+            scaling_method = None  # No scaling needed, data is already for target years
         case "residential" | "commercial":
             demand_profile = "eulp"
             demand_disaggregation = "pop"
@@ -2307,8 +2541,8 @@ if __name__ == "__main__":
         # )
         snakemake = mock_snakemake(
             "build_sector_demand",
-            interconnect="western",
-            end_use="residential",
+            interconnect="usa",
+            end_use="no-end-use",
         )
     configure_logging(snakemake)
 
@@ -2322,7 +2556,14 @@ if __name__ == "__main__":
     n.set_investment_periods(periods=planning_horizons)
 
     # extract user demand configuration parameters
-
+    nza_scenario = (
+        snakemake.params.get("nza_scenario", [None])
+        if hasattr(
+            snakemake.params,
+            "nza_scenario",
+        )
+        else None
+    )
     demand_params = snakemake.params.get("demand_params", None)
     end_use = snakemake.wildcards.end_use
     eia_api = snakemake.params.eia_api
@@ -2365,6 +2606,15 @@ if __name__ == "__main__":
         sns = n.snapshots.get_level_values(1).map(
             lambda x: x.replace(year=profile_year),
         )
+
+    elif demand_profile == "simpsec":
+        reader = ReadSimpSec(demand_files)
+        # For SimpSec, use original network snapshots, no year adjustment needed
+        # because data already contains correct year information
+        sns = n.snapshots.get_level_values(1)
+        # Ensure snapshots have no timezone info
+        if hasattr(sns, "tz") and sns.tz is not None:
+            sns = sns.tz_localize(None)
 
     elif demand_profile == "eulp":
         stock = {"residential": "res", "commercial": "com"}
@@ -2429,6 +2679,14 @@ if __name__ == "__main__":
     if end_use == "power":  # only one demand for electricity only studies
         demand = demand_converter.prepare_demand(sns=sns)  # pd.DataFrame
         demands = {"electricity": demand}
+    elif end_use == "no-end-use":  # SimpSec - simplified sector modeling
+        # For SimpSec, prepare demands for all three carriers
+        fuels = ("electricity", "natural_gas", "hydrogen")
+        demands = demand_converter.prepare_multiple_demands(
+            end_use,
+            fuels,
+            sns=sns,
+        )  # dict[str, pd.DataFrame]
     elif end_use == "transport":
         # only road transport has specific electrical profiles
         fuels = ("electricity", "lpg") if not vehicle else ("lpg")
@@ -2468,6 +2726,10 @@ if __name__ == "__main__":
                     demand,
                     vehicle_type,
                 ).mul(vmt_conversion)
+    elif end_use == "no-end-use":  # SimpSec - no scaling needed
+        for fuel, demand in demands.items():
+            # For SimpSec, data is already in correct format and years
+            formatted_demand[fuel] = demand_formatter.format_demand(demand, "all")
     else:
         for fuel, demand in demands.items():
             formatted_demand[fuel] = demand_formatter.format_demand(demand, end_use)
@@ -2477,6 +2739,16 @@ if __name__ == "__main__":
         formatted_demand["electricity"].round(4).to_csv(
             snakemake.output.elec_demand,
             index=True,
+        )
+    elif end_use == "no-end-use":
+        formatted_demand["electricity"].round(4).to_pickle(
+            snakemake.output.elec_demand,
+        )
+        formatted_demand["natural_gas"].round(4).to_pickle(
+            snakemake.output.gas_demand,
+        )
+        formatted_demand["hydrogen"].round(4).to_pickle(
+            snakemake.output.h2_demand,
         )
     # transport demand is by subsector
     elif end_use == "transport":
