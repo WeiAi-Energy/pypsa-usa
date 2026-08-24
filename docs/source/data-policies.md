@@ -11,7 +11,7 @@ PyPSA-USA integrates with the ReEDS capacity expansion model developed by NREL t
 
 PyPSA-USA currently supports several key policy constraints, including:
 
-- **Energy Reserve Margins (ERM)**: Constrains capacity to meet a reserve margin above demand at every timestep. Resources must be "energy-backed" meaning storage devices must have sufficient state of charge to contribute.
+- **Energy Reserve Margins (ERM)**: One adequacy inequality per NERC region and timestep. A region's generator capacity times its availability factor (`p_max_pu`, which already carries the VRE profile and the temperature-dependent thermal derates), plus the discharge potential of its storage, plus the base state's actual net flow across the region boundary, must cover demand plus that region's reserve margin. Contributions are gross — nothing is netted out for what the base state is already doing with the same asset — while storage stays "energy-backed": discharge potential is capped both by the rating of the installed capacity and by the state of charge the base-state dispatch leaves behind. Only the dischargers carry a variable of their own, so the constraint adds no second dispatch, nodal balance or voltage law. Crediting the *actual* boundary flow is deliberately conservative: a region exporting in the base state is assumed to keep exporting when the reserve is called.
 - **Clean Energy Standards (CES)**: Mandates the proportion of electricity generation that must come from clean energy sources.
 - **Renewable Portfolio Standards (RPS)**: Requires a specific percentage of electricity generation to come from renewable sources.
 - **Technology Capacity Targets**: Sets specific capacity expansion or retirement goals for certain technologies, such as wind, solar, or nuclear.

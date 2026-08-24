@@ -1,57 +1,44 @@
 # Rules to Optimize/Solve Network
 
 
-def pop_layout_input(wildcards):
-    if wildcards["sector"] != "E":
-        return RESOURCES + "{interconnect}/pop_layout_elec_s{simpl}_c{clusters}.csv"
-    else:
-        return []
-
-
-def ev_policy_input(wildcards):
-    if wildcards["sector"] != "E":
-        return "config/policy_constraints/ev_policy.csv"
-    else:
-        return []
+def solve_network_input(wildcards):
+    resolved = scenario_lookup(wildcards)
+    return (
+        case_resource_dir(wildcards)
+        + f"elec_ec_l{resolved.ll}_{resolved.opts}.nc"
+    )
 
 
 rule solve_network:
     params:
         solving=config_provider("solving"),
         foresight=config_provider("foresight"),
-        planning_horizons=config["scenario"]["planning_horizons"],
+        planning_horizons=config_provider("scenario", "planning_horizons"),
         transmission_network=config_provider("model_topology", "transmission_network"),
-        sector_config=config_provider("sector", default={}),
+        opts=config_provider("scenario", "opts"),
     input:
-        network=RESOURCES
-        + "{interconnect}/elec_s{simpl}_c{clusters}_ec_l{ll}_{opts}_{sector}.nc",
+        network=solve_network_input,
+        sector_costs="repo_data/costs/simple_sector_costs.csv",
+        hydrogen_demand_share="repo_data/ReEDS_Constraints/hydrogen_demand_share.csv",
         flowgates="repo_data/ReEDS_Constraints/transmission/transmission_capacity_init_AC_ba_NARIS2024.csv",
         safer_reeds="config/policy_constraints/reeds/prm_annual.csv",
         rps_reeds="config/policy_constraints/reeds/rps_fraction.csv",
         ces_reeds="config/policy_constraints/reeds/ces_fraction.csv",
-        pop_layout=pop_layout_input,
-        ev_policy=ev_policy_input,
     output:
-        network=RESULTS
-        + "{interconnect}/networks/elec_s{simpl}_c{clusters}_ec_l{ll}_{opts}_{sector}.nc",
-        config=RESULTS
-        + "{interconnect}/configs/config.elec_s{simpl}_c{clusters}_l{ll}_{opts}_{sector}.yaml",
+        network=result_network_path(),
+        config=result_config_path(),
     log:
-        solver=normpath(
-            LOGS
-            + "solve_network/{interconnect}/elec_s{simpl}_c{clusters}_ec_l{ll}_{opts}_{sector}_solver.log"
-        ),
-        python=LOGS
-        + "solve_network/{interconnect}/elec_s{simpl}_c{clusters}_ec_l{ll}_{opts}_{sector}_python.log",
+        solver=normpath(CASE_LOGS + "solve_network/solver.log"),
+        python=CASE_LOGS + "solve_network/python.log",
     benchmark:
-        (
-            BENCHMARKS
-            + "solve_network/{interconnect}/elec_s{simpl}_c{clusters}_ec_l{ll}_{opts}_{sector}"
-        )
-    threads: solver_threads
+        CASE_BENCHMARKS + "solve_network"
+    threads:
+        lambda wildcards: config_provider("solving", "solver_options")(wildcards)[
+            config_provider("solving", "solver", "options")(wildcards)
+        ].get("threads", 4)
     resources:
         walltime=config_provider("walltime", "solve_network"),
-        mem_mb=lambda wildcards, input, attempt: (input.size // 100000) * attempt * 150,
+        mem_mb=28000,
     conda:
         "../envs/environment.yaml"
     script:

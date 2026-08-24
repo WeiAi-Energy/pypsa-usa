@@ -356,8 +356,6 @@ if __name__ == "__main__":
 
         snakemake = mock_snakemake(
             "plot_figures",
-            interconnect="texas",
-            clusters=40,
             ll="v1.25",
             opts="Co2L1.25",
             sector="E",

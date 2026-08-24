@@ -491,6 +491,7 @@ def set_parameters(plants: pd.DataFrame):
     plants = impute_missing_plant_data(plants, ["technology_description", "build_decade"], data_fields)
     plants = impute_missing_plant_data(plants, ["prime_mover_code", "build_decade"], data_fields)
     plants = impute_missing_plant_data(plants, ["carrier", "build_decade"], data_fields)
+    plants = impute_missing_plant_data(plants, ["carrier"], ["vom"])
 
     plants["start_fuel_cost"] = plants.start_fuel_mmbtu * plants.fuel_cost
     plants["start_up_cost"] = plants.startup_cost_fixed + plants.start_fuel_cost
@@ -690,8 +691,10 @@ if __name__ == "__main__":
         rootpath = "."
     configure_logging(snakemake)
 
-    weather_year = snakemake.params.renewable_weather_year[0]
-    # Cap the year at 2023 if it's greater
+    weather_years = snakemake.params.renewable_weather_year
+    weather_year = max(weather_years) if isinstance(weather_years, (list, tuple)) else weather_years
+    # Static power-plant inputs use the latest available EIA year and are not
+    # split by weather year.
     data_year = min(int(weather_year), 2023)
     start_date = f"{data_year}-01-01"
     end_date = f"{data_year + 1}-01-01"

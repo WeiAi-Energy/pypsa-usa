@@ -7,7 +7,6 @@ dependencies:
 - python==3.11.9
 - pip
 
-- pypsa==0.30.2
 - atlite==0.3.0
 - linopy==0.3.14
 
@@ -55,6 +54,7 @@ dependencies:
 - country_converter==1.0.0
 
 - pip:
+  - git+https://github.com/WeiAi-Energy/PyPSA-SSSC.git@main
   - tsam>=1.1.0
   - gurobipy==11.0.3
   - highspy

@@ -3,6 +3,7 @@
 import copy
 import hashlib
 import logging
+import os
 import re
 from functools import partial
 from pathlib import Path
@@ -12,7 +13,10 @@ import pandas as pd
 import pypsa
 import requests
 import yaml
+from pypsa.geo import haversine_pts
 from snakemake.utils import update_config
+
+logger = logging.getLogger(__name__)
 
 REGION_COLS = ["geometry", "name", "x", "y", "country"]
 
@@ -61,6 +65,32 @@ def configure_logging(snakemake, skip_handlers=False):
     logging.basicConfig(**kwargs)
 
 
+def configure_cds_api(snakemake):
+    """
+    Expose CDS API credentials from the Snakemake config to cdsapi/atlite.
+
+    Does nothing when no credentials are configured, in which case ``cdsapi``
+    falls back to ``~/.cdsapirc``.
+    """
+    api = snakemake.config.get("api", {})
+    cds = api.get("cds") or api.get("cdsapi") or api.get("copernicus")
+
+    if not cds:
+        return
+
+    if isinstance(cds, str):
+        key = cds
+        url = "https://cds.climate.copernicus.eu/api"
+    else:
+        key = cds.get("key") or cds.get("token") or cds.get("personal_access_token")
+        url = cds.get("url", "https://cds.climate.copernicus.eu/api")
+
+    if key and not os.environ.get("CDSAPI_KEY"):
+        os.environ["CDSAPI_KEY"] = str(key)
+    if url and not os.environ.get("CDSAPI_URL"):
+        os.environ["CDSAPI_URL"] = str(url)
+
+
 def setup_custom_logger(name):
     formatter = logging.Formatter(
         fmt="%(asctime)s - %(levelname)s - %(module)s - %(message)s",
@@ -73,6 +103,48 @@ def setup_custom_logger(name):
     # logger.setLevel(logging.DEBUG)
     logger.addHandler(handler)
     return logger
+
+
+def register_topology_carriers(n):
+    """
+    Declare the carriers the raw topology already refers to.
+
+    `add_electricity` is what normally populates `n.carriers`, and it runs after
+    the network has been reduced and clustered, so the AC and DC carriers that
+    buses, lines and links were born with are undeclared until then. PyPSA's
+    consistency check flags every one of them on each export in between, which
+    buries any real warning under tens of thousands of lines of noise.
+    """
+    referenced = set()
+    for component in ("Bus", "Line", "Link"):
+        df = n.df(component)
+        if "carrier" in df.columns:
+            referenced |= set(df.carrier.dropna().astype(str))
+    missing = sorted(carrier for carrier in referenced - set(n.carriers.index) if carrier)
+    if missing:
+        n.madd("Carrier", missing)
+        logging.getLogger(__name__).info(
+            "Registered topology carriers: %s.",
+            ", ".join(missing),
+        )
+    return n
+
+
+def read_network(path):
+    """
+    Read a network written either as netCDF or as a pickle.
+
+    `add_electricity` hands its result on as a pickle so that the custom
+    columns this workflow carries on buses, lines and generators survive
+    intact; everything else in the pipeline uses netCDF. Rules that sit
+    downstream of the hand-off should not have to care which they were given.
+    """
+    if str(path).endswith((".pkl", ".pickle")):
+        import dill
+
+        with open(path, "rb") as stream:
+            return dill.load(stream)
+    return pypsa.Network(path)
 
 
 def load_network(import_name=None, custom_components=None):
@@ -158,49 +230,98 @@ def load_costs(tech_costs: str) -> pd.DataFrame:
     return df.pivot(index="pypsa-name", columns="parameter", values="value").fillna(0)
 
 
-def load_network_for_plots(fn, tech_costs, config, combine_hydro_ps=True):
-    import pypsa
-    from add_electricity import load_costs, update_transmission_costs
+def get_complete_bidirectional_link_pairs(links: pd.DataFrame) -> dict[str, dict[str, str]]:
+    """Return complete `_fwd`/`_rev` link pairs keyed by shared base name.
 
-    n = pypsa.Network(fn)
+    Every physical DC corridor is built as two directional Links (``add_dclines``
+    in ``build_base_network``), and ``opts.bidirectional_link`` forces the two
+    directions to expand by the same amount. Callers that price or measure a
+    corridor therefore have to know which Links are two halves of one asset --
+    and which are unpaired survivors that must carry the full figure (a
+    direction can be dropped as a self-loop during topology reduction).
+    """
+    # Keyed off the index alone, so a frame carrying names but no columns -- which
+    # pandas reports as `empty` -- still resolves.
+    if links.index.empty:
+        return {}
 
-    n.loads["carrier"] = n.loads.bus.map(n.buses.carrier) + " load"
-    n.stores["carrier"] = n.stores.bus.map(n.buses.carrier)
+    directional = links.index[links.index.str.contains(r"_fwd$|_rev$", regex=True, case=True)]
+    pairs: dict[str, dict[str, str]] = {}
 
-    n.links["carrier"] = n.links.bus0.map(n.buses.carrier) + "-" + n.links.bus1.map(n.buses.carrier)
-    n.lines["carrier"] = "AC line"
-    n.transformers["carrier"] = "AC transformer"
+    for link_name in directional:
+        if link_name.endswith("_fwd"):
+            pairs.setdefault(link_name[: -len("_fwd")], {})["fwd"] = link_name
+        elif link_name.endswith("_rev"):
+            pairs.setdefault(link_name[: -len("_rev")], {})["rev"] = link_name
 
-    n.lines["s_nom"] = n.lines["s_nom_min"]
-    n.links["p_nom"] = n.links["p_nom_min"]
+    return {base_name: pair for base_name, pair in pairs.items() if {"fwd", "rev"} <= set(pair)}
 
-    if combine_hydro_ps:
-        n.storage_units.loc[
-            n.storage_units.carrier.isin({"PHS", "hydro"}),
-            "carrier",
-        ] = "hydro+PHS"
 
-    # if the carrier was not set on the heat storage units
-    # bus_carrier = n.storage_units.bus.map(n.buses.carrier)
-    # n.storage_units.loc[bus_carrier == "heat","carrier"] = "water tanks"
+#: Link columns written by ``add_electricity.update_transmission_costs``: the
+#: annualized per-MW-km line cost (already voltage- and region-resolved) and the
+#: annualized converter-pair cost that does not scale with distance.
+LINK_UNIT_COST_COL = "capex_per_mw_km_annual"
+LINK_FIXED_COST_COL = "capex_fixed_per_mw_annual"
 
-    num_years = n.snapshot_weightings.loc[n.investment_periods[0]].objective.sum() / 8760.0
-    costs = load_costs(tech_costs, config["costs"], config["electricity"], num_years)
-    update_transmission_costs(n, costs)
 
-    return n
+def recompute_link_transmission_costs(n: pypsa.Network) -> None:
+    """Rebuild transmission ``Link.capital_cost`` from the stored unit costs.
+
+    ``add_electricity`` resolves each transmission Link's per-MW-km cost from its
+    endpoint counties and stashes it in :data:`LINK_UNIT_COST_COL`. Every later
+    topology step moves those endpoints -- ``simplify_network`` relocates Links
+    off eliminated buses, and pypsa's clustering re-points them at cluster
+    centroids -- so the distance the cost was based on goes stale. pypsa only
+    rescales Link costs when ``scale_link_capital_costs=True``, which would also
+    (wrongly) scale the converter-pair term, so this recomputes both terms
+    explicitly from the *current* bus coordinates instead.
+
+    Call it at the end of every rule that changes bus positions.
+    """
+    if n.links.empty or LINK_UNIT_COST_COL not in n.links.columns:
+        return
+
+    transmission = n.links.index[n.links.carrier.isin(["AC", "DC"])]
+    if transmission.empty:
+        return
+
+    coords = n.buses[["x", "y"]].astype(float)
+    great_circle_km = pd.Series(
+        haversine_pts(
+            coords.loc[n.links.loc[transmission, "bus0"]].to_numpy(),
+            coords.loc[n.links.loc[transmission, "bus1"]].to_numpy(),
+        ),
+        index=transmission,
+    )
+
+    unit = pd.to_numeric(n.links.loc[transmission, LINK_UNIT_COST_COL], errors="coerce").fillna(0.0)
+    fixed = pd.to_numeric(n.links.loc[transmission, LINK_FIXED_COST_COL], errors="coerce").fillna(0.0)
+
+    # A complete pair is one physical corridor represented twice, so each
+    # direction carries half the cost; an unpaired survivor carries all of it.
+    paired = [
+        link_name
+        for pair in get_complete_bidirectional_link_pairs(n.links.loc[transmission]).values()
+        for link_name in pair.values()
+    ]
+    directions = pd.Series(1.0, index=transmission)
+    directions.loc[paired] = 2.0
+
+    n.links.loc[transmission, "capital_cost"] = (unit * great_circle_km + fixed) / directions
+    logger.info(
+        "Recomputed capital_cost for %s transmission Links (%s of them paired) from current bus coordinates.",
+        len(transmission),
+        len(paired),
+    )
 
 
 def is_transport_model(transmission_network):
-    match transmission_network:
-        case "reeds":
-            return True
-        case "tamu":
-            return False
-        case _:
-            return ValueError(
-                "transmission network not specified correctly. Check config",
-            )
+    if transmission_network != "tamu":
+        raise ValueError(
+            "This workflow only supports the non-transport TAMU power-flow model; "
+            f"received {transmission_network!r}.",
+        )
+    return False
 
 
 def update_p_nom_max(n):
@@ -304,7 +425,8 @@ def progress_retrieve(url, file):
     pbar = ProgressBar(0, 100)
 
     def dlProgress(count, block_size, total_size):
-        pbar.update(int(count * block_size * 100 / total_size))
+        percent = int(count * block_size * 100 / total_size)
+        pbar.update(min(percent, 100))
 
     urllib.request.urlretrieve(url, file, reporthook=dlProgress)
 
@@ -483,19 +605,19 @@ def get_checksum_from_zenodo(file_url):
 ### Config Related Helpers ###
 
 
+def set_case_config(snakemake):
+    """Merge case-specific overrides into snakemake.config."""
+    cases = snakemake.config.get("cases", {})
+    if cases and "case" in snakemake.wildcards.keys():
+        case_name = snakemake.wildcards.case
+        if case_name not in cases:
+            raise KeyError(f"Case '{case_name}' not found in config/cases_backup.yaml.")
+        update_config(snakemake.config, copy.deepcopy(cases[case_name] or {}))
+
+
 def set_scenario_config(snakemake):
-    scenario = snakemake.config["run"].get("scenarios", {})
-    if scenario.get("enable") and "run" in snakemake.wildcards.keys():
-        try:
-            with open(scenario["file"]) as f:
-                scenario_config = yaml.safe_load(f)
-        except FileNotFoundError:
-            # fallback for mock_snakemake
-            script_dir = Path(__file__).parent.resolve()
-            root_dir = script_dir.parent
-            with open(root_dir / scenario["file"]) as f:
-                scenario_config = yaml.safe_load(f)
-        update_config(snakemake.config, scenario_config[snakemake.wildcards.run])
+    """Backward-compatible alias for case-aware config overrides."""
+    set_case_config(snakemake)
 
 
 def get_opt(opts, expr, flags=None):
@@ -549,15 +671,6 @@ def update_config_from_wildcards(config, w, inplace=True):
             config["electricity"]["gaslimit_enable"] = True
             if gasl_value is not None:
                 config["electricity"]["gaslimit"] = gasl_value * 1e6
-
-        if "Ept" in opts:
-            config["costs"]["emission_prices"]["co2_monthly_prices"] = True
-
-        ep_enable, ep_value = find_opt(opts, "Ep")
-        if ep_enable:
-            config["costs"]["emission_prices"]["enable"] = True
-            if ep_value is not None:
-                config["costs"]["emission_prices"]["co2"] = ep_value
 
         attr_lookup = {
             "p": "p_nom_max",
@@ -807,6 +920,35 @@ def get_snapshots(
     return time
 
 
+def get_weather_year_snapshots(
+    weather_years: list[int] | tuple[int, ...],
+    *,
+    drop_leap_day: bool = True,
+    freq: str = "h",
+) -> pd.DatetimeIndex:
+    """Return concatenated, timezone-naive snapshots for explicit weather years.
+
+    Leap days are removed with the same ``get_snapshots`` implementation used by
+    the reference workflow.  Gaps in the requested weather-year sequence are
+    deliberately retained; callers can therefore distinguish 2013 from 2016.
+    """
+    snapshots = pd.DatetimeIndex([], name="timestep")
+    for weather_year in weather_years:
+        year = int(weather_year)
+        snapshots = snapshots.append(
+            get_snapshots(
+                {
+                    "start": f"{year}-01-01 00:00:00",
+                    "end": f"{year + 1}-01-01 00:00:00",
+                    "inclusive": "left",
+                },
+                drop_leap_day=drop_leap_day,
+                freq=freq,
+            ),
+        )
+    return snapshots
+
+
 def weighted_avg(df, values, weights):
     """
     Return the weighted average of a DataFrame column(s) `values` with weights
@@ -821,10 +963,83 @@ def weighted_avg(df, values, weights):
 def get_multiindex_snapshots(
     sns_config: dict[str, str],
     invest_periods: list[int],
+    weather_years: list[int] | tuple[int, ...] | None = None,
 ) -> pd.MultiIndex:
+    if weather_years:
+        weather_snapshots = get_weather_year_snapshots(weather_years)
+        periods = np.repeat([int(year) for year in invest_periods], len(weather_snapshots))
+        timesteps = weather_snapshots.to_numpy().tolist() * len(invest_periods)
+        return pd.MultiIndex.from_arrays(
+            [periods, pd.DatetimeIndex(timesteps)],
+            names=["period", "timestep"],
+        )
+
     sns = pd.DatetimeIndex([])
     for year in invest_periods:
         sns = sns.append(
             get_snapshots(sns_config).map(lambda x: x.replace(year=year)),
         )
-    return pd.MultiIndex.from_arrays([sns.year, sns])
+    return pd.MultiIndex.from_arrays(
+        [sns.year, sns],
+        names=["period", "timestep"],
+    )
+
+
+def get_currency_conversion_factor(year, currency="EUR"):
+    """Convert nominal EUR/USD costs to 2022 USD using reference factors."""
+    eur_usd_avg = {
+        2010: 1.3261,
+        2011: 1.3931,
+        2012: 1.2859,
+        2013: 1.3281,
+        2014: 1.3297,
+        2015: 1.1096,
+        2016: 1.1072,
+        2017: 1.1301,
+        2018: 1.1817,
+        2019: 1.1194,
+        2020: 1.1410,
+        2021: 1.1830,
+        2022: 1.0534,
+        2023: 1.0817,
+        2024: 1.0820,
+        2025: 1.1687,
+    }
+    cpi_us = {
+        # ReEDS reports transmission costs in 2004 USD, so the index reaches back
+        # that far even though no EUR exchange rate is available for 2004.
+        # CPI-U annual averages 188.9 (2004) / 292.655 (2022), rebased to 2022=100,
+        # which makes the 2004 -> 2022 factor 1.549.
+        2004: 64.547,
+        2010: 74.5,
+        2011: 76.9,
+        2012: 78.5,
+        2013: 79.6,
+        2014: 80.9,
+        2015: 81.0,
+        2016: 82.0,
+        2017: 83.8,
+        2018: 85.8,
+        2019: 87.4,
+        2020: 88.4,
+        2021: 92.6,
+        2022: 100.0,
+        2023: 104.1,
+        2024: 107.2,
+        2025: 110.1,
+    }
+    year = int(year)
+    if year not in cpi_us:
+        raise ValueError(f"Year {year} has no US CPI reference; supported years are {sorted(cpi_us)}.")
+    currency = currency.upper()
+    if currency == "EUR":
+        if year not in eur_usd_avg:
+            raise ValueError(
+                f"No EUR/USD exchange rate for {year}; supported years are {sorted(eur_usd_avg)}.",
+            )
+        exchange_rate = eur_usd_avg[year]
+    elif currency == "USD":
+        exchange_rate = 1.0
+    else:
+        raise ValueError(f"Unsupported currency: {currency}. Use 'EUR' or 'USD'.")
+    return exchange_rate * cpi_us[2022] / cpi_us[year]

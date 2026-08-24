@@ -18,8 +18,6 @@ In production cost-minimizing optimization models, a generator’s marginal cost
 
 - **Data Imputation**:
     - Missing data is imputed using capacity-weighted averages calculated by NERC region and unit technology type.
-    - Wholesale daily natural gas prices for fuel regions across the WECC are imputed using CAISO OASIS data.
-    - Monthly fuel prices for coal and natural gas, spatially resolved by state, are supplemented by data from the EIA.
     - For technologies like biomass and nuclear, where fuel prices are not available from other sources, projected fuel costs from the NREL ATB are used.
 
 - **Future Fuel Costs**:

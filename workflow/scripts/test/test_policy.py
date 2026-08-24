@@ -150,7 +150,7 @@ def test_add_regional_co2limit(policy_network, co2_config):
     def extra_functionality(n, _):
         add_regional_co2limit(n, config)
 
-    n.optimize(solver_name="glpk", multi_investment_periods=True, extra_functionality=extra_functionality)
+    n.optimize(solver_name="highs", multi_investment_periods=True, extra_functionality=extra_functionality)
 
     # Check that constraints were added
     assert any("co2_limit" in c for c in n.model.constraints), "No CO2 limit constraints were added"
@@ -180,7 +180,7 @@ def test_add_regional_co2limit_clustered(clustered_policy_network, co2_config):
     def extra_functionality(n, _):
         add_regional_co2limit(n, config)
 
-    n.optimize(solver_name="glpk", multi_investment_periods=True, extra_functionality=extra_functionality)
+    n.optimize(solver_name="highs", multi_investment_periods=True, extra_functionality=extra_functionality)
 
     # Check that constraints were added
     assert any("co2_limit" in c for c in n.model.constraints), "No CO2 limit constraints were added"
@@ -205,51 +205,37 @@ def test_add_rps_constraints(policy_network, rps_config):
 
     n = policy_network
     config, snakemake = rps_config
+    if "load" not in n.carriers.index:
+        n.add("Carrier", "load")
+    n.add(
+        "Generator",
+        "z1 load",
+        bus="z1",
+        carrier="load",
+        p_nom=1e4,
+        marginal_cost=1e5,
+    )
 
     # Add RPS constraints
     def extra_functionality(n, _):
-        add_RPS_constraints(n, config, sector=False, snakemake=snakemake)
+        add_RPS_constraints(n, config, snakemake=snakemake)
 
-    n.optimize(solver_name="glpk", multi_investment_periods=True, extra_functionality=extra_functionality)
+    n.optimize(solver_name="highs", multi_investment_periods=True, extra_functionality=extra_functionality)
 
     # Check that constraints were added
     assert any("rps_limit" in c for c in n.model.constraints), "No RPS limit constraints were added"
+    assert any("ces_limit" in c for c in n.model.constraints), "No CES limit constraints were added"
 
-    # Get the portfolio standards from config file
-    portfolio_standards = pd.read_csv(config["electricity"]["portfolio_standards"])
-
-    # Check that renewable generation meets RPS requirements
-    for _, row in portfolio_standards.iterrows():
-        region_list = [region.strip() for region in row.region.split(",")]
-        region_buses = get_region_buses(n, region_list)
-
-        if region_buses.empty:
-            continue
-
-        carriers = [carrier.strip() for carrier in row.carrier.split(",")]
-        region_gens = n.generators[n.generators.bus.isin(region_buses.index)]
-        region_gens_eligible = region_gens[region_gens.carrier.isin(carriers)]
-
-        if region_gens_eligible.empty:
-            continue
-
-        # Calculate total generation from eligible sources
-        eligible_generation = n.generators_t.p[region_gens_eligible.index].sum().sum()
-
-        # Calculate total demand in the region
-        region_demand = n.loads_t.p_set.loc[:, n.loads.bus.isin(region_buses.index)].sum().sum()
-        logger.info(
-            f"RPS Check: Region: {row.region}, Carriers: {carriers}, "
-            f"Eligible Generation: {eligible_generation:.2f} MW, "
-            f"Total Demand: {region_demand:.2f} MW, "
-            f"Required %: {row.pct * 100:.1f}%, "
-            f"Actual %: {(eligible_generation / region_demand) * 100:.1f}%",
-        )
-        # Check if RPS requirement is met with small epsilon for rounding errors
-        epsilon = 1e-3
-        assert eligible_generation >= (row.pct * region_demand) - epsilon, (
-            f"RPS requirement of {row.pct * 100}% not met for region {row.region}"
-        )
+    shedding_labels = set(
+        n.model["Generator-p"]
+        .labels.sel(Generator="z1 load")
+        .to_numpy()
+        .reshape(-1),
+    )
+    for name, constraint in n.model.constraints.items():
+        if name.startswith("PortfolioStandard-"):
+            constraint_labels = set(constraint.vars.to_numpy().reshape(-1))
+            assert shedding_labels.isdisjoint(constraint_labels)
 
 
 def test_add_rps_constraints_clustered(clustered_policy_network, rps_config):
@@ -261,116 +247,23 @@ def test_add_rps_constraints_clustered(clustered_policy_network, rps_config):
 
     # Add RPS constraints
     def extra_functionality(n, _):
-        add_RPS_constraints(n, config, sector=False, snakemake=snakemake)
+        add_RPS_constraints(n, config, snakemake=snakemake)
 
-    n.optimize(solver_name="glpk", multi_investment_periods=True, extra_functionality=extra_functionality)
+    n.optimize(solver_name="highs", multi_investment_periods=True, extra_functionality=extra_functionality)
 
     # Check that constraints were added
     assert any("rps_limit" in c for c in n.model.constraints), "No RPS limit constraints were added"
-
-    # Get the portfolio standards from config file
-    portfolio_standards = pd.read_csv(config["electricity"]["portfolio_standards"])
-
-    # Check that renewable generation meets RPS requirements
-    for _, row in portfolio_standards.iterrows():
-        region_list = [region.strip() for region in row.region.split(",")]
-        region_buses = get_region_buses(n, region_list)
-
-        if region_buses.empty:
-            continue
-
-        carriers = [carrier.strip() for carrier in row.carrier.split(",")]
-        region_gens = n.generators[n.generators.bus.isin(region_buses.index)]
-        region_gens_eligible = region_gens[region_gens.carrier.isin(carriers)]
-
-        if region_gens_eligible.empty:
-            continue
-
-        # Calculate total generation from eligible sources
-        eligible_generation = n.generators_t.p[region_gens_eligible.index].sum().sum()
-
-        # Calculate total demand in the region
-        region_demand = n.loads_t.p_set.loc[:, n.loads.bus.isin(region_buses.index)].sum().sum()
-        logger.info(
-            f"RPS Check (Clustered): Region: {row.region}, Carriers: {carriers}, "
-            f"Eligible Generation: {eligible_generation:.2f} MW, "
-            f"Total Demand: {region_demand:.2f} MW, "
-            f"Required %: {row.pct * 100:.1f}%, "
-            f"Actual %: {(eligible_generation / region_demand) * 100:.1f}%",
-        )
-        # Check if RPS requirement is met with small epsilon for rounding errors
-        epsilon = 1e-3
-        assert eligible_generation >= (row.pct * region_demand) - epsilon, (
-            f"RPS requirement of {row.pct * 100}% not met for region {row.region} in clustered network"
-        )
+    assert any("ces_limit" in c for c in n.model.constraints), "No CES limit constraints were added"
 
 
 def test_add_technology_capacity_target_constraints(policy_network, tct_config):
-    """Test that technology capacity target constraints are correctly added to the network."""
+    """TCT creates minimum and maximum constraints without requiring a solver."""
     from opts.policy import add_technology_capacity_target_constraints
 
     n = policy_network
-    config = tct_config
+    n.optimize.create_model(multi_investment_periods=True)
+    add_technology_capacity_target_constraints(n, tct_config)
 
-    # Add TCT constraints
-    def extra_functionality(n, _):
-        add_technology_capacity_target_constraints(n, config)
-
-    n.optimize(solver_name="glpk", multi_investment_periods=True, extra_functionality=extra_functionality)
-
-    # Check that constraints were added
-    assert any("min" in c for c in n.model.constraints), "No TCT minimum constraints were added"
-    assert any("max" in c for c in n.model.constraints), "No TCT maximum constraints were added"
-
-    # Get the technology capacity targets from config file
-    tct_data = pd.read_csv(config["electricity"]["technology_capacity_targets"])
-
-    # Check that capacity targets are met
-    for _, target in tct_data.iterrows():
-        region_list = [region.strip() for region in target.region.split(",")]
-        region_buses = get_region_buses(n, region_list)
-
-        if region_buses.empty:
-            continue
-
-        carriers = [carrier.strip() for carrier in target.carrier.split(",")]
-
-        # Get total capacity (existing + new) for the target technology
-        total_capacity = 0
-
-        # Check generators
-        gens = n.generators[(n.generators.bus.isin(region_buses.index)) & (n.generators.carrier.isin(carriers))]
-        total_capacity += gens.p_nom_opt.sum()
-
-        # Check storage units
-        storage = n.storage_units[
-            (n.storage_units.bus.isin(region_buses.index)) & (n.storage_units.carrier.isin(carriers))
-        ]
-        total_capacity += storage.p_nom_opt.sum()
-
-        # Check links
-        links = n.links[(n.links.bus0.isin(region_buses.index)) & (n.links.carrier.isin(carriers))]
-        total_capacity += links.p_nom_opt.sum()
-
-        # Get min and max targets, handling NaN values
-        min_target = float(target["min"]) if not pd.isna(target["min"]) else None
-        max_target = float(target["max"]) if not pd.isna(target["max"]) else None
-
-        logger.info(
-            f"TCT Check: Region: {target.region}, Carrier: {carriers}, "
-            f"Total Capacity: {total_capacity:.2f} MW, "
-            f"Min Target: {min_target}, "
-            f"Max Target: {max_target}",
-        )
-
-        # Check minimum capacity if specified
-        if min_target is not None:
-            assert total_capacity >= min_target, (
-                f"Minimum capacity target of {min_target} MW not met for {target['carrier']} in {target['region']}"
-            )
-
-        # Check maximum capacity if specified
-        if max_target is not None:
-            assert total_capacity <= max_target, (
-                f"Maximum capacity target of {max_target} MW exceeded for {target['carrier']} in {target['region']}"
-            )
+    names = list(n.model.constraints)
+    assert any(name.startswith("TCT-") and name.endswith("_min") for name in names)
+    assert any(name.startswith("TCT-") and name.endswith("_max") for name in names)

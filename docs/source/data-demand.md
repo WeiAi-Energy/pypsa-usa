@@ -32,6 +32,7 @@ scenario:
 electricity:
   demand:
     profile: efs # efs, eia
+    efs_scaling_factor: 1.0 # optional multiplier applied to total EFS demand
     scenario:
       efs_case: reference # reference, medium, high
       efs_speed: moderate # slow, moderate, rapid

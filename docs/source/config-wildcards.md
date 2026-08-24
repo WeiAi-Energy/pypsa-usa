@@ -31,12 +31,12 @@ A visual representation of each `{interconnect}` is shown below:
 
 The ``{simpl}`` wildcard specifies number of buses a detailed
 network model should be pre-clustered to in the rule
-:mod:`simplify_network` (before :mod:`cluster_network`).
+:mod:`simplify_network`.
 
 (clusters)=
 ## The `{clusters}` wildcard
 
-The `{clusters}` wildcard specifies the number of buses a detailed network model should be reduced to in the rule :mod:`cluster_network`.
+The `{clusters}` wildcard specifies the number of buses a detailed network model should be reduced to. Every aggregation pass — substation aggregation, electrical-distance clustering and low-degree reduction — runs in the rule :mod:`simplify_network`; there is no separate clustering rule.
 The number of clusters must be lower than the total number of nodes and higher than the number of balancing authoritites.
 
 If an `m` is placed behind the number of clusters (e.g. `100m`), generators are only moved to the clustered buses but not aggregated by carrier; i.e. the clustered bus may have more than one e.g. wind generator.
@@ -90,12 +90,37 @@ There are currently:
 
 ### Energy Reserve Margin (ERM) Configuration
 
-The ERM constraint ensures that each region has sufficient firm capacity to meet demand plus a reserve margin at every timestep. Unlike traditional planning reserve margins that only consider peak demand, ERM enforces the constraint across all snapshots.
+The ERM constraint ensures the system can serve demand plus a reserve margin at every timestep. Unlike traditional planning reserve margins that only consider peak demand, ERM enforces the constraint across all snapshots.
+
+It is formulated as one **aggregated adequacy inequality per region and snapshot**. For each region `R` and snapshot `t`:
+
+```
+  Σ_{g∈R}  p_nom_g · availability_{g,t}          generator capacity × availability factor
++ Σ_{s∈R}  discharge_potential_{s,t}             energy-backed storage discharge potential
++ F_{R,t}                                        net actual power flow into R across its boundary
+≥ (1 + erm_R) · demand_{R,t}
+```
+
+Only the **dischargers** carry a variable of their own. Every other term is either a linear expression in base-state variables the model already builds or a constant, so the ERM adds no second copy of the dispatch, no second nodal balance and no second voltage law. On a county-resolution USA network at 8 snapshots this is the difference between roughly +3.4 M constraint rows and +0.8 M, and it removes a duplicated Kirchhoff voltage law worth about 13 M matrix non-zeros.
+
+**Contributions are gross.** Nothing is netted out for what the base state is already doing with the same asset: a generator counts its full available capacity even while it is dispatched, and a storage unit counts its discharge potential even while it charges. The one place the base state does enter is the boundary flow, which is deliberately conservative — a region that exports in the base state is assumed to keep exporting when the reserve is called.
 
 **Key Features:**
-- Resources must be "energy-backed" - storage devices must have sufficient state of charge to contribute to the reserve
-- Supports multiple non-overlapping regions with different reserve margins
-- Defaults to 15% reserve margin for all regions if not specified
+
+- **Availability factor is `p_max_pu`.** It already carries the VRE resource profile *and* the temperature-dependent thermal derates applied in `capacity_derates.py`, so no separate capacity-credit table is involved. Extendable capacity enters the row on its `p_nom` variable; fixed capacity is a constant on the right-hand side
+- Resources must be "energy-backed" — reserve discharge from a storage unit is capped both by its rating against the shared `p_nom` and by the state of charge the base-state dispatch leaves in the device, and reserve flow on a `Store` discharge link is capped by the energy in that store. A discharge link reaches the electricity bus through its efficiency, so it contributes `efficiency · p`
+- **Inter-regional transmission contributes to adequacy through the base state's actual flow.** A branch with exactly one end in the region enters with the sign of the in-region end: `+s` at `bus1`, `−s` at `bus0` for a passive branch, `+efficiency · p` at `bus1` and `−p` at `bus0` for a link. Where losses are modelled, half the branch loss is charged at each end, matching PyPSA's own nodal balance. Only electric branches count — a `tes` or `H2` bus carries no region label, so a TES or electrolysis link is not a boundary crossing
+- Because the boundary term is the base-state flow rather than an independently redispatchable reserve flow, an SSSC no longer earns adequacy value directly; it affects the requirement only through the base-state flows it steers
+- No ramping coupling to the base state is imposed, and the constraint is applied at every snapshot rather than only at stress hours
+- Supports overlapping regions with different reserve margins; each region gets its own constraint row, so overlaps are additive in the requirement rather than resolved by taking a maximum
+
+**Requirement granularity.** One row per region and snapshot. `erm: {all: X}` is shorthand for "apply `X` to every NERC region" rather than a single nationwide row: a nationwide region has no boundary, so its flow term would vanish and the requirement would collapse into a nationwide capacity sum. Explicit region keys override the value inherited from `all`.
+
+The flip side of aggregating is worth stating plainly: within a region the requirement is one sum, so intra-regional transmission earns no adequacy value. A region containing both a large generator and an electrically unreachable load pocket will pass. Use a finer region definition (ReEDS zone rather than NERC region, say) where that matters.
+
+One dual is stored after solving:
+
+- `n.erm_region_price` — a `DataFrame` indexed by snapshot with one column per ERM region, the dual of the regional requirement: the marginal cost of raising that region's reserve margin.
 
 **Configuration:**
 
@@ -118,10 +143,10 @@ electricity:
     # CISO: 0.17
 ```
 
-If no `erm` configuration is provided, a default of `{'all': 0.15}` (15% reserve margin for all regions) is used.
+If no `erm` configuration is provided, a default of `{'all': 0.15}` is used, i.e. a 15% reserve margin on every NERC region.
 
 **Valid region identifiers:**
-- `all` - applies to all buses in the network
+- `all` - applies the same margin to every NERC region present in the network
 - State codes: `TX`, `CA`, `MT`, etc.
 - Interconnect names: `western`, `eastern`, `texas`
 - NERC region names

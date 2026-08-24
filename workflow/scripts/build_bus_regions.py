@@ -74,7 +74,7 @@ def main(snakemake):
 
     logger.info(
         "Building bus regions for %s Interconnect",
-        snakemake.wildcards.interconnect,
+        snakemake.params.interconnect,
     )
     logger.info("Built for aggregation with %s zones", topological_boundaries)
 
@@ -193,6 +193,17 @@ def main(snakemake):
 
         logger.info(f"Added {len(empty_counties)} empty counties assigned to nearest buses.")
 
+    if onshore_regions_concat["name"].duplicated().any():
+        duplicate_count = int(onshore_regions_concat["name"].duplicated().sum())
+        logger.info(
+            "Collapsing %s duplicate onshore regions by bus name after assigning empty counties.",
+            duplicate_count,
+        )
+        onshore_regions_concat = onshore_regions_concat.dissolve(
+            by="name",
+            aggfunc={"x": "first", "y": "first", "country": "first"},
+        ).reset_index()
+
     onshore_regions_concat.to_file(snakemake.output.regions_onshore)
     combined_onshore = onshore_regions_concat.geometry.union_all()
 
@@ -238,6 +249,6 @@ if __name__ == "__main__":
     if "snakemake" not in globals():
         from _helpers import mock_snakemake
 
-        snakemake = mock_snakemake("build_bus_regions", interconnect="western")
+        snakemake = mock_snakemake("build_bus_regions")
     configure_logging(snakemake)
     main(snakemake)

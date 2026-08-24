@@ -16,6 +16,7 @@ scenario:
   scope: "total" # "urban", "rural", or "total"
   sector: "" # G
   planning_horizons: [2050]    #(2018-2023, 2030, 2040, 2050)
+  cost_year: 2050
 foresight:  'perfect' # myopic, perfect
 
 model_topology:
@@ -33,7 +34,7 @@ model_topology:
 
 # docs :
 enable:
-  build_cutout: false
+  custom_busmap: false
 
 renewable_weather_years: [2019]
 
@@ -47,18 +48,13 @@ electricity:
   conventional_carriers: [nuclear, oil, OCGT, CCGT, coal, geothermal, biomass, waste] # Choose the conventional plant types to include in network
   renewable_carriers: [onwind, offwind_floating, solar, hydro] # Choose the renewable plant types to include in network
   retirement: economic # "economic" or "technical"
+  add_extendable_tes: false
   SAFE_reservemargin: 0.14
   regional_Co2_limits: 'config/policy_constraints/regional_Co2_limits.csv'
-  technology_capacity_targets: 'config/policy_constraints/technology_capacity_targets.csv'
+  technology_capacity_targets: 'repo_data/policy/technology_capacity_targets.csv'
   portfolio_standards: 'config/policy_constraints/portfolio_standards.csv'
   SAFE_regional_reservemargins: 'config/policy_constraints/SAFE_regional_prm.csv'
   transmission_interface_limits: 'config/policy_constraints/transmission_interface_limits.csv'
-
-  operational_reserve:
-    activate: false
-    epsilon_load: 0.02
-    epsilon_vres: 0.02
-    contingency: 4000
 
   extendable_carriers:
     Generator: [solar, onwind, offwind_floating, OCGT, CCGT, CCGT-95CCS, coal, nuclear] #include CCGT-CCS
@@ -68,6 +64,10 @@ electricity:
 
   demand: 
     profile: efs # efs, eia
+    data_center_demand_growth: false # false, central, high
+    electrolyzer_load:
+      enable: false
+      profile: repo_data/electrolyzer_load/electrolyzer_load_2050.csv
     scenario: 
       efs_case: reference # reference, medium, high
       efs_speed: moderate # slow, moderate, rapid
@@ -77,17 +77,21 @@ electricity:
 conventional:
   unit_commitment: false
   must_run: false
-  dynamic_fuel_price:
-    enable: false
-    pudl: true
-    wholesale: true
+  gas_fuel_price: 15 # $/MWh_th natural gas fuel price applied to all gas-fueled generators (OCGT, CCGT, and their -CCS variants)
 
 # docs :
 lines:
   s_max_pu: 0.7
   s_nom_max: .inf
   max_extension: 20000 #MW
-  length_factor: 1.25
+  length_factor: 1.0 # routed-length / great-circle. ReEDS prices already embed
+    # route detour, so update_transmission_costs divides this back out; it must
+    # match the factor used by every aggregation pass or impedance and cost shift.
+  convert_lines_to_line_psts:
+    enable: false
+    phase_shift_min: -5
+    phase_shift_max: 5
+    relax_line_pst_investment: false
 
 
 # docs :
@@ -96,7 +100,6 @@ links:
   p_nom_max: .inf
   max_extension: 20000 #MW
 
-# docs :
 costs:
   atb:
     model_case: "Market" # Market, R&D
@@ -104,31 +107,6 @@ costs:
   aeo:
     scenario: "reference" # reference, high, low
   social_discount_rate: 0.02
-  ng_fuel_year: 2019 # year of the natural gas price from CAISO [2019- 2023]
-  emission_prices: # in currency per tonne emission, only used with the option Ep
-    enable: false
-    co2: 0.
-    co2_monthly_prices: false
-  ptc_modifier:
-    onwind: 27.50
-    biomass: 27.50
-  itc_modifier:
-    solar: 0.3
-    offwind: 0.3
-    offwind_floating: 0.3
-    EGS: 0.3
-    geothermal: 0.3
-    SMR: 0.3
-    nuclear: 0.3
-    hydro: 0.3
-    2hr_battery_storage: 0.3
-    4hr_battery_storage: 0.3
-    6hr_battery_storage: 0.3
-    8hr_battery_storage: 0.3
-    10hr_battery_storage: 0.3
-    8hr_PHS: 0.3
-    10hr_PHS: 0.3
-    12hr_PHS: 0.3
   max_growth:  # {carrier: {base:, rate:}}
 
 
@@ -165,11 +143,6 @@ clustering:
     to_substations: false # network is simplified to nodes with positive or negative power injection (i.e. substations or offwind connections)
     algorithm: kmeans # choose from: [hac, kmeans]
     feature: solar+onwind-time # only for hac. choose from: [solar+onwind-time, solar+onwind-cap, solar-time, solar-cap, solar+offwind-cap] etc.
-  cluster_network:
-    algorithm: kmeans # choose from: [hac, kmeans]
-    feature: solar+onwind-time
-    exclude_carriers: []
-    consider_efficiency_classes: false
   aggregation_strategies:
     generators:
       build_year: 'capacity_weighted_average'
@@ -186,6 +159,11 @@ clustering:
   temporal:
     resolution_elec: false
     resolution_sector: false
+    representative_periods:
+      enable: false
+      period_length: 1  # days; one tsam run, so representative and extreme periods share it
+      number: 8
+      include_extreme: true  # true keeps legacy defaults; or use [solar_min, solar_max, wind_min, wind_max, demand_min, demand_max]
 
 focus_weights:
 
@@ -203,6 +181,7 @@ solving:
     track_iterations: false
     min_iterations: 4
     max_iterations: 6
+    method: fixed_point
     transmission_losses: 2
     linearized_unit_commitment: true
     horizon: 8760

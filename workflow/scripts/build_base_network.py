@@ -9,9 +9,11 @@ import pandas as pd
 import pypsa
 from _helpers import configure_logging
 from build_shapes import load_na_shapes
-from constants import REC_TRADING_ZONE_MAPPER
 from shapely.geometry import Polygon
 from sklearn.neighbors import BallTree
+
+
+logger = logging.getLogger(__name__)
 
 
 def haversine_np(lon1, lat1, lon2, lat2):
@@ -70,13 +72,174 @@ def add_buses_from_file(
     return n
 
 
+def impute_cross_substation_line_ratings(
+    branches: pd.DataFrame,
+    buses: pd.DataFrame,
+) -> pd.DataFrame:
+    """Impute missing AC line ratings without changing the source data.
+
+    MATPOWER encodes an unspecified ``rateA`` as zero. Most such entries in
+    the Breakthrough data are same-substation connectors and are subsequently
+    contracted during simplification. A zero-rated line between substations,
+    however, would otherwise be imported as a 0.01 MVA bottleneck. Those
+    lines receive the median ``rateA`` of rated lines in the same
+    interconnection and nominal-voltage class.
+    """
+    branches = branches.copy()
+    branches["rating_imputed"] = False
+    bus_attrs = buses[["sub_id", "v_nom"]].copy()
+    bus_attrs.index = bus_attrs.index.astype(str)
+
+    from_sub = branches.from_bus_id.map(bus_attrs.sub_id)
+    to_sub = branches.to_bus_id.map(bus_attrs.sub_id)
+    from_v_nom = branches.from_bus_id.map(bus_attrs.v_nom)
+    to_v_nom = branches.to_bus_id.map(bus_attrs.v_nom)
+    voltage_class = pd.concat([from_v_nom, to_v_nom], axis=1).max(axis=1)
+
+    line_mask = branches.branch_device_type.eq("Line")
+    rated_mask = line_mask & branches.rateA.gt(0)
+    missing_cross_substation_mask = line_mask & branches.rateA.eq(0) & from_sub.ne(to_sub)
+
+    if not missing_cross_substation_mask.any():
+        return branches
+
+    peer_medians = (
+        pd.DataFrame(
+            {
+                "interconnect": branches.loc[rated_mask, "interconnect"],
+                "voltage_class": voltage_class.loc[rated_mask],
+                "rateA": branches.loc[rated_mask, "rateA"],
+            },
+        )
+        .groupby(["interconnect", "voltage_class"])["rateA"]
+        .median()
+        .to_dict()
+    )
+    voltage_medians = (
+        pd.DataFrame(
+            {
+                "voltage_class": voltage_class.loc[rated_mask],
+                "rateA": branches.loc[rated_mask, "rateA"],
+            },
+        )
+        .groupby("voltage_class")["rateA"]
+        .median()
+        .to_dict()
+    )
+
+    imputed = pd.Series(
+        [
+            peer_medians.get(
+                (branches.at[index, "interconnect"], voltage_class.at[index]),
+                voltage_medians.get(voltage_class.at[index]),
+            )
+            for index in branches.index[missing_cross_substation_mask]
+        ],
+        index=branches.index[missing_cross_substation_mask],
+        dtype=float,
+    )
+    if imputed.isna().any():
+        missing = imputed.index[imputed.isna()].tolist()
+        raise ValueError(f"Cannot impute rateA for cross-substation lines: {missing}")
+
+    branches.loc[imputed.index, "rateA"] = imputed
+    branches.loc[imputed.index, "rating_imputed"] = True
+    logger.info(
+        "Imputed rateA for %s cross-substation Breakthrough lines using rated-line medians.",
+        len(imputed),
+    )
+    return branches
+
+
+def impute_remaining_branch_ratings(
+    branches: pd.DataFrame,
+    buses: pd.DataFrame,
+) -> pd.DataFrame:
+    """Rate the branches ``impute_cross_substation_line_ratings`` leaves behind.
+
+    What remains after that pass is unrated same-substation Lines and unrated
+    Transformers of any kind. They used to be stamped with a 0.01 MVA sentinel,
+    which is hazardous because it is indistinguishable from a real rating:
+    ``simplify_network`` merges branches in series with ``min(s_nom)``, so a single
+    sentinel turns an entire series chain into a phantom 0.01 MVA bottleneck, and
+    any capacity-normalised metric (flow / s_nom) is dominated by it.
+
+    Each remaining branch instead receives the median ``rateA`` of rated branches of
+    the same device type, interconnection and nominal-voltage class. ``rating_imputed``
+    records the provenance so downstream code can tell a measured rating from a
+    filled one.
+    """
+    branches = branches.copy()
+    if "rating_imputed" not in branches.columns:
+        branches["rating_imputed"] = False
+
+    bus_v_nom = buses["v_nom"].copy()
+    bus_v_nom.index = bus_v_nom.index.astype(str)
+    voltage_class = pd.concat(
+        [branches.from_bus_id.map(bus_v_nom), branches.to_bus_id.map(bus_v_nom)],
+        axis=1,
+    ).max(axis=1)
+
+    missing = branches.rateA.le(0)
+    if not missing.any():
+        return branches
+
+    rated = branches.rateA.gt(0)
+    keys = pd.DataFrame(
+        {
+            "device": branches.branch_device_type,
+            "interconnect": branches.interconnect,
+            "voltage_class": voltage_class,
+        },
+    )
+    by_all = branches.loc[rated].groupby(
+        [keys.device[rated], keys.interconnect[rated], keys.voltage_class[rated]],
+    ).rateA.median()
+    by_voltage = branches.loc[rated].groupby([keys.device[rated], keys.voltage_class[rated]]).rateA.median()
+    by_device = branches.loc[rated].groupby(keys.device[rated]).rateA.median()
+
+    def lookup(index):
+        device = keys.device.at[index]
+        v_class = keys.voltage_class.at[index]
+        for table, key in (
+            (by_all, (device, keys.interconnect.at[index], v_class)),
+            (by_voltage, (device, v_class)),
+            (by_device, device),
+        ):
+            value = table.get(key)
+            if value is not None and np.isfinite(value):
+                return value
+        return np.nan
+
+    filled = pd.Series(
+        [lookup(index) for index in branches.index[missing]],
+        index=branches.index[missing],
+        dtype=float,
+    )
+    if filled.isna().any():
+        raise ValueError(
+            f"Cannot impute rateA for branches: {filled.index[filled.isna()].tolist()}",
+        )
+
+    branches.loc[filled.index, "rateA"] = filled
+    branches.loc[filled.index, "rating_imputed"] = True
+    logger.info(
+        "Imputed rateA for %s remaining unrated branch(es) (%s) using rated-branch medians; "
+        "the 0.01 MVA sentinel is no longer emitted.",
+        len(filled),
+        branches.loc[filled.index, "branch_device_type"].value_counts().to_dict(),
+    )
+    return branches
+
+
 def add_branches_from_file(n: pypsa.Network, fn_branches: str) -> pypsa.Network:
     branches = pd.read_csv(
         fn_branches,
         dtype={"from_bus_id": str, "to_bus_id": str},
         index_col=0,
     ).query("from_bus_id in @n.buses.index and to_bus_id in @n.buses.index")
-    branches.loc[branches.rateA == 0, "rateA"] = 0.01
+    branches = impute_cross_substation_line_ratings(branches, n.buses)
+    branches = impute_remaining_branch_ratings(branches, n.buses)
 
     for tech in ["Line", "Transformer"]:
         tech_branches = branches.query("branch_device_type == @tech")
@@ -94,30 +257,28 @@ def add_branches_from_file(n: pypsa.Network, fn_branches: str) -> pypsa.Network:
             s_nom=tech_branches.rateA,
             v_nom=tech_branches.from_bus_id.map(n.buses.v_nom),
             interconnect=tech_branches.interconnect,
-            type="temp",  # temporarily then over ridden by assign_line_types
+            # No standard line type: r/x/b above come straight from TAMU and are the
+            # only source of impedance. Setting a `type` would make pypsa's
+            # apply_line_types() recompute them as `per_length * length`, discarding
+            # the TAMU values and coupling impedance to length_factor.
+            type="",
             carrier="AC",
             underwater_fraction=0.0,
+            rating_imputed=tech_branches.rating_imputed,
         )
     return n
 
 
-def add_custom_line_type(n: pypsa.Network):
-    n.line_types.loc["temp"] = pd.Series(
-        [60, 0.0683, 0.335, 15, 1.01],
-        index=["f_nom", "r_per_length", "x_per_length", "c_per_length", "i_nom"],
-    )
-
-
-def assign_line_types(n: pypsa.Network):
-    n.lines.type = n.lines.v_nom.map(snakemake.config["lines"]["types"])
-
-
-def add_dclines_from_file(n: pypsa.Network, fn_dclines: str) -> pypsa.Network:
-    dclines = pd.read_csv(
-        fn_dclines,
-        dtype={"from_bus_id": str, "to_bus_id": str},
-        index_col=0,
-    ).query("from_bus_id in @n.buses.index and to_bus_id in @n.buses.index")
+def add_dclines(
+    n: pypsa.Network,
+    dclines: pd.DataFrame | str,
+) -> pypsa.Network:
+    if isinstance(dclines, str):
+        dclines = pd.read_csv(
+            dclines,
+            dtype={"from_bus_id": str, "to_bus_id": str},
+            index_col=0,
+        ).query("from_bus_id in @n.buses.index and to_bus_id in @n.buses.index")
 
     logger.info(f"Adding {len(dclines)} dc-lines as Links to the network.")
 
@@ -129,7 +290,7 @@ def add_dclines_from_file(n: pypsa.Network, fn_dclines: str) -> pypsa.Network:
         bus1=dclines.to_bus_id,
         p_nom=dclines.Pt,
         carrier="DC",
-        underwater_fraction=0.0,  # DC line in bay is underwater, but does network have this line?
+        underwater_fraction=0.0,
     )
 
     n.madd(
@@ -140,7 +301,7 @@ def add_dclines_from_file(n: pypsa.Network, fn_dclines: str) -> pypsa.Network:
         bus1=dclines.from_bus_id,
         p_nom=dclines.Pt,
         carrier="DC",
-        underwater_fraction=0.0,  # DC line in bay is underwater, but does network have this line?
+        underwater_fraction=0.0,
     )
 
     return n
@@ -184,24 +345,33 @@ def map_bus_to_region(
     return gpd.sjoin(buses, shape_filtered, how="left").drop(columns=["index_right"])
 
 
-def assign_line_length(n: pypsa.Network):
+def assign_line_length(n: pypsa.Network, length_factor: float):
     """Assigns line length to each line in the network using Haversine distance."""
     bus_df = n.buses[["x", "y"]]
     bus0 = bus_df.loc[n.lines.bus0].values
     bus1 = bus_df.loc[n.lines.bus1].values
     distances = haversine_np(bus0[:, 0], bus0[:, 1], bus1[:, 0], bus1[:, 1])
-    n.lines["length"] = distances
+    n.lines["length"] = distances * length_factor
 
 
-def assign_link_length_and_efficiency(n: pypsa.Network, length_factor: float):
-    """Assigns link length and efficiency to each link (DC transmission line) in the network using Haversine distance."""
+def assign_link_length_and_efficiency(
+    n: pypsa.Network,
+    length_factor: float,
+):
+    """Assigns link length and efficiency to each link (DC transmission line) in the network using Haversine distance.
+
+    Length and loss share one definition of how far the conductor runs: both use the
+    routed distance ``haversine * length_factor``. They used to disagree -- length was
+    the bare great-circle while the loss term carried ``length_factor`` -- which made
+    a DC corridor's losses and its reported length describe different lines.
+    """
     bus_df = n.buses[["x", "y"]]
     bus0 = bus_df.loc[n.links.bus0].values
     bus1 = bus_df.loc[n.links.bus1].values
-    distances = haversine_np(bus0[:, 0], bus0[:, 1], bus1[:, 0], bus1[:, 1])
-    n.links["length"] = distances
-    # 2% loss for inverters, 3%/1000km loss for DC lines, https://www.nature.com/articles/s41560-025-01752-6#Sec14
-    n.links["efficiency"] = 1 - 0.02 - 0.03 * distances * length_factor / 1000
+    routed_km = haversine_np(bus0[:, 0], bus0[:, 1], bus1[:, 0], bus1[:, 1]) * length_factor
+    n.links["length"] = routed_km
+    # 1.4% loss for inverters, 5%/1000mile loss for DC lines.
+    n.links["efficiency"] = 1 - 0.014 - 0.05 * routed_km / 1609.34
 
 
 def create_grid(polygon, cell_size):
@@ -458,6 +628,12 @@ def assign_reeds_memberships(n: pypsa.Network, fn_reeds_memberships: str):
         lambda x: x.mode()[0],
     )
 
+    # 45V hydrogen PTC region. It is a pure state-level grouping, so it is derived
+    # from the county-corrected reeds_state above rather than from the raw zone
+    # mapping. Non-US zones have no h2ptcreg and stay NaN.
+    state_to_h2ptcreg = reeds_memberships.dropna(subset=["h2ptcreg"]).drop_duplicates("st").set_index("st")["h2ptcreg"]
+    n.buses["h2ptcreg"] = n.buses.reeds_state.map(state_to_h2ptcreg)
+
 
 def modify_breakthrough_substations(buslocs: pd.DataFrame):
     sub_fixes = {
@@ -495,13 +671,160 @@ def modify_breakthrough_substations(buslocs: pd.DataFrame):
     return buslocs
 
 
+def find_coincident_substation_groups(sub: pd.DataFrame) -> list:
+    """Return groups (each a list of sub_id) that share an identical (lat, lon)."""
+    dup_mask = sub.duplicated(subset=["lat", "lon"], keep=False)
+    if not dup_mask.any():
+        return []
+    return [group.index.tolist() for _, group in sub[dup_mask].groupby(["lat", "lon"])]
+
+
+def merge_colocated_substation_ties(n: pypsa.Network, coincident_sub_groups: list) -> pypsa.Network:
+    """
+    Merge bus pairs tied by a negligible-impedance, same-voltage Line between
+    substations recorded at (near-)identical coordinates.
+
+    Some BE-TAMU substations are different voltage yards of a single physical
+    site (e.g. "CLATSKANIE 2"/"CLATSKANIE 5") linked by a very short
+    same-voltage Line representing a bus-tie rather than a real transmission
+    connection. At capacity-expansion resolution this tie carries no
+    meaningful constraint, so its two endpoints are merged into one bus and
+    the tie line is dropped. Only the specific tied bus pair is merged --
+    other buses at either substation (e.g. a different-voltage yard reached
+    through a Transformer) are left untouched.
+    """
+    if n.lines.empty or not coincident_sub_groups:
+        return n
+
+    group_of_sub = {sub_id: gid for gid, group in enumerate(coincident_sub_groups) for sub_id in group}
+
+    bus0_sub = n.lines.bus0.map(n.buses.sub_id)
+    bus1_sub = n.lines.bus1.map(n.buses.sub_id)
+    bus0_group = bus0_sub.map(group_of_sub)
+    bus1_group = bus1_sub.map(group_of_sub)
+    bus0_v = n.lines.bus0.map(n.buses.v_nom)
+    bus1_v = n.lines.bus1.map(n.buses.v_nom)
+
+    tie_mask = bus0_group.notna() & (bus0_group == bus1_group) & (bus0_sub != bus1_sub) & (bus0_v == bus1_v)
+    tie_lines = n.lines.loc[tie_mask]
+    if tie_lines.empty:
+        return n
+
+    parent = {}
+
+    def find(bus):
+        parent.setdefault(bus, bus)
+        while parent[bus] != bus:
+            parent[bus] = parent[parent[bus]]
+            bus = parent[bus]
+        return bus
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            lo, hi = sorted((ra, rb))
+            parent[hi] = lo
+
+    for bus0, bus1 in tie_lines[["bus0", "bus1"]].itertuples(index=False):
+        union(bus0, bus1)
+
+    busmap = {bus: find(bus) for bus in parent}
+    dropped = [bus for bus, rep in busmap.items() if rep != bus]
+    if not dropped:
+        return n
+
+    logger.info(
+        "Merging %s co-located same-voltage substation-tie bus(es) via %s tie lines.",
+        len(dropped),
+        len(tie_lines),
+    )
+
+    for old, new in busmap.items():
+        if old != new:
+            n.buses.at[new, "Pd"] += n.buses.at[old, "Pd"]
+
+    for component in ["Line", "Transformer", "Link"]:
+        df = n.df(component)
+        for col in ("bus0", "bus1"):
+            if col in df.columns:
+                df[col] = df[col].replace(busmap)
+
+    self_loops = n.lines.index[n.lines.bus0 == n.lines.bus1]
+    n.mremove("Line", self_loops.tolist())
+    n.mremove("Bus", dropped)
+    return n
+
+
+def merge_colocated_substation_sites(n: pypsa.Network, coincident_sub_groups: list) -> pypsa.Network:
+    """
+    Give one ``sub_id`` to substation records that describe a single physical site.
+
+    ``merge_colocated_substation_ties`` merges *buses*, which is only valid for a
+    same-voltage bus tie. The commoner case is a site recorded as two substations
+    because it has two voltage yards joined by a Transformer: those buses must stay
+    separate (the transformer has real impedance and a real rating), but they are
+    still one site.
+
+    ``sub_id`` is a site label, not an electrical node -- it only decides how
+    ``simplify_network.aggregate_to_substations`` groups buses. Leaving the two
+    yards on different ``sub_id`` values keeps them as two nodes at substation
+    resolution and leaves the zero-length busbar link between them in the network,
+    where it survives as an unrated (0.01 MVA) near-zero-impedance branch.
+
+    Only groups corroborated by a direct branch between their members are merged;
+    coincident coordinates alone are treated as insufficient evidence.
+    """
+    if not coincident_sub_groups:
+        return n
+
+    group_of_sub = {sub_id: gid for gid, group in enumerate(coincident_sub_groups) for sub_id in group}
+    linked_groups = set()
+    for component in ["Line", "Transformer", "Link"]:
+        df = n.df(component)
+        if df.empty or "bus0" not in df.columns:
+            continue
+        sub0 = df.bus0.map(n.buses.sub_id)
+        sub1 = df.bus1.map(n.buses.sub_id)
+        g0 = sub0.map(group_of_sub)
+        g1 = sub1.map(group_of_sub)
+        linked = g0.notna() & (g0 == g1) & (sub0 != sub1)
+        linked_groups.update(g0[linked].astype(int).tolist())
+
+    submap = {}
+    merged_sites = 0
+    for gid in sorted(linked_groups):
+        group = coincident_sub_groups[gid]
+        canonical = min(group)
+        # never fold an offshore substation into an onshore one, or vice versa
+        if (max(group) >= 41012) != (canonical >= 41012):
+            continue
+        merged_sites += 1
+        for sub_id in group:
+            if sub_id != canonical:
+                submap[sub_id] = canonical
+
+    if not submap:
+        return n
+
+    affected = n.buses.sub_id.isin(submap)
+    n.buses.loc[affected, "sub_id"] = n.buses.loc[affected, "sub_id"].map(submap)
+    logger.info(
+        "Unified sub_id for %s co-located substation record(s) across %s site(s); "
+        "%s bus(es) reassigned.",
+        len(submap),
+        merged_sites,
+        int(affected.sum()),
+    )
+    return n
+
+
 def main(snakemake):
     # create network
     n = pypsa.Network()
     n.name = "PyPSA-USA"
 
     model_topology = snakemake.params.model_topology
-    interconnect = snakemake.wildcards.interconnect
+    interconnect = snakemake.params.interconnect
     # interconnect in raw data given with an uppercase first letter
     if interconnect != "usa":
         interconnect = interconnect[0].upper() + interconnect[1:]
@@ -509,6 +832,14 @@ def main(snakemake):
     # assign locations and balancing authorities to buses
     bus2sub = pd.read_csv(snakemake.input.bus2sub).set_index("bus_id")
     sub = pd.read_csv(snakemake.input.sub).set_index("sub_id")
+    # Substation records sharing a coordinate are resolved by merging them (bus-level
+    # for a same-voltage tie, site-level otherwise), not by perturbing the geography.
+    # A zero-length line is not a hazard on its own: pypsa's aggregatelines guards the
+    # division (`length_factor = (df.length / orig_length).where(orig_length > 0, ...)`),
+    # whereas nudging the endpoints ~1 m apart makes orig_length tiny-but-positive and
+    # sends length_factor to ~1e4, which silently deletes the branch from the
+    # aggregated network.
+    coincident_sub_groups = find_coincident_substation_groups(sub)
     buslocs = pd.merge(bus2sub, sub, left_on="sub_id", right_index=True)
     buslocs = modify_breakthrough_substations(buslocs)
 
@@ -561,7 +892,7 @@ def main(snakemake):
     # add buses, transformers, lines and links
     n = add_buses_from_file(n, gdf_bus, interconnect=interconnect)
     n = add_branches_from_file(n, snakemake.input["lines"])
-    n = add_dclines_from_file(n, snakemake.input["links"])
+    n = add_dclines(n, snakemake.input["links"])
 
     # identify offshore points of interconnection, and remove unncess components from BE network
     n = identify_osw_poi(n)
@@ -577,15 +908,15 @@ def main(snakemake):
     )
     n = add_offshore_buses(n, offshore_buses)
 
-    # Assign Lines Types and Missing Region Memberships
-    add_custom_line_type(n)
-    assign_line_types(n)
+    n = merge_colocated_substation_ties(n, coincident_sub_groups)
+    n = merge_colocated_substation_sites(n, coincident_sub_groups)
+
+    # Assign Line Lengths and Missing Region Memberships
     length_factor = snakemake.params.length_factor
-    assign_line_length(n)
+    assign_line_length(n, length_factor)
     assign_link_length_and_efficiency(n, length_factor)
     assign_missing_regions(n)
     assign_reeds_memberships(n, snakemake.input.reeds_memberships)
-    n.buses["rec_trading_zone"] = n.buses.reeds_state.map(REC_TRADING_ZONE_MAPPER).fillna(n.buses.reeds_state)
 
     # Filter Network to Only Specified Regions
     if model_topology is not None:
@@ -673,10 +1004,9 @@ def main(snakemake):
 
 
 if __name__ == "__main__":
-    logger = logging.getLogger(__name__)
     if "snakemake" not in globals():
         from _helpers import mock_snakemake
 
-        snakemake = mock_snakemake("build_base_network", interconnect="texas")
+        snakemake = mock_snakemake("build_base_network")
     configure_logging(snakemake)
     main(snakemake)

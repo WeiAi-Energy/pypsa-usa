@@ -1,3 +1,23 @@
-# SLURM specifications made in default.cluster.yaml & the individual rules
-# GRB_LICENSE_FILE=/share/software/user/restricted/gurobi/11.0.2/licenses/gurobi.lic⁠
-snakemake --cluster "sbatch -A {cluster.account} --mail-type ALL --mail-user {cluster.email}  -p {cluster.partition} -o {cluster.output} -e {cluster.error} -c {threads} --mem {resources.mem_mb} --time {resources.walltime}" --cluster-config config/config.cluster.yaml --jobs 20 --latency-wait 60 --rerun-incomplete --configfile config/CH1/config.tamu.single_horizon.bau.yaml
+#!/bin/bash
+#SBATCH --account=mtcraig98
+#SBATCH --partition=standard
+#SBATCH --time=24:00:00
+#SBATCH --mem=5G
+
+set -euo pipefail
+
+cd /nfs/turbo/seas-mtcraig/Wei/pypsa-usa-pst/workflow
+source /sw/pkgs/arc/mamba/py3.11/etc/profile.d/conda.sh
+conda activate pypsa-usa
+snakemake --unlock
+module load gurobi
+
+snakemake \
+    --cluster "sbatch -A {cluster.account} -p {cluster.partition} -t {cluster.walltime} -o {cluster.output} -e {cluster.error} -c {threads} --mem {resources.mem_mb} --licenses=gurobi@slurmdb:1" \
+    --cluster-config config/config.cluster.yaml \
+    --jobs 999 \
+    --latency-wait 60 \
+    --configfile config/config.default.yaml \
+    --rerun-incomplete \
+    --printshellcmds \
+    all

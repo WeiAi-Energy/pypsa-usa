@@ -6,28 +6,100 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import pypsa
-from _helpers import calculate_annuity, configure_logging
+from _helpers import calculate_annuity, configure_logging, set_case_config, update_config_from_wildcards
 from add_electricity import add_missing_carriers
-from eia import FuelCosts
 from opts._helpers import get_region_buses
+from regional_cost import (
+    SectorCosts,
+    bus_multiplier_table,
+    carrier_multiplier,
+    county_multiplier_table,
+    load_reg_cap_cost_diff,
+    overnight_delta_capital_cost,
+)
 from pypsa.descriptors import get_switchable_as_dense as get_as_dense
-from shapely.geometry import Point
 
 idx = pd.IndexSlice
 
 logger = logging.getLogger(__name__)
 
+FLEXIBLE_ELECTROLYSIS_BUS_SUFFIX = " flexible electrolysis H2"
+FLEXIBLE_ELECTROLYSIS_LINK_SUFFIX = " flexible electrolysis"
+
+NEW_GAS_COST_CARRIERS = {"OCGT", "CCGT"}
+
+# Carriers with one generator per bus already attached by attach_wind_and_solar
+# in add_electricity.py (real atlite resource p_nom_max + capacity-factor
+# profile, using the same unified cost table). Their new-build capacity is
+# already fully represented before this script ever runs, so they must be
+# excluded from the generic attach_new_generators path -- adding a second,
+# uncapped generator there would ignore the real resource limit entirely.
+RESOURCE_PROFILE_CARRIERS = {"onwind", "offwind", "offwind_floating", "solar"}
+
+
+def carrier_new_build_buses(
+    n: pypsa.Network,
+    carrier: str,
+    all_buses_i: pd.Index,
+    gas_union_buses_i: pd.Index,
+) -> pd.Index:
+    """
+    Determine which buses are eligible for new-build capacity of `carrier`.
+
+    Only called for carriers not in RESOURCE_PROFILE_CARRIERS -- wind/solar
+    already have their own resource-capped, per-bus new-build option from
+    add_electricity.py and never reach this function.
+
+    - nuclear is buildable at every AC bus, not restricted to existing
+      nuclear sites.
+    - OCGT/CCGT/CCGT-CCS share one pool: the union of buses with existing
+      OCGT or CCGT capacity, since gas new-build is about existing gas
+      infrastructure rather than a siting resource.
+    - Every other carrier (coal, hydrogen_ct, ...) is
+      restricted to buses that already have that carrier -- or, for a
+      "-CCS" variant, its base carrier -- installed, since that's where the
+      underlying site/interconnection exists.
+    - If no such bus exists, fall back to all AC buses rather than making
+      it unbuildable.
+      This inverts the siting restriction into no restriction at all, so it
+      is logged -- it adds one extendable generator per AC bus.
+    """
+    if carrier == "nuclear":
+        return all_buses_i
+    base_carrier = carrier.split("-")[0]
+    if base_carrier in NEW_GAS_COST_CARRIERS:
+        return gas_union_buses_i
+    buses_i = pd.Index(n.generators.loc[n.generators.carrier == base_carrier, "bus"].unique())
+    if buses_i.empty:
+        logger.warning(
+            "No existing %s capacity to site new %s against -- falling back to all "
+            "%s AC buses. Add %s to electricity.conventional_carriers to restrict "
+            "new-build to existing sites, or remove it from the new-build carriers.",
+            base_carrier,
+            carrier,
+            len(all_buses_i),
+            base_carrier,
+        )
+        return all_buses_i
+    return buses_i
+
 
 def add_co2_emissions(n, costs, carriers):
     """Add CO2 emissions to the network's carriers attribute."""
-    suptechs = n.carriers.loc[carriers].index.str.split("-").str[0]
-    missing_carriers = set(suptechs) - set(costs.index)
-    if missing_carriers:
+    suptechs = pd.Index(n.carriers.loc[carriers].index.str.split("-").str[0]).unique()
+    missing_cost_carriers = set(suptechs) - set(costs.index)
+    if missing_cost_carriers:
         logger.warning(
-            f"CO2 emissions for carriers {missing_carriers} not defined in cost data.",
+            f"CO2 emissions for carriers {missing_cost_carriers} not defined in cost data.",
         )
-        suptechs = suptechs.difference(missing_carriers)
-    n.carriers.loc[suptechs, "co2_emissions"] = costs.co2_emissions[suptechs].values
+    missing_network_carriers = set(suptechs) - set(n.carriers.index)
+    if missing_network_carriers:
+        logger.warning(
+            f"CO2 emissions target carriers {missing_network_carriers} not present in network carriers.",
+        )
+
+    valid_suptechs = suptechs.intersection(costs.index).intersection(n.carriers.index)
+    n.carriers.loc[valid_suptechs, "co2_emissions"] = costs.co2_emissions[valid_suptechs].values
 
     n.carriers = n.carriers.fillna(
         {"co2_emissions": 0},
@@ -37,9 +109,32 @@ def add_co2_emissions(n, costs, carriers):
         ccs_carriers = [carrier for carrier in carriers if "CCS" in carrier]
         for ccs_carrier in ccs_carriers:
             base_carrier = ccs_carrier.split("-")[0]
-            base_emissions = n.carriers.loc[base_carrier, "co2_emissions"]
+            if base_carrier in n.carriers.index:
+                base_emissions = n.carriers.loc[base_carrier, "co2_emissions"]
+            elif base_carrier in costs.index:
+                base_emissions = costs.at[base_carrier, "co2_emissions"]
+                logger.warning(
+                    "Base carrier %s for %s not present in network carriers; using costs table co2_emissions.",
+                    base_carrier,
+                    ccs_carrier,
+                )
+            else:
+                logger.warning(
+                    "Skipping CO2 emission derivation for %s because base carrier %s is missing from both network carriers and costs table.",
+                    ccs_carrier,
+                    base_carrier,
+                )
+                continue
             ccs_level = int(ccs_carrier.split("-")[1].replace("CCS", ""))
-            ccs_emissions = (1 - ccs_level / 100) * base_emissions
+            # Only direct (combustion) emissions are capturable; the indirect
+            # (upstream) share passes through at any capture rate.
+            indirect_emissions = 0.0
+            if "co2_emissions_indirect" in costs.columns and base_carrier in costs.index:
+                carrier_indirect = costs.at[base_carrier, "co2_emissions_indirect"]
+                if pd.notna(carrier_indirect):
+                    indirect_emissions = carrier_indirect
+            direct_emissions = max(base_emissions - indirect_emissions, 0.0)
+            ccs_emissions = (1 - ccs_level / 100) * direct_emissions + indirect_emissions
             n.carriers.loc[ccs_carrier, "co2_emissions"] = ccs_emissions
 
 
@@ -56,17 +151,69 @@ def add_nice_carrier_names(n, config):
     n.carriers["color"] = colors
 
 
-def attach_storageunits(n, costs, elec_opts, investment_year):
+def _build_bus_multipliers(n: pypsa.Network, snakemake):
+    """Resolve the ReEDS county overnight-capex multipliers onto this network's buses.
+
+    Returns ``None`` when the feature is disabled, which makes every downstream cost
+    expression reduce to its unmodified form.
+    """
+    cfg = getattr(snakemake.params, "cost_multipliers", None) or {}
+    if not cfg.get("enable", False):
+        return None
+
+    reg_cap_cost_diff = snakemake.input.get("reg_cap_cost_diff", None)
+    if not reg_cap_cost_diff:
+        logger.warning(
+            "cost_multipliers.enable is true but no reg_cap_cost_diff input was provided; "
+            "skipping regional overnight-capex multipliers.",
+        )
+        return None
+
+    county_table = county_multiplier_table(
+        load_reg_cap_cost_diff(reg_cap_cost_diff),
+        cfg.get("column_to_tech", None),
+    )
+    ac_buses = n.buses[n.buses.carrier == "AC"]
+    return bus_multiplier_table(ac_buses, county_table, snakemake.input.county_shapes)
+
+
+def _regional_capital_cost(costs, carrier, buses_i, bus_multipliers):
+    """Per-bus capital cost for an ATB carrier, scaling overnight capex only.
+
+    Returns the uniform ``annualized_capex_fom`` scalar unchanged whenever the
+    feature is off, the carrier carries no ReEDS multiplier column, or the cost
+    table has no usable overnight breakdown to scale.
+    """
+    base = costs.at[carrier, "annualized_capex_fom"]
+    multiplier = carrier_multiplier(bus_multipliers, carrier, buses_i)
+    if np.isscalar(multiplier):
+        return base
+    overnight = costs.at[carrier, "capex_overnight_per_kw"] if "capex_overnight_per_kw" in costs.columns else np.nan
+    if not np.isfinite(overnight):
+        logger.warning(
+            "No finite capex_overnight_per_kw for %r; skipping its regional multiplier.",
+            carrier,
+        )
+        return base
+    annuity_factor = calculate_annuity(
+        costs.at[carrier, "cost_recovery_period_years"],
+        costs.at[carrier, "wacc_real"],
+    )
+    return overnight_delta_capital_cost(base, overnight, annuity_factor, multiplier)
+
+
+def attach_storageunits(n, costs, elec_opts, investment_year, bus_multipliers=None):
     carriers = elec_opts["extendable_carriers"]["StorageUnit"]
     carriers = [k for k in carriers if "battery_storage" in k]
 
-    buses_i = n.buses.index
+    buses_i = n.buses.index[n.buses.carrier == "AC"]
 
     add_missing_carriers(n, carriers)
     add_co2_emissions(n, costs, carriers)
     for carrier in carriers:
         max_hours = int(carrier.split("hr_")[0])
         roundtrip_correction = 0.5 if "battery" in carrier else 1
+        capital_cost = _regional_capital_cost(costs, carrier, buses_i, bus_multipliers)
 
         n.madd(
             "StorageUnit",
@@ -75,15 +222,228 @@ def attach_storageunits(n, costs, elec_opts, investment_year):
             bus=buses_i,
             carrier=carrier,
             p_nom_extendable=True,
-            capital_cost=costs.at[carrier, "annualized_capex_fom"],
+            capital_cost=capital_cost,
             marginal_cost=0,  # costs.at[carrier, "marginal_cost"], # TODO: FIX THIS ISSUE IN BUILD_COST_DATA
             efficiency_store=costs.at[carrier, "efficiency"] ** roundtrip_correction,
             efficiency_dispatch=costs.at[carrier, "efficiency"] ** roundtrip_correction,
-            max_hours=max_hours,
-            cyclic_state_of_charge=False,
+            max_hours=max_hours / (costs.at[carrier, "efficiency"] ** roundtrip_correction),
+            cyclic_state_of_charge=True,
             build_year=investment_year,
             lifetime=costs.at[carrier, "cost_recovery_period_years"],
         )
+
+
+def attach_tes_storageunits(n: pypsa.Network, sector_costs_path: str, bus_multipliers=None):
+    """Attach reference TES buses, stores, chargers, and dischargers."""
+    buses_i = n.buses.index[n.buses.carrier == "AC"]
+    if buses_i.empty:
+        return
+
+    costs = SectorCosts(sector_costs_path)
+    crp = costs.value("TES", "crp")
+    # The regional multiplier scales the annuity term only, leaving the FOM share
+    # untouched. All three cost items share it, and every madd below is keyed on
+    # buses_i, so a per-bus array aligns positionally.
+    multiplier = carrier_multiplier(bus_multipliers, "tes", buses_i)
+    annuity = calculate_annuity(crp, costs.wacc_real("TES")) * multiplier + costs.value("TES", "FOM") / 100
+    energy_cost = annuity * costs.value("TES", "energy_cost")
+    charge_cost = annuity * costs.value("TES", "charge_cost")
+    discharge_cost = annuity * costs.value("TES", "discharge_cost")
+    lifetime = costs.lifetime("TES")
+    build_year = int(n.investment_periods[0])
+
+    add_missing_carriers(n, ["tes"])
+    n.carriers.loc["tes", "co2_emissions"] = 0.0
+    buses = n.buses.loc[buses_i]
+    n.madd(
+        "Bus",
+        names=buses_i,
+        suffix=" tes",
+        x=buses.x.to_numpy(),
+        y=buses.y.to_numpy(),
+        carrier="tes",
+        unit="MWh_th",
+    )
+    n.madd(
+        "Store",
+        names=buses_i + " tes",
+        bus=buses_i + " tes",
+        carrier="tes",
+        e_nom_extendable=True,
+        e_cyclic=True,
+        standing_loss=costs.value("TES", "loss"),
+        capital_cost=energy_cost,
+        build_year=build_year,
+        lifetime=lifetime,
+    )
+    n.madd(
+        "Link",
+        names=buses_i + " tes charger",
+        bus0=buses_i,
+        bus1=buses_i + " tes",
+        carrier="tes",
+        p_nom_extendable=True,
+        capital_cost=charge_cost,
+        efficiency=costs.value("TES", "charge_efficiency"),
+        build_year=build_year,
+        lifetime=lifetime,
+    )
+    n.madd(
+        "Link",
+        names=buses_i + " tes discharger",
+        bus0=buses_i + " tes",
+        bus1=buses_i,
+        carrier="tes",
+        p_nom_extendable=True,
+        capital_cost=discharge_cost,
+        efficiency=costs.value("TES", "discharge_efficiency"),
+        marginal_cost=costs.value("TES", "VOM"),
+        build_year=build_year,
+        lifetime=lifetime,
+    )
+
+
+def attach_flexible_electrolysis(
+    n: pypsa.Network,
+    config: dict,
+    sector_costs_path: str,
+    bus_multipliers=None,
+):
+    """Attach electrolysis links at every AC bus feeding a pure accounting H2 bus.
+
+    There is one accounting H2 bus per 45V hydrogen PTC region (``h2ptcreg``, a bus
+    attribute assigned in ``build_base_network``), and each AC bus feeds the bus of
+    the region it sits in. The links have ``efficiency = 0``, so nothing is
+    injected into the H2 buses and their nodal
+    balance holds trivially without any sink component. The annual hydrogen
+    production is instead imposed in ``solve_network`` as a per-``h2ptcreg``
+    constraint on the link electricity withdrawal (``p0``) times the conversion
+    efficiency implied by ``h2 electrolysis`` / ``electricity-input`` in
+    ``simple_sector_costs.csv``. The value is validated here so a broken cost file
+    fails at build time.
+    """
+    if not config.get("enable", False):
+        return
+
+    if n.buses.index.str.endswith(FLEXIBLE_ELECTROLYSIS_BUS_SUFFIX).any():
+        logger.info("Flexible electrolysis accounting buses already attached. Skipping duplicate attachment.")
+        return
+
+    costs = SectorCosts(sector_costs_path)
+    electricity_input = costs.value("h2 electrolysis", "electricity-input")
+    if electricity_input <= 0.0:
+        raise ValueError(
+            "'h2 electrolysis' 'electricity-input' in simple_sector_costs.csv must be positive; "
+            f"got {electricity_input}.",
+        )
+
+    ac_buses = n.buses.index[n.buses.carrier == "AC"]
+    if ac_buses.empty:
+        logger.warning(
+            "Flexible electrolysis is enabled but no AC bus exists; skipping electrolysis attachment.",
+        )
+        return
+
+    if "h2ptcreg" not in n.buses.columns:
+        raise ValueError(
+            "Flexible electrolysis is enabled but the network has no 'h2ptcreg' bus attribute. "
+            "It is assigned in build_base_network from repo_data/ReEDS_Constraints/membership.csv.",
+        )
+
+    # Non-US buses (Canadian/Mexican ReEDS zones) have no h2ptcreg and get no
+    # electrolysis link. A netCDF round trip turns their missing value into "".
+    bus_regions = n.buses.loc[ac_buses, "h2ptcreg"].replace("", np.nan).dropna()
+    if bus_regions.empty:
+        logger.warning(
+            "Flexible electrolysis is enabled but no AC bus has an h2ptcreg region; "
+            "skipping electrolysis attachment.",
+        )
+        return
+    if len(bus_regions) < len(ac_buses):
+        logger.info(
+            "No h2ptcreg for %d AC bus(es) (non-US or unmapped location); they get no electrolysis link.",
+            len(ac_buses) - len(bus_regions),
+        )
+
+    add_missing_carriers(n, ["H2", "electrolysis"])
+    if "co2_emissions" not in n.carriers.columns:
+        n.carriers["co2_emissions"] = 0.0
+    n.carriers.loc[["H2", "electrolysis"], "co2_emissions"] = 0.0
+
+    regions = pd.Index(sorted(bus_regions.unique()))
+    region_buses = pd.Index(regions + FLEXIBLE_ELECTROLYSIS_BUS_SUFFIX)
+
+    # Place each regional accounting bus at the centroid of the AC buses feeding it.
+    bus_kwargs = {}
+    for coord in ("x", "y"):
+        if coord in n.buses.columns:
+            centroid = n.buses.loc[bus_regions.index, coord].groupby(bus_regions).mean()
+            bus_kwargs[coord] = centroid.reindex(regions).astype(float).values
+
+    n.madd(
+        "Bus",
+        region_buses,
+        carrier="H2",
+        **bus_kwargs,
+    )
+
+    if "country" in n.buses.columns:
+        countries = n.buses.loc[bus_regions.index, "country"].groupby(bus_regions).first()
+        n.buses.loc[region_buses, "country"] = countries.reindex(regions).values
+
+    n.madd(
+        "Link",
+        bus_regions.index,
+        suffix=FLEXIBLE_ELECTROLYSIS_LINK_SUFFIX,
+        bus0=bus_regions.index,
+        bus1=(bus_regions + FLEXIBLE_ELECTROLYSIS_BUS_SUFFIX).values,
+        carrier="electrolysis",
+        p_nom=0,
+        p_nom_extendable=True,
+        p_nom_max=1e5,
+        # Zero efficiency: no hydrogen flows into the accounting bus, so its energy
+        # balance is satisfied automatically. Hydrogen output is accounted for in
+        # solve_network from p0 and the configured electricity input per hydrogen.
+        efficiency=0.0,
+        capital_cost=costs.annualized(
+            "h2 electrolysis",
+            overnight_multiplier=carrier_multiplier(bus_multipliers, "electrolysis", bus_regions.index),
+        ),
+        lifetime=costs.lifetime("h2 electrolysis"),
+        build_year=int(n.investment_periods[0]),
+    )
+    logger.info(
+        "Attached %d flexible electrolysis links across %d h2ptcreg region(s): %s.",
+        len(bus_regions),
+        len(regions),
+        ", ".join(regions),
+    )
+
+
+def apply_gas_fuel_price(n: pypsa.Network, gas_price: float) -> None:
+    """Apply a single configured natural gas price ($/MWh_th) to all gas-fueled generators (OCGT, CCGT, and their -CCS variants)."""
+    gas_carriers = [carrier for carrier in n.generators.carrier.unique() if carrier.split("-")[0] in ("OCGT", "CCGT")]
+    gens = n.generators[n.generators.carrier.isin(gas_carriers)]
+    if gens.empty:
+        return
+
+    efficiency = n.generators.loc[gens.index, "efficiency"].replace(0, np.nan)
+    if efficiency.isna().any():
+        raise ValueError("Gas generator efficiency must be positive.")
+    vom = n.generators.loc[gens.index].get(
+        "vom_cost",
+        pd.Series(0.0, index=gens.index),
+    ).fillna(0.0)
+    n.generators.loc[gens.index, "marginal_cost"] = vom + gas_price / efficiency
+
+
+def remove_gas_generators(n: pypsa.Network) -> None:
+    """Drop all gas-fueled generators (OCGT, CCGT, and their -CCS variants) for the 100VRE decarbonization scenario."""
+    gas_carriers = [carrier for carrier in n.generators.carrier.unique() if carrier.split("-")[0] in ("OCGT", "CCGT")]
+    gens = n.generators[n.generators.carrier.isin(gas_carriers)]
+    if not gens.empty:
+        logger.info("100VRE decarbonization: removing %s gas generators (%s).", len(gens), sorted(gas_carriers))
+        n.mremove("Generator", gens.index)
 
 
 def attach_phs_storageunits(n: pypsa.Network, elec_opts, costs: pd.DataFrame):
@@ -189,7 +549,7 @@ def attach_stores(n, costs, elec_opts, investment_year):
     add_missing_carriers(n, carriers)
     add_co2_emissions(n, costs, carriers)
 
-    buses_i = n.buses.index
+    buses_i = n.buses.index[n.buses.carrier == "AC"]
     bus_sub_dict = {k: n.buses[k].values for k in ["x", "y", "country"]}
 
     if "H2" in carriers:
@@ -240,32 +600,40 @@ def attach_stores(n, costs, elec_opts, investment_year):
         )
 
 
-def split_retirement_gens(
+def freeze_existing_generators(
     n: pypsa.Network,
     costs: pd.DataFrame,
     carriers: list[str] | None = None,
     economic: bool = True,
 ):
     """
-    Seperates extendable conventional generators into existing and new
-    generators to support economic or technical retirement.
+    Converts today's fleet of extendable generators into fixed-capacity
+    "existing" generators to support economic or technical retirement. Does
+    NOT create a new-build capacity option: new-build generators for these
+    carriers are attached separately by attach_new_generators, using
+    unified cost data rather than a copy of the existing generator.
 
+    Wind/solar are never passed through this function -- their existing
+    capacity and buildable resource potential are already represented as a
+    single extendable generator per bus by attach_wind_and_solar /
+    attach_existing_renewable_capacities in add_electricity.py, with nothing
+    left here to freeze into a separate row.
 
     Specifically this function does the following:
-    1. Creates duplicate generators for any that are tagged as extendable. For
-    example, an extendable "CCGT" generator will be split into "CCGT existing" and "CCGT"
-    2. Capital costs of existing extendable generators are replaced with fixed costs
-    3. p_nom_max of existing extendable generators are set to p_nom
-    4. p_nom_min of existing and new generators is set to zero
+    1. Renames matching generators with an " existing" suffix. For example,
+    an extendable "CCGT" generator becomes "CCGT existing".
+    2. Capital costs of existing generators are replaced with fixed costs
+    3. p_nom_max of existing generators is set to p_nom
+    4. p_nom_min of existing generators is set to zero
 
     Arguments:
     n: pypsa.Network,
     costs: pd.DataFrame,
     carriers: List[str]
-        List of generator carriers to apply economic retirment to.
+        List of generator carriers to apply retirement to.
     economic: bool
         If True, enable economic retirement, else only allow lifetime
-        retirement for the new generators
+        retirement.
     """
     retirement_mask = (
         n.generators["p_nom_extendable"]
@@ -310,31 +678,7 @@ def split_retirement_gens(
         "p_nom_extendable",
     ] = economic  # if economic retirement is true enable extendable
 
-    # Adding Expanding generators for the first investment period
-    # There are generators that exist today and could expand
-    # in the first time horizon
-    n.madd(
-        "Generator",
-        retirement_gens.index,
-        carrier=retirement_gens.carrier,
-        bus=retirement_gens.bus,
-        p_nom_min=0,
-        p_nom=0,
-        p_nom_max=retirement_gens.p_nom_max,
-        p_nom_extendable=True,
-        ramp_limit_up=retirement_gens.ramp_limit_up,
-        ramp_limit_down=retirement_gens.ramp_limit_down,
-        efficiency=retirement_gens.efficiency,
-        marginal_cost=retirement_gens.marginal_cost,
-        capital_cost=retirement_gens.capital_cost,
-        build_year=n.investment_periods[0],
-        lifetime=retirement_gens.carrier.map(costs.lifetime).fillna(np.inf),
-        p_min_pu=retirement_gens.p_min_pu,
-        p_max_pu=retirement_gens.p_max_pu,
-        land_region=retirement_gens.land_region,
-    )
-
-    # time dependent factors added after as not all generators are time dependent
+    # time dependent factors renamed to match the " existing" suffix above
     marginal_cost_t = n.generators_t["marginal_cost"][
         [x for x in retirement_gens.index if x in n.generators_t.marginal_cost.columns]
     ]
@@ -354,174 +698,29 @@ def split_retirement_gens(
     n.generators_t["p_max_pu"] = n.generators_t["p_max_pu"].join(p_max_pu_t)
 
 
-def attach_multihorizon_existing_generators(
-    n: pypsa.Network,
-    costs: dict,
-    gens: pd.DataFrame,
-    investment_year: int,
-):
+def attach_new_generators(n, costs, carriers, investment_year, carrier_buses=None, bus_multipliers=None):
     """
-    Adds multiple investment options for generators types that were already
-    existing in the network. Function used for all carriers, renewable and
-    conventional. Generators are added only to the nodes where they already exist
-    because their cost information is spatially resolved.
+    Attaches new-build generators using unified, per-investment-year cost
+    data (capital_cost, marginal_cost, efficiency, lifetime all come straight
+    from `costs`) -- never copied or inherited from an existing generator.
 
-    Specifically this function does the following:
-    1. Adds new generators for the given investment year, according that year's costs.
-        if this is the first investment period we use the existing generator's p_nom and p_nom_min
-    2. Adds time dependent factors for the new generators
-
-
-    Arguments:
-    n: pypsa.Network,
-    costs_dict: dict,
-        Dict of costs for each investment period
-    carriers: List[str]
-        List of carriers to add multiple investment options for
-    """
-    if gens.empty or len(n.investment_periods) == 1:
-        return
-
-    n.madd(
-        "Generator",
-        gens.index,
-        suffix=f" {investment_year}",
-        carrier=gens.carrier,
-        bus=gens.bus,
-        p_nom_min=0 if investment_year != n.investment_periods[0] else gens.p_nom_min,
-        p_nom=0 if investment_year != n.investment_periods[0] else gens.p_nom,
-        p_nom_max=gens.p_nom_max,
-        p_nom_extendable=True,
-        ramp_limit_up=gens.ramp_limit_up,
-        ramp_limit_down=gens.ramp_limit_down,
-        efficiency=gens.efficiency,
-        marginal_cost=gens.marginal_cost,
-        p_min_pu=gens.p_min_pu,
-        p_max_pu=gens.p_max_pu,
-        capital_cost=gens.carrier.map(costs.annualized_capex_fom),
-        build_year=investment_year,
-        lifetime=gens.carrier.map(costs.cost_recovery_period_years),
-        land_region=gens.land_region,
-    )
-
-    # time dependent factors added after as not all generators are time dependent
-    marginal_cost_t = n.generators_t["marginal_cost"][
-        [x for x in gens.index if x in n.generators_t.marginal_cost.columns]
-    ]
-    marginal_cost_t = marginal_cost_t.rename(
-        columns={x: f"{x} {investment_year}" for x in marginal_cost_t.columns},
-    )
-    n.generators_t["marginal_cost"] = n.generators_t["marginal_cost"].join(
-        marginal_cost_t,
-    )
-
-    p_max_pu_t = n.generators_t["p_max_pu"][[x for x in gens.index if x in n.generators_t["p_max_pu"].columns]]
-    p_max_pu_t = p_max_pu_t.rename(
-        columns={x: f"{x} {investment_year}" for x in p_max_pu_t.columns},
-    )
-    n.generators_t["p_max_pu"] = n.generators_t["p_max_pu"].join(p_max_pu_t)
-
-
-def attach_multihorizon_egs(
-    n: pypsa.Network,
-    costs: pd.DataFrame,
-    costs_dict: dict,
-    gens: pd.DataFrame,
-    investment_year: int,
-):
-    """
-    Adds multiple investment options for EGS.
-    Arguments:
-    n: pypsa.Network,
-    costs: pd.DataFrame,
-        dataframe with costs of investment year
-    costs_dict: dict,
-        Dict of costs for each investment period
-    carriers: List[str]
-        List of carriers to add multiple investment options for.
-    """
-    if gens.empty or len(n.investment_periods) == 1:
-        return
-
-    lifetime = 25  # Following EGS supply curves by Aljubran et al. (2024)
-    base_year = n.investment_periods[0]
-    learning_ratio = costs.loc["EGS", "capex_per_kw"] / costs_dict[base_year].loc["EGS", "capex_per_kw"]
-    capital_cost = learning_ratio * gens["capital_cost"]
-    n.madd(
-        "Generator",
-        gens.index,
-        suffix=f" {investment_year}",
-        carrier=gens.carrier,
-        bus=gens.bus,
-        p_nom_min=0,
-        p_nom=0,
-        p_nom_max=gens.p_nom_max,
-        p_nom_extendable=True,
-        ramp_limit_up=gens.ramp_limit_up,
-        ramp_limit_down=gens.ramp_limit_down,
-        efficiency=gens.efficiency,
-        marginal_cost=gens.marginal_cost,
-        p_min_pu=gens.p_min_pu,
-        p_max_pu=gens.p_max_pu,
-        capital_cost=capital_cost,
-        build_year=investment_year,
-        lifetime=lifetime,
-    )
-
-    # time dependent factors added after
-    marginal_cost_t = n.generators_t["marginal_cost"][
-        [x for x in gens.index if x in n.generators_t.marginal_cost.columns]
-    ]
-    marginal_cost_t = marginal_cost_t.rename(
-        columns={x: f"{x} {investment_year}" for x in marginal_cost_t.columns},
-    )
-    n.generators_t["marginal_cost"] = n.generators_t["marginal_cost"].join(
-        marginal_cost_t,
-    )
-
-    p_max_pu_t = n.generators_t["p_max_pu"][[x for x in gens.index if x in n.generators_t["p_max_pu"].columns]]
-
-    p_max_pu_t = p_max_pu_t.rename(
-        columns={x: f"{x} {investment_year}" for x in p_max_pu_t.columns},
-    )
-
-    n.generators_t["p_max_pu"] = n.generators_t["p_max_pu"].join(p_max_pu_t)
-
-    # shift over time to capture decline
-    investment_year_idx = np.where(n.investment_periods == investment_year)[0][0]
-    cars = list(
-        n.generators_t["p_max_pu"].filter(like="EGS").filter(like=str(investment_year)).columns,
-    )
-    n.generators_t["p_max_pu"].loc[n.investment_periods[investment_year_idx:], cars] = (
-        n.generators_t["p_max_pu"]
-        .loc[
-            n.investment_periods[: len(n.investment_periods) - investment_year_idx],
-            cars,
-        ]
-        .values
-    )
-
-
-def attach_multihorizon_new_generators(n, costs, carriers, investment_year):
-    """
-    Attaches generators for carriers which did not previously exist in the
-    network (CCS, H2, SMR, etc). These generators do not have spatially resolved
-    costs, so they are added to all buses in the network.
-
-    Unlike CT's and CCGT's we include nuclear in this function, since we assume
-    they can be built anywhere in the network.
-
-    Specifically this function does the following:
-    1. Adds new carriers to the network
-    2. Adds generators for the new carriers
+    Bus eligibility per carrier is given by `carrier_buses` (see
+    `carrier_new_build_buses`); a carrier missing from that dict defaults to
+    all AC buses. p_max_pu profile are still informed by
+    each bus's existing fleet of the same (or, for a "-CCS" carrier, its
+    base) carrier where available, purely to seed reasonable operating
+    characteristics -- this does not affect cost.
 
     Arguments:
     n: pypsa.Network,
     costs: pd.DataFrame,
     carriers: List[str]
-        List of carriers to add to the network
+        List of carriers to add new-build generators for
     investment_year: int
         Year of investment
+    carrier_buses: dict[str, pd.Index] | None
+        Per-carrier override for which buses to add the new generators to.
+        Carriers not present in this dict default to all AC buses.
     """
     if not carriers:
         return
@@ -529,22 +728,69 @@ def attach_multihorizon_new_generators(n, costs, carriers, investment_year):
     add_missing_carriers(n, carriers)
     add_co2_emissions(n, costs, carriers)
     min_years = snakemake.config["costs"].get("min_year")
-    buses_i = n.buses.index
+    all_buses_i = n.buses.index[n.buses.carrier == "AC"]
+    if all_buses_i.empty:
+        return
+    carrier_buses = carrier_buses or {}
     for carrier in carriers:
+        buses_i = carrier_buses.get(carrier, all_buses_i)
+        if buses_i.empty:
+            continue
         p_max_pu_t = None
         if min_years and min_years.get(carrier, 0) > investment_year:
             continue
-        existing_gens = n.generators[
-            (
-                (n.generators.carrier == carrier)
-                & ~n.generators.index.str.contains("existing")
-                & (n.generators.build_year <= n.investment_periods[0])
-            )
-        ].copy()
+        reference_carriers = [carrier]
+        if "CCS" in carrier:
+            base_carrier = carrier.split("-")[0]
+            if base_carrier != carrier:
+                reference_carriers.append(base_carrier)
 
-        if not existing_gens.empty:
-            p_max_pu_t = n.get_switchable_as_dense("Generator", "p_max_pu")
-            p_max_pu_t = (p_max_pu_t[[x for x in existing_gens.index if x in p_max_pu_t.columns]]).mean().mean()
+        # build_year < investment_year (not <=) so a carrier processed earlier
+        # in this same loop (e.g. CCGT before CCGT-95CCS) isn't picked up as
+        # its own reference -- only generators that already existed before
+        # this call count as "existing".
+        existing_gens = n.generators.iloc[0:0].copy()
+        for reference_carrier in reference_carriers:
+            existing_gens = n.generators[
+                (
+                    (n.generators.carrier == reference_carrier)
+                    & (n.generators.build_year < investment_year)
+                )
+            ].copy()
+            if not existing_gens.empty:
+                break
+
+        profile_gens = existing_gens
+
+        if not profile_gens.empty:
+            p_max_pu_dense = n.get_switchable_as_dense("Generator", "p_max_pu")
+            existing_cols = [x for x in profile_gens.index if x in p_max_pu_dense.columns]
+            if existing_cols:
+                p_max_pu_dense = p_max_pu_dense[existing_cols]
+                existing_meta = n.generators.loc[existing_cols]
+                weights_all = existing_meta.p_nom.fillna(0).clip(lower=0)
+                if weights_all.sum() > 0:
+                    p_max_pu_all = p_max_pu_dense.mul(weights_all, axis=1).sum(axis=1) / weights_all.sum()
+                else:
+                    p_max_pu_all = p_max_pu_dense.mean(axis=1)
+
+                bus_to_existing_cols = existing_meta.groupby("bus").groups
+                profiles = {}
+                for bus in buses_i:
+                    bus_existing_cols = bus_to_existing_cols.get(bus, [])
+                    if len(bus_existing_cols) > 0:
+                        bus_weights = weights_all.reindex(bus_existing_cols).fillna(0)
+                        if bus_weights.sum() > 0:
+                            bus_profile = (
+                                p_max_pu_dense[bus_existing_cols].mul(bus_weights, axis=1).sum(axis=1)
+                                / bus_weights.sum()
+                            )
+                        else:
+                            bus_profile = p_max_pu_dense[bus_existing_cols].mean(axis=1)
+                    else:
+                        bus_profile = p_max_pu_all
+                    profiles[f"{bus} {carrier}_{investment_year}"] = bus_profile
+                p_max_pu_t = pd.DataFrame(profiles, index=p_max_pu_dense.index)
 
         n.madd(
             "Generator",
@@ -553,60 +799,17 @@ def attach_multihorizon_new_generators(n, costs, carriers, investment_year):
             bus=buses_i,
             carrier=carrier,
             p_nom_extendable=True,
-            capital_cost=costs.at[carrier, "annualized_capex_fom"],
+            capital_cost=_regional_capital_cost(costs, carrier, buses_i, bus_multipliers),
             marginal_cost=costs.at[carrier, "marginal_cost"],
+            vom_cost=costs.at[carrier, "opex_variable_per_mwh"],
             efficiency=costs.at[carrier, "efficiency"],
             build_year=investment_year,
             lifetime=costs.at[carrier, "lifetime"],
-            p_max_pu=p_max_pu_t if p_max_pu_t is not None else 1,
-            ramp_limit_up=existing_gens.ramp_limit_up.mean() or 1,
-            ramp_limit_down=existing_gens.ramp_limit_down.mean() or 1,
+            p_max_pu=1,
         )
 
-
-def apply_itc(n, itc_modifier, monitization_cost=0.1):
-    """
-    Applies investment tax credit to all extendable components in the network.
-
-    Arguments:
-    n: pypsa.Network,
-    itc_modifier: dict,
-        Dict of ITC modifiers for each carrier
-    """
-    for carrier in itc_modifier.keys():
-        carrier_mask = n.generators["carrier"] == carrier
-        n.generators.loc[carrier_mask, "capital_cost"] *= 1 - ((1 - monitization_cost) * itc_modifier[carrier])
-
-        carrier_mask = n.storage_units["carrier"] == carrier
-        n.storage_units.loc[carrier_mask, "capital_cost"] *= 1 - ((1 - monitization_cost) * itc_modifier[carrier])
-
-
-def apply_ptc(n, ptc_modifier, costs):
-    """
-    Applies production tax credit to all extendable components in the network.
-
-    Arguments:
-    n: pypsa.Network,
-    ptc_modifier: dict,
-        Dict of PTC modifiers for each carrier
-    """
-
-    def discount_ptc(ptc, r, financial_lifetime, credit_lifetime=10, monitization_cost_pct=0.1):
-        eff_ptc = (1 - monitization_cost_pct) * ptc
-        pv = eff_ptc * (1 - (1 + r) ** (-1 * credit_lifetime)) / r
-        crf = (r * (1 + r) ** financial_lifetime) / ((1 + r) ** financial_lifetime - 1)
-        return round(pv * crf, 2)
-
-    for carrier in ptc_modifier.keys():
-        ptc = ptc_modifier[carrier]
-        discounted_ptc = discount_ptc(ptc, costs.at[carrier, "wacc_real"], costs.at[carrier, "lifetime"])
-        mask = (n.generators["carrier"] == carrier) & n.generators.p_nom_extendable
-        for build_year in n.investment_periods:
-            mask_by = (n.generators.build_year == build_year) & mask
-            mc = n.get_switchable_as_dense("Generator", "marginal_cost").loc[:, mask_by]
-            mc.loc[build_year:, :] -= discounted_ptc
-            n.generators_t.marginal_cost.loc[:, mask_by] = mc
-            n.generators.loc[mask_by, "marginal_cost"] -= discounted_ptc
+        if p_max_pu_t is not None and not p_max_pu_t.empty:
+            n.generators_t.p_max_pu = pd.concat([n.generators_t.p_max_pu, p_max_pu_t], axis=1)
 
 
 def apply_max_annual_growth_rate(n, max_growth):
@@ -635,143 +838,6 @@ def apply_max_annual_growth_rate(n, max_growth):
         p_nom = n.generators.p_nom.loc[n.generators.carrier == carrier].sum()
         n.carriers.loc[carrier, "max_growth"] = base or p_nom
         n.carriers.loc[carrier, "max_relative_growth"] = rate**years
-
-
-def add_demand_response(
-    n: pypsa.Network,
-    dr_config: dict[str, str | float],
-) -> None:
-    """Add price based demand response to network."""
-    n.add("Carrier", "demand_response", color="#dd2e23", nice_name="Demand Response")
-
-    shift = dr_config.get("shift", 0)
-    if shift == 0:
-        logger.info(f"DR not applied as allowable sift is {shift}")
-        return
-
-    marginal_cost_storage = dr_config.get("marginal_cost", 0)
-    if marginal_cost_storage == 0:
-        logger.warning("No cost applied to demand response")
-
-    # attach dr at all load locations
-
-    buses = n.loads.bus
-    df = n.buses[n.buses.index.isin(buses)].copy()
-
-    # two storageunits for forward and backwards load shifting
-
-    n.madd(
-        "Bus",
-        names=df.index,
-        suffix="-fwd-dr",
-        x=df.x,
-        y=df.y,
-        carrier="demand_response",
-        unit="MWh",
-        country=df.country,
-        reeds_zone=df.reeds_zone,
-        reeds_ba=df.reeds_ba,
-        interconnect=df.interconnect,
-        trans_reg=df.trans_reg,
-        trans_grp=df.trans_grp,
-        reeds_state=df.reeds_state,
-        substation_lv=df.substation_lv,
-    )
-
-    n.madd(
-        "Bus",
-        names=df.index,
-        suffix="-bck-dr",
-        x=df.x,
-        y=df.y,
-        carrier="demand_response",
-        unit="MWh",
-        country=df.country,
-        reeds_zone=df.reeds_zone,
-        reeds_ba=df.reeds_ba,
-        interconnect=df.interconnect,
-        trans_reg=df.trans_reg,
-        trans_grp=df.trans_grp,
-        reeds_state=df.reeds_state,
-        substation_lv=df.substation_lv,
-    )
-
-    # seperate charging/discharging links for easier constraint generation
-
-    n.madd(
-        "Link",
-        names=df.index,
-        suffix="-fwd-dr-charger",
-        bus0=df.index,
-        bus1=df.index + "-fwd-dr",
-        carrier="demand_response",
-        p_nom_extendable=False,
-        p_nom=np.inf,
-    )
-
-    n.madd(
-        "Link",
-        names=df.index,
-        suffix="-fwd-dr-discharger",
-        bus0=df.index + "-fwd-dr",
-        bus1=df.index,
-        carrier="demand_response",
-        p_nom_extendable=False,
-        p_nom=np.inf,
-    )
-
-    n.madd(
-        "Link",
-        names=df.index,
-        suffix="-bck-dr-charger",
-        bus0=df.index,
-        bus1=df.index + "-bck-dr",
-        carrier="demand_response",
-        p_nom_extendable=False,
-        p_nom=np.inf,
-    )
-
-    n.madd(
-        "Link",
-        names=df.index,
-        suffix="-bck-dr-discharger",
-        bus0=df.index + "-bck-dr",
-        bus1=df.index,
-        carrier="demand_response",
-        p_nom_extendable=False,
-        p_nom=np.inf,
-    )
-
-    # backward stores have positive marginal cost storage and postive e
-    # forward stores have negative marginal cost storage and negative e
-
-    n.madd(
-        "Store",
-        names=df.index,
-        suffix="-bck-dr",
-        bus=df.index + "-bck-dr",
-        e_cyclic=True,
-        e_nom_extendable=False,
-        e_nom=1e9,
-        e_min_pu=0,
-        e_max_pu=1,
-        carrier="demand_response",
-        marginal_cost_storage=marginal_cost_storage,
-    )
-
-    n.madd(
-        "Store",
-        names=df.index,
-        suffix="-fwd-dr",
-        bus=df.index + "-fwd-dr",
-        e_cyclic=True,
-        e_nom_extendable=False,
-        e_nom=1e9,
-        e_min_pu=-1,
-        e_max_pu=0,
-        carrier="demand_response",
-        marginal_cost_storage=marginal_cost_storage * (-1),
-    )
 
 
 def trim_network(n, trim_topology):
@@ -884,616 +950,17 @@ def trim_network(n, trim_topology):
     n.determine_network_topology()
 
 
-def calc_import_export_costs(n: pypsa.Network, carrier: str) -> float:
-    """Calculates the average marginal cost for a given carrier."""
-    gens = n.generators[n.generators.carrier == carrier]
-    component = "Generator"
-    if gens.empty:
-        gens = n.links[n.links.carrier == carrier]
-        component = "Link"
-    if gens.empty:
-        raise ValueError(f"No generators or links found for carrier to calculate imports/exports costs: {carrier}")
-    costs = get_as_dense(n, component, "marginal_cost").loc[:, gens.index].mean().mean()
-    if costs <= 0.01:
-        raise ValueError(
-            f"Average marginal cost for {carrier} is less than or equal to 0.01. Check the fuel costs configuration.",
-        )
-    return costs
-
-
-def load_import_export_costs(eia_api: str, year: int) -> pd.DataFrame:
-    """Loads fuel costs from EIA."""
-    return FuelCosts(fuel="electricity", year=year, api=eia_api).get_data()
-
-
-def format_import_export_costs(n: pypsa.Network, fuel_costs: pd.DataFrame) -> pd.DataFrame:
-    """Formats fuel costs for BA mappings."""
-    df = fuel_costs.copy()
-    data = []
-
-    buses = n.buses.copy()
-
-    region_mapping = buses.set_index("country")["reeds_state"].to_dict()
-    for region, state in region_mapping.items():
-        for period in df.index.unique():
-            temp = df[(df.index == period) & (df.state == state)]
-            value = temp.value.mean()
-            data.append([period, region, value, "usd/mwh"])
-    formatted = pd.DataFrame(data, columns=["period", "zone", "value", "units"]).set_index("period")
-    return formatted[~formatted.value.isna()]  # regions outside of model scope
-
-
-def format_flowgates_for_imports_exports(n: pypsa.Network, flowgates: pd.DataFrame, zone_col: str) -> pd.DataFrame:
-    """Formats flowgates for zone mappings."""
-    zones_in_model = n.buses[zone_col].unique()
-    df = flowgates.copy()
-
-    # only keep flowgates that connect inside to outside model scope
-    df = df[df.r.isin(zones_in_model) ^ df.rr.isin(zones_in_model)]
-
-    # reformat to sinlge value column for easier addition to network
-    data = []
-    for _, row in df.iterrows():
-        if row.MW_f0 > 0:
-            data.append([row.r, row.rr, row.MW_f0])
-        if row.MW_r0 > 0:
-            data.append([row.rr, row.r, row.MW_r0])
-
-    return pd.DataFrame(data, columns=["r", "rr", "value"])
-
-
-def convert_flowgates_to_state(flowgates: pd.DataFrame, membership: pd.DataFrame) -> pd.DataFrame:
-    """Converts flowgates to state level."""
-    mbshp = membership.set_index("ba")
-    df = flowgates.copy()
-
-    df["s"] = df.r.map(mbshp["st"])
-    df["ss"] = df.rr.map(mbshp["st"])
-    df = df.drop(columns=["r", "rr"])
-    df = df.rename(columns={"s": "r", "ss": "rr"})
-    return df
-
-
-def add_elec_imports_exports(
-    n: pypsa.Network,
-    direction: str,
-    flowgates: pd.DataFrame,
-    fuel_costs: pd.DataFrame | float,
-    co2_emissions: float = 0,
-    zone_col: str = "reeds_zone",
-):
-    """Add electricity imports and exports to the network.
-
-    These are capacity constrianed links to/from states outside the model spatial scope.
-    """
-
-    def _get_regions_2_add(n: pypsa.Network, flowgates: pd.DataFrame, zone_col: str) -> list[str]:
-        """Gets regions to add import and export buses to."""
-        unique_regions = set(flowgates.r.unique()) | set(flowgates.rr.unique())
-        return [x for x in unique_regions if x not in n.buses[zone_col].unique()]
-
-    def _add_import_export_carriers(n: pypsa.Network, direction: str, co2_emissions: float | None = None) -> None:
-        """Adds import and export carriers to the network."""
-        if direction == "imports":
-            co2_emissions = 0 if not co2_emissions else co2_emissions
-            n.add("Carrier", "imports", co2_emissions=co2_emissions, nice_name="Imports")
-        elif direction == "exports":
-            n.add("Carrier", "exports", co2_emissions=0, nice_name="Exports")
-        else:
-            raise ValueError(f"direction must be either imports or exports; received: {direction}")
-
-    def _add_import_export_buses(n: pypsa.Network, regions_2_add: list[str], direction: str) -> None:
-        """Adds import and export buses to the network."""
-        if direction == "imports":
-            suffix = "_imports"
-            carrier = "imports"
-        elif direction == "exports":
-            suffix = "_exports"
-            carrier = "exports"
-        else:
-            raise ValueError(f"direction must be either imports or exports; received: {direction}")
-
-        # cant add in the reeds_state, reeds_zone, reeds_ba, interconnect, trans_reg, trans_grp
-        # because this information has already been filtered out of the network
-
-        n.madd(
-            "Bus",
-            regions_2_add,
-            suffix=suffix,
-            carrier=carrier,
-            country=regions_2_add,
-        )
-
-    def _add_import_export_stores(n: pypsa.Network, regions_2_add: list[str], direction: str) -> None:
-        """Adds import and export stores to the network."""
-        if direction == "imports":
-            n.madd(
-                "Store",
-                regions_2_add,
-                bus=[f"{x}_imports" for x in regions_2_add],
-                suffix="_imports",
-                carrier="imports",
-                e_nom=0,
-                e_nom_extendable=True,
-                capital_cost=0,
-                e_nom_min=0,
-                e_nom_max=1e9,
-                e_min_pu=-1,
-                e_max_pu=0,
-                e_cyclic_per_period=False,
-                marginal_cost=0,
-            )
-        elif direction == "exports":
-            n.madd(
-                "Store",
-                regions_2_add,
-                bus=[f"{x}_exports" for x in regions_2_add],
-                suffix="_exports",
-                carrier="exports",
-                e_nom_extendable=True,
-                marginal_cost=0,
-                e_nom=0,
-                e_nom_max=1e9,
-                e_min=0,
-                e_min_pu=0,
-                e_max_pu=1,
-            )
-        else:
-            raise ValueError(f"direction must be either imports or exports; received: {direction}")
-
-    def _build_cost_timeseries(n: pypsa.Network, costs: pd.DataFrame, zone: str) -> pd.Series:
-        """Builds a cost timeseries for a given state."""
-        timesteps = n.snapshots.get_level_values("timestep")
-        years = n.investment_periods
-        cost_by_zone = costs[costs.zone == zone].drop(columns=["zone", "units"])
-        dfs = []
-        for year in years:
-            df = cost_by_zone.copy()
-            df.index = pd.to_datetime(df.index).map(lambda x: x.replace(year=year))
-            df = df.resample("h").ffill().reindex(timesteps).ffill()
-            df["year"] = year
-            df = df.set_index(["year", df.index])  # df.index is timestep
-            dfs.append(df)
-        df = pd.concat(dfs)
-        return df.reindex(n.snapshots)
-
-    def _add_import_export_links(
-        n: pypsa.Network,
-        flowgates: pd.DataFrame,
-        fuel_costs: pd.DataFrame | float | str,
-        direction: str,
-        zone_col: str = "reeds_zone",
-    ) -> None:
-        """Adds import and export links to the network."""
-        costs = {}
-        zones_in_model = n.buses[zone_col].dropna().unique()
-
-        for _, row in flowgates.iterrows():
-            zone_inside = row.r if row.r in zones_in_model else row.rr
-            zone_outside = row.r if row.r not in zones_in_model else row.rr
-
-            # extremely crude cashing for generating cost timeseries :|
-            if zone_outside not in costs:
-                if isinstance(fuel_costs, float | int):
-                    costs[zone_inside] = fuel_costs
-                elif isinstance(fuel_costs, pd.DataFrame):
-                    costs[zone_inside] = _build_cost_timeseries(n, fuel_costs, zone_inside)
-                else:
-                    costs[zone_inside] = 0
-
-            marginal_cost = costs[zone_inside]
-
-            capacity = row.value
-
-            """Structre of flowgates is given by:
-
-                  r   rr     value
-            0    p6   p8   488.117
-            1    p8   p6   378.458
-            2    p6   p9  4800.000
-            ...
-            """
-
-            if direction == "imports":
-                if row.r == zone_inside:  # originating at r is exports (ie r -> rr)
-                    continue
-                name = f"{zone_inside}_{zone_outside}_imports"
-                bus0 = f"{zone_outside}_imports"
-                bus1 = zone_inside
-                carrier = "imports"
-            else:
-                if row.r == zone_outside:  # originating at rr is exports (ie rr -> r)
-                    continue
-                name = f"{zone_inside}_{zone_outside}_exports"
-                bus0 = zone_inside
-                bus1 = f"{zone_outside}_exports"
-                carrier = "exports"
-                if isinstance(marginal_cost, pd.Series):
-                    marginal_cost = marginal_cost.mul(-1)  # constraint will limit exports
-
-            mc = marginal_cost.value if isinstance(marginal_cost, pd.DataFrame) else marginal_cost
-
-            n.add(
-                "Link",
-                name,
-                bus0=bus0,
-                bus1=bus1,
-                carrier=carrier,
-                p_nom_extendable=False,
-                p_min_pu=0,
-                p_max_pu=1,
-                marginal_cost=mc,
-                p_nom=capacity,
-            )
-
-    assert direction in ["imports", "exports"], f"direction must be either imports or exports; received: {direction}"
-
-    regions_2_add = _get_regions_2_add(n, flowgates, zone_col)
-    _add_import_export_carriers(n, direction, co2_emissions)
-    _add_import_export_buses(n, regions_2_add, direction)
-    _add_import_export_stores(n, regions_2_add, direction)
-    _add_import_export_links(n, flowgates, fuel_costs, direction, zone_col)
-
-
-def add_co2_storage(n: pypsa.Network, config: dict, co2_storage_csv: str, costs: pd.DataFrame, sector: bool):
-    """Adds node level CO2 (underground) storage."""
-    # get node level CO2 (underground) storage potential and cost from CSV file
-    co2_storage = pd.read_csv(co2_storage_csv).set_index("node")
-
-    # add carrier to represent CO2
-    n.madd(
-        "Carrier",
-        ["co2"],
-        color=config["plotting"]["tech_colors"]["co2"],
-        nice_name=config["plotting"]["nice_names"]["co2"],
-    )
-
-    # add buses to represent node level CO2 captured by different processes
-    n.madd(
-        "Bus",
-        co2_storage.index,
-        suffix=" co2 capture",
-        carrier="co2",
-    )
-
-    # add stores to represent node level CO2 (underground) storage
-    n.madd(
-        "Store",
-        co2_storage.index,
-        suffix=" co2 storage",
-        bus=co2_storage.index + " co2 capture",
-        e_nom_extendable=True,
-        e_nom_max=co2_storage["potential [MtCO2]"] * 1e6,  # in tCO2
-        marginal_cost=co2_storage["cost [USD/tCO2]"],
-        carrier="co2",
-    )
-
-    # add carrier to represent CC only (i.e. without S)
-    carriers = n.carriers.query("Carrier.str.endswith('CCS')")
-    if not carriers.empty:
-        n.madd(
-            "Carrier",
-            carriers.index.str.replace("CCS", "CC", regex=True),
-            color=carriers["color"],
-            nice_name=carriers["nice_name"].str.replace("Ccs", "Cc", regex=True),
-        )
-
-    # get CO2 intensity for gas and coal
-    gas_co2_intensity = costs.loc["gas"]["co2_emissions"]
-    coal_co2_intensity = costs.loc["coal"]["co2_emissions"]
-
-    if sector:
-        links = n.links.index.str.contains("CCS")
-        if links.any():  # found links equipped with CCS
-            # specify links' bus4 to point to their respective CO2 capture buses
-            n.links.loc[links, "bus4"] = co2_storage.index + " co2 capture"
-
-            # calculate efficiencies
-            efficiency2 = []  # to node or state atmosphere bus (e.g. "p9 pwr atmosphere", "CA pwr atmosphere")
-            efficiency4 = []  # to node co2 capture bus (e.g. "p9 co2 capture")
-            for index in n.links.loc[links].index:
-                link_efficiency = n.links.loc[index]["efficiency"]
-                if "CCGT" in index:
-                    efficiency = 1 / link_efficiency * gas_co2_intensity
-                elif "coal" in index:
-                    efficiency = 1 / link_efficiency * coal_co2_intensity
-                else:
-                    logger.warning(
-                        f"Assuming a CO2 intensity equal to 1 given that link '{index}' is not powered by gas or coal",
-                    )
-                    efficiency = 1 / link_efficiency * 1
-                cc_level = (
-                    int(index.split("-")[1].split("CC")[0]) / 100
-                )  # extract CC level from index (e.g. index "p1 CCGT-95CCS_2030" returns 0.95)
-                efficiency2.append(efficiency * (1 - cc_level) / cc_level)
-                efficiency4.append(efficiency)
-
-            # set links' bus2 and bus4 efficiencies
-            n.links.loc[links, "efficiency2"] = efficiency2
-            n.links.loc[links, "efficiency4"] = efficiency4
-
-            # remove storage cost from links' capital cost (given that they do not require technology to store CO2 anymore as this is done underground)
-            n.links.loc[links, "capital_cost"] *= (
-                0.95  # TODO: replace with a concrete storage cost (reducing 5% capital cost for the time being)
-            )
-
-            # replace substring "CCS" with just "CC" in links' names and carriers
-            n.links.loc[links, "carrier"] = n.links.loc[links].carrier.str.replace("CCS", "CC", regex=True)
-            n.links.index = n.links.index.str.replace("CCS", "CC", regex=True)
-
-    else:  # sector-less
-        generators = n.generators.index.str.contains("CCS")
-        if generators.any():  # found generators equipped with CCS
-            # remove storage cost from generators' capital cost (given that they do not require technology to store CO2 anymore as this is done underground)
-            n.generators.loc[generators, "capital_cost"] *= (
-                0.95  # TODO: replace with a concrete storage cost (reducing 5% capital cost for the time being)
-            )
-
-            # replace "CCS" with "CC" in generators' indexes/carriers description
-            n.generators.loc[generators, "carrier"] = n.generators.loc[generators].carrier.str.replace(
-                "CCS",
-                "CC",
-                regex=True,
-            )
-            n.generators.index = n.generators.index.str.replace("CCS", "CC", regex=True)
-
-            # add buses to represent node level electricity CC generator
-            indexes = n.generators.loc[generators].index
-            n.madd(
-                "Bus",
-                indexes,
-                carrier=n.generators.loc[generators].carrier,
-            )
-
-            # add buses to represent node level emitted CO2 by different processes
-            granularity = config["dac"]["granularity"]
-            if granularity == "nation":
-                buses_atmosphere_unique = ["atmosphere"]
-                buses_atmosphere = buses_atmosphere_unique
-            else:
-                if config["model_topology"]["transmission_network"] == "reeds":
-                    elements = 1
-                else:  # TAMU
-                    elements = 2
-                if granularity == "state":
-                    buses = n.buses[["x", "y"]].query("x != 0 and y != 0").copy()
-                    buses["geometry"] = buses.apply(lambda x: Point(x.x, x.y), axis=1)
-                    buses_gdf = gpd.GeoDataFrame(buses, crs="EPSG:4269")
-                    states_gdf = gpd.GeoDataFrame(
-                        gpd.read_file(snakemake.input.county_shapes).dissolve("STUSPS")["geometry"],
-                    )
-                    buses_projected = buses_gdf.to_crs("EPSG:3857")
-                    states_projected = states_gdf.to_crs("EPSG:3857")
-                    states = gpd.sjoin_nearest(buses_projected, states_projected, how="left")["STUSPS"]
-                    buses_atmosphere_unique = states.unique() + " atmosphere"
-                    buses_atmosphere = [
-                        "{} atmosphere".format(states.loc[" ".join(index.split(" ")[:elements])]) for index in indexes
-                    ]
-                else:  # node
-                    buses_atmosphere_unique = [
-                        "{} atmosphere".format(" ".join(index.split(" ")[:elements])) for index in indexes
-                    ]
-                    buses_atmosphere = buses_atmosphere_unique
-
-            # add buses to represent (air) atmosphere where CO2 emissions are sent to
-            n.madd(
-                "Bus",
-                buses_atmosphere_unique,
-                carrier="co2",
-            )
-
-            # add stores to represent (air) atmosphere where CO2 emissions are stored
-            n.madd(
-                "Store",
-                buses_atmosphere_unique,
-                bus=buses_atmosphere_unique,
-                e_nom_extendable=True,
-                e_min_pu=-1,
-                carrier="co2",
-            )
-
-            # calculate efficiencies
-            efficiency2 = []  # to node or state atmosphere bus (e.g. "p9 atmosphere", "CA atmosphere")
-            efficiency3 = []  # to node co2 capture bus (e.g. "p9 co2 capture")
-            for index in indexes:
-                generator_efficiency = n.generators.loc[index]["efficiency"]
-                if "CCGT" in index:
-                    efficiency = 1 / generator_efficiency * gas_co2_intensity
-                elif "coal" in index:
-                    efficiency = 1 / generator_efficiency * coal_co2_intensity
-                else:
-                    logger.warning(
-                        f"Assuming a CO2 intensity equal to 1 given that generator '{index}' is not powered by gas or coal",
-                    )
-                    efficiency = 1 / generator_efficiency * 1
-                cc_level = (
-                    int(index.split("-")[1].split("CC")[0]) / 100
-                )  # extract CC level from index (e.g. index "p1 CCGT-95CCS_2030" returns 0.95)
-                efficiency2.append(efficiency)
-                efficiency3.append(efficiency * (1 - cc_level) / cc_level)
-
-            # add links to represent sending electricity (in MW) to the electricity bus (e.g. "p9" if ReEDS or "p100 0" if TAMU) as well as sending emitted CO2 (by the generator) to both the atmosphere bus and the co2 capture bus
-            n.madd(
-                "Link",
-                indexes,
-                bus0=indexes,
-                bus1=n.generators.loc[generators]["bus"],
-                bus2=buses_atmosphere,
-                bus3=co2_storage.index + " co2 capture",
-                efficiency=1,
-                efficiency2=efficiency2,
-                efficiency3=efficiency3,
-                p_nom_extendable=True,
-                capital_cost=0,
-                marginal_cost=0,
-                carrier=n.generators.loc[generators].carrier,
-            )
-
-            # (re-)attach generators to new buses (that represent node level CC generator)
-            n.generators.loc[generators, "bus"] = indexes
-
-
-def add_co2_network(n: pypsa.Network, config: dict):
-    """Adds CO2 (transportation) network."""
-    # get electricity connections
-    if config["model_topology"]["transmission_network"] == "reeds":
-        connections = n.links.query("carrier == 'AC' and not Link.str.endswith('exp')")
-    else:  # TAMU
-        connections = n.lines
-
-    # calculate annualized capital cost
-    number_years = n.snapshot_weightings.generators.sum() / 8760
-    cost = (
-        config["co2"]["network"]["capital_cost"]
-        * calculate_annuity(config["co2"]["network"]["lifetime"], config["co2"]["network"]["discount_rate"])
-        * number_years
-    )
-
-    # add links to represent CO2 (transportation) network based on electricity connections layout
-    n.madd(
-        "Link",
-        connections.index,
-        suffix=" co2 transport",
-        bus0=connections["bus0"] + " co2 capture",
-        bus1=connections["bus1"] + " co2 capture",
-        efficiency=1,
-        p_min_pu=-1,
-        p_nom_extendable=True,
-        length=connections["length"].values,
-        capital_cost=cost * connections["length"].values,
-        marginal_cost=config["co2"]["network"]["marginal_cost"],
-        carrier="co2",
-        lifetime=config["co2"]["network"]["lifetime"],
-    )
-
-
-def add_dac(n: pypsa.Network, config: dict, sector: bool):
-    """Adds node level DAC capabilities."""
-    # generate node level buses to represent emitted, captured and accounted CO2 and links to represent DAC in function of whether network is based on sectors or not
-    if sector:
-        # get DAC granularity/scope
-        granularity = config["dac"]["granularity"]
-        if granularity == "nation":
-            granularity = "node"
-            logger.warning(
-                "Nation level DAC capabilities is not applicable for a network based on sectors - defaulting to node level instead",
-            )
-
-        # set number of elements based on electricity transmission network type
-        if config["model_topology"]["transmission_network"] == "reeds":
-            elements = 1
-        else:  # TAMU
-            elements = 2
-
-        # get links that emit CO2 for all sectors
-        links = n.links.query("bus2.str.endswith('-co2')")
-
-        # set buses needed to create DAC links properly afterwards
-        exists_atmosphere = set()
-        exists_dac = set()
-        buses_atmosphere = []
-        buses_atmosphere_all = []
-        buses_atmosphere_unique = []
-        buses_co2_capture = []
-        buses_co2_account = []
-        buses_ac = []
-        links_dac = []
-        for index in links.index:
-            bus2 = links.loc[index]["bus2"]  # e.g. "CA pwr-co2"
-            node = " ".join(index.split(" ")[:elements])  # e.g. "p9" if ReEDS or "p100 0" if TAMU
-            state = bus2.split(" ")[0]  # e.g. "CA"
-            state_sector = bus2.split(" ")[1].split("-")[0]  # e.g. "pwr"
-            if granularity == "node":
-                atmosphere = f"{node} {state_sector} atmosphere"
-            else:  # state
-                atmosphere = f"{state} {state_sector} atmosphere"
-            buses_atmosphere_all.append(atmosphere)
-            if atmosphere not in exists_atmosphere:
-                buses_atmosphere_unique.append(atmosphere)
-                buses_co2_account.append(bus2)
-                exists_atmosphere.add(atmosphere)
-            dac = f"{node} {state_sector} dac"
-            if dac not in exists_dac:
-                buses_atmosphere.append(atmosphere)
-                buses_co2_capture.append(f"{node} co2 capture")
-                buses_ac.append(node)
-                links_dac.append(dac)
-                exists_dac.add(dac)
-
-        # add node or state level buses to represent (air) atmosphere where CO2 emissions are sent to (on a per sector basis)
-        n.madd(
-            "Bus",
-            buses_atmosphere_unique,
-            carrier="co2",
-        )
-
-        # add links from node or state level buses that represent (air) atmosphere to state level buses tracking CO2 emissions (on a per sector basis)
-        n.madd(
-            "Link",
-            buses_atmosphere_unique,
-            bus0=buses_atmosphere_unique,
-            bus1=buses_co2_account,
-            efficiency=1,
-            p_nom_extendable=True,
-            capital_cost=0,
-            marginal_cost=0,
-            carrier="co2",
-        )
-
-        # redirect links that emit CO2 to node or state level buses that represent (air) atmosphere   # e.g. "p1 trn atmosphere"
-        n.links.loc[links.index, "bus2"] = buses_atmosphere_all
-
-    else:  # sector-less
-        # set buses needed to create DAC links properly afterwards
-        buses_atmosphere = n.links.query("bus2.str.endswith('atmosphere')")["bus2"].values
-        buses_co2_capture = n.buses.query("Bus.str.endswith(' co2 capture')").index
-        buses_ac = buses_co2_capture.str.replace(" co2 capture", "")
-        links_dac = buses_co2_capture.str.replace(" co2 capture", " dac")
-
-    # add carrier to represent DAC
-    n.madd(
-        "Carrier",
-        ["dac"],
-        color=config["plotting"]["tech_colors"]["dac"],
-        nice_name=config["plotting"]["nice_names"]["dac"],
-    )
-
-    # calculate annualized capital cost
-    number_years = n.snapshot_weightings.generators.sum() / 8760
-    cost = (
-        config["dac"]["capital_cost"]
-        * calculate_annuity(config["dac"]["lifetime"], config["dac"]["discount_rate"])
-        * number_years
-    )
-
-    # add links to represent node level DAC capabilities
-    n.madd(
-        "Link",
-        links_dac,
-        bus0=buses_atmosphere,
-        bus1=buses_co2_capture,
-        bus2=buses_ac,
-        efficiency=1,  # in tCO2
-        efficiency2=-config["dac"]["electricity_input"],  # in MWh (for each tCO2)
-        p_nom_extendable=True,
-        capital_cost=cost,
-        marginal_cost=0,
-        carrier="dac",
-        lifetime=config["dac"]["lifetime"],
-    )
-
-
 if __name__ == "__main__":
     if "snakemake" not in globals():
         from _helpers import mock_snakemake
 
         snakemake = mock_snakemake(
             "add_extra_components",
-            interconnect="western",
-            simpl="20",
-            clusters="4m",
+            case="test",
         )
     configure_logging(snakemake)
+    set_case_config(snakemake)
+    update_config_from_wildcards(snakemake.config, snakemake.wildcards)
 
     n = pypsa.Network(snakemake.input.network)
     elec_config = snakemake.config["electricity"]
@@ -1507,190 +974,84 @@ if __name__ == "__main__":
         for i in range(len(n.investment_periods))
     }
 
+    # County-level ReEDS overnight-capex multipliers, resolved onto this network's
+    # buses. Buses here are finer than county resolution and no longer carry a
+    # `county` column (simplify_network drops it), so they are matched to the
+    # geographically nearest county the ReEDS table covers. Applied where each
+    # component is created, so only the overnight share is ever scaled.
+    bus_multipliers = _build_bus_multipliers(n, snakemake)
+
     if any("PHS" in s for s in elec_config["extendable_carriers"]["StorageUnit"]):
         attach_phs_storageunits(n, elec_config, costs_dict[n.investment_periods[0]])
 
     if snakemake.params.retirement == "economic":
         economic_retirement_gens = set(elec_config.get("conventional_carriers", None))
-        split_retirement_gens(
+        freeze_existing_generators(
             n,
             costs_dict[n.investment_periods[0]],
             economic_retirement_gens,
             economic=True,
         )
-    # Split renewable generators from the first investement period to support lifetime retirement
-    split_retirement_gens(
-        n,
-        costs_dict[n.investment_periods[0]],
-        set(elec_config.get("renewable_carriers", None)),
-        economic=False,
+    # Wind/solar are intentionally not passed through freeze_existing_generators:
+    # their existing capacity + buildable resource potential are already a single
+    # extendable generator per bus from add_electricity.py (see
+    # attach_existing_renewable_capacities), so there's nothing to freeze here.
+
+    # Bus eligibility for new-build capacity: nuclear at every AC bus;
+    # OCGT/CCGT/CCGT-CCS on the union of existing gas buses; everything
+    # else restricted to buses that already have that carrier installed (see
+    # carrier_new_build_buses).
+    all_ac_buses_i = n.buses.index[n.buses.carrier == "AC"]
+    gas_union_buses_i = pd.Index(
+        n.generators.loc[n.generators.carrier.isin(NEW_GAS_COST_CARRIERS), "bus"].unique(),
     )
 
-    multi_horizon_gens = n.generators[
-        n.generators["p_nom_extendable"]
-        & n.generators["carrier"].isin(elec_config["extendable_carriers"]["Generator"])
-        & ~n.generators.index.str.contains("existing")
-    ]
-
-    multi_horizon_gens = multi_horizon_gens[
-        multi_horizon_gens["carrier"].isin(
-            [car for car in elec_config["extendable_carriers"]["Generator"] if "EGS" not in car],
-        )
-    ]
-    egs_gens = n.generators[n.generators["p_nom_extendable"]]
-    egs_gens = egs_gens.loc[egs_gens["carrier"].str.contains("EGS")]
-
-    new_carriers = list(
-        set(elec_config["extendable_carriers"].get("Generator", [])) - set(n.generators.carrier.unique())
-        | set(
-            ["nuclear"] if "nuclear" in elec_config["extendable_carriers"].get("Generator", []) else [],
-        ),
+    # onwind/offwind_floating/solar are excluded: attach_wind_and_solar and
+    # attach_existing_renewable_capacities (add_electricity.py) already give them a
+    # single extendable generator per bus -- existing capacity as p_nom/p_nom_min,
+    # resource potential as p_nom_max, new-build cost -- so there's nothing to add here.
+    new_carriers = sorted(
+        set(elec_config["extendable_carriers"].get("Generator", [])) - RESOURCE_PROFILE_CARRIERS,
     )
+    new_generator_carrier_buses = {
+        carrier: carrier_new_build_buses(n, carrier, all_ac_buses_i, gas_union_buses_i) for carrier in new_carriers
+    }
 
     for investment_year in n.investment_periods:
         costs = costs_dict[investment_year]
-        attach_storageunits(n, costs, elec_config, investment_year)
-        attach_multihorizon_existing_generators(
+        attach_storageunits(n, costs, elec_config, investment_year, bus_multipliers=bus_multipliers)
+        attach_new_generators(
             n,
             costs,
-            multi_horizon_gens,
+            new_carriers,
             investment_year,
+            carrier_buses=new_generator_carrier_buses,
+            bus_multipliers=bus_multipliers,
         )
-        attach_multihorizon_egs(n, costs, costs_dict, egs_gens, investment_year)
-        attach_multihorizon_new_generators(n, costs, new_carriers, investment_year)
         # attach_stores(n, costs, elec_config, investment_year)
 
-    if not multi_horizon_gens.empty and not len(n.investment_periods) == 1:
-        # Remove duplicate generators from first investment period,
-        # created by attach_multihorizon_generators
-        n.mremove("Generator", multi_horizon_gens.index)
+    attach_flexible_electrolysis(
+        n,
+        snakemake.config.get("flexible_electrolysis", {}),
+        snakemake.input.sector_costs,
+        bus_multipliers=bus_multipliers,
+    )
 
-    apply_itc(n, snakemake.config["costs"]["itc_modifier"])
-    apply_ptc(n, snakemake.config["costs"]["ptc_modifier"], costs)
+    if snakemake.params.add_extendable_tes:
+        attach_tes_storageunits(n, snakemake.input.sector_costs, bus_multipliers=bus_multipliers)
+
+    if snakemake.config.get("scenario", {}).get("decarbonization") == "100VRE":
+        remove_gas_generators(n)
+
+    apply_gas_fuel_price(n, snakemake.params.gas_fuel_price)
+
     apply_max_annual_growth_rate(n, snakemake.config["costs"]["max_growth"])
     add_nice_carrier_names(n, snakemake.config)
     add_co2_emissions(n, costs_dict[n.investment_periods[0]], n.carriers.index)
 
-    dr_config = snakemake.params.demand_response
-    if dr_config:
-        add_demand_response(n, dr_config)
-
     trim_network_config = snakemake.params.trim_network
-    imports_config = snakemake.params.imports
-    exports_config = snakemake.params.exports
-
-    assert not (
-        snakemake.params.trim_network and (imports_config.get("enable", False) or exports_config.get("enable", False))
-    ), "trim_network and imports/exports cannot be used together"
-
     if snakemake.params.trim_network:
         trim_network(n, trim_network_config)
-
-    if snakemake.params.transmission_network == "reeds":
-        # flowgates to limit the capacity (removed later if configured capacity limit is inf)
-        flowgates = pd.read_csv(snakemake.input.flowgates)
-        if snakemake.params.topological_boundaries == "state":
-            zone_col = "reeds_state"
-            membership = pd.read_csv(snakemake.input.reeds_memberships)
-            flowgates = convert_flowgates_to_state(flowgates, membership)
-            flowgates = format_flowgates_for_imports_exports(n, flowgates, zone_col)
-            flowgates = flowgates.groupby(["r", "rr"], as_index=False).sum()
-        elif snakemake.params.topological_boundaries == "county":
-            zone_col = "county"
-            flowgates = format_flowgates_for_imports_exports(n, flowgates, zone_col)
-        elif snakemake.params.topological_boundaries == "reeds_zone":
-            zone_col = "reeds_zone"
-            flowgates = format_flowgates_for_imports_exports(n, flowgates, zone_col)
-        else:
-            raise ValueError(f"Invalid topological boundaries: {snakemake.params.topological_boundaries}")
-
-    # Electricity imports configuration
-    if imports_config.get("enable", False) and snakemake.params.transmission_network == "reeds":
-        co2_emissions = imports_config.get("co2_emissions", 0)
-
-        weather_year = snakemake.params.weather_year
-        if isinstance(weather_year, list):
-            year = weather_year[0]
-
-        import_flowgates = flowgates.copy()
-        if not imports_config.get("capacity_limit", True):
-            import_flowgates["value"] = np.inf
-
-        import_costs = imports_config.get("costs", False)
-
-        if isinstance(import_costs, float | int):  # user defined value
-            fuel_costs = import_costs
-        elif isinstance(import_costs, str):  # 'wholesale' or name of carrier
-            if import_costs == "wholesale":
-                fuel_costs = load_import_export_costs(snakemake.params.eia_api, year)
-                fuel_costs = format_import_export_costs(n, fuel_costs)
-            else:
-                fuel_costs = calc_import_export_costs(n, import_costs)
-        else:
-            raise ValueError(
-                f"'imports.costs' must be 'wholesale', name of a carrier, or a float/int. Received: {import_costs}",
-            )
-
-        add_elec_imports_exports(n, "imports", import_flowgates, fuel_costs, co2_emissions, zone_col)
-
-    # Electricity exports configuration
-    if exports_config.get("enable", False) and snakemake.params.transmission_network == "reeds":
-        co2_emissions = 0
-
-        weather_year = snakemake.params.weather_year
-        if isinstance(weather_year, list):
-            year = weather_year[0]
-
-        # flowgates to limit the capacity
-        export_flowgates = flowgates.copy()
-        if not exports_config.get("capacity_limit", True):
-            export_flowgates["value"] = np.inf
-
-        export_costs = exports_config.get("costs", False)
-
-        if isinstance(export_costs, float | int):  # user defined value
-            fuel_costs = export_costs
-            fuel_costs *= -1  # make money by exporting
-        elif isinstance(export_costs, str):  # 'wholesale' or name of carrier
-            if export_costs == "wholesale":
-                fuel_costs = load_import_export_costs(snakemake.params.eia_api, year)
-                fuel_costs = format_import_export_costs(n, fuel_costs)
-                fuel_costs["value"] = fuel_costs.value.mul(-1)  # make money by exporting
-            else:
-                fuel_costs = calc_import_export_costs(n, export_costs)
-                fuel_costs *= -1  # make money by exporting
-        else:
-            raise ValueError(
-                f"'exports.costs' must be 'wholesale', name of a carrier, or a float/int. Received: {export_costs}",
-            )
-
-        add_elec_imports_exports(n, "exports", export_flowgates, fuel_costs, co2_emissions)
-
-    if snakemake.config["scenario"]["sector"] == "E":
-        # add node level CO2 (underground) storage
-        if snakemake.config["co2"]["storage"]:
-            logger.info("Adding node level CO2 (underground) storage")
-            add_co2_storage(n, snakemake.config, snakemake.input.co2_storage, costs, False)
-
-        # add CO2 (transportation) network
-        if snakemake.config["co2"]["network"]["enable"]:
-            if snakemake.config["co2"]["storage"]:
-                logger.info("Adding CO2 (transportation) network")
-                add_co2_network(n, snakemake.config)
-            else:
-                logger.warning(
-                    "Not adding CO2 (transportation) network given that CO2 (underground) storage is not enabled",
-                )
-
-        # add node level DAC capabilities
-        if snakemake.config["dac"]["enable"]:
-            if snakemake.config["co2"]["storage"]:
-                logger.info("Adding DAC capabilities")
-                add_dac(n, snakemake.config, False)
-            else:
-                logger.warning(
-                    "Not adding DAC capabilities given that CO2 (underground) storage is not enabled",
-                )
 
     n.consistency_check()
     n.meta = dict(snakemake.config, **dict(wildcards=dict(snakemake.wildcards)))

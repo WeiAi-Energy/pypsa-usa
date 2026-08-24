@@ -1,4 +1,4 @@
-"""The `build_shapes` rule builds the GIS shape files for the balancing authorities and offshore regions. The regions are only built for the {interconnect} wildcard."""
+"""The `build_shapes` rule builds the GIS shape files for the balancing authorities and offshore regions. The regions are only built for the configured interconnect."""
 
 import logging
 
@@ -209,7 +209,7 @@ def trim_shape_to_interconnect(
 
 
 def main(snakemake):
-    interconnect = snakemake.wildcards.interconnect
+    interconnect = snakemake.params.interconnect
     breakthrough_zones = pd.read_csv(snakemake.input.zone)
     logger.info("Building GIS Shapes for %s Interconnect", interconnect)
 
@@ -367,6 +367,6 @@ def main(snakemake):
 if __name__ == "__main__":
     logger = logging.getLogger(__name__)
     if "snakemake" not in globals():
-        snakemake = mock_snakemake("build_shapes", interconnect="eastern")
+        snakemake = mock_snakemake("build_shapes")
     configure_logging(snakemake)
     main(snakemake)

@@ -16,11 +16,34 @@ import pandas as pd
 import pypsa
 import xarray as xr
 from _helpers import (
+    LINK_FIXED_COST_COL,
+    LINK_UNIT_COST_COL,
     calculate_annuity,
     configure_logging,
     export_network_for_gis_mapping,
+    get_currency_conversion_factor,
+    get_multiindex_snapshots,
+    recompute_link_transmission_costs,
     update_p_nom_max,
     weighted_avg,
+)
+from regional_cost import (
+    REEDS_TRANSMISSION_COST_YEAR,
+    county_unit_cost_field,
+    dc_ac_line_cost_ratio,
+    load_transmission_basecost,
+    load_transmission_pair_costs,
+    pair_unit_costs,
+    renewable_interconnection_capital_cost,
+    transmission_unit_costs,
+    voltage_cost_anchors,
+    voltage_cost_exponent,
+    voltage_ratio,
+)
+from select_representative_periods import (
+    read_representative_snapshots,
+    reindex_calendar_timeseries_to_snapshots,
+    reindex_source_timeseries_to_snapshots,
 )
 from sklearn.neighbors import BallTree
 
@@ -81,129 +104,131 @@ def add_missing_carriers(n, carriers):
         n.madd("Carrier", missing_carriers)
 
 
-def clean_locational_multiplier(df: pd.DataFrame):
-    """Updates format of locational multiplier data."""
-    df = df.fillna(1)
-    df = df[["State", "Location Variation"]]
-    return df.groupby("State").mean()
+def _annualization_factor(costs: pd.DataFrame, technology: str) -> float:
+    """Annuity plus FOM share, applied to a per-line overnight capex.
 
-
-def update_capital_costs(
-    n: pypsa.Network,
-    carrier: str,
-    costs: pd.DataFrame,
-    multiplier: pd.DataFrame,
-):
-    """Applies regional multipliers to capital cost data."""
-    # map generators to states
-    bus_state_mapper = n.buses.to_dict()["state"]
-    gen = n.generators[n.generators.carrier == carrier].copy()
-    gen["state"] = gen.bus.map(bus_state_mapper)
-    gen = gen[gen["state"].isin(multiplier.index)]  # drops any regions that do not have cost multipliers
-
-    # log any states that do not have multipliers attached
-    missed = gen[~gen["state"].isin(multiplier.index)]
-    if not missed.empty:
-        logger.warning(f"CAPEX cost multiplier not applied to {missed.state.unique()}")
-
-    # apply multiplier to annualized capital investment cost
-    gen["annualized_capex_per_mw"] = gen.apply(
-        lambda x: costs.at[carrier, "annualized_capex_per_mw"] * multiplier.at[x["state"], "Location Variation"],
-        axis=1,
-    )
-
-    # get fixed costs based on overnight capital costs with multiplier applied
-    gen["fom"] = costs.at[carrier, "opex_fixed_per_kw"] * 1e3
-
-    # find final annualized capital cost
-    gen["capital_cost"] = gen["annualized_capex_per_mw"] + gen["fom"]
-
-    # overwrite network generator dataframe with updated values
-    n.generators.loc[gen.index] = gen
-
-
-def apply_dynamic_pricing(
-    n: pypsa.Network,
-    carrier: str,
-    geography: str,
-    df: pd.DataFrame,
-    vom: float = 0,
-):
+    FOM for transmission is a fixed percentage of capex, so once capex varies by
+    line the FOM has to vary with it -- hence one combined factor rather than the
+    single pre-annualized ``annualized_capex_per_mw_km_fom`` figure this used to
+    read out of the cost table.
     """
-    Applies user-supplied dynamic pricing.
+    needed = ["cost_recovery_period_years", "wacc_real", "opex_fixed_pct_of_capex"]
+    values = {}
+    for parameter in needed:
+        try:
+            value = float(costs.at[technology, parameter])
+        except KeyError as exc:
+            raise KeyError(f"Cost table has no {parameter!r} for {technology!r}.") from exc
+        # A blank cell pivots to NaN, which would silently make every line free
+        # rather than failing, so it is rejected here instead.
+        if not np.isfinite(value):
+            raise ValueError(f"Cost table has no finite {parameter!r} for {technology!r}.")
+        values[parameter] = value
 
-    Arguments
-    ---------
-    n: pypsa.Network,
-    carrier: str,
-        carrier to apply fuel cost data to (ie. Gas)
-    geography: str,
-        column of geography to search over (ie. balancing_area, state, reeds_zone, ...)
-    df: pd.DataFrame,
-        Fuel costs data
-    vom: float = 0
-        Additional flat $/MWh cost to add onto the fuel costs
+    annuity = calculate_annuity(values["cost_recovery_period_years"], values["wacc_real"])
+    return float(annuity + values["opex_fixed_pct_of_capex"])
+
+
+def update_transmission_costs(
+    n,
+    costs,
+    length_factor: float = 1.0,
+    *,
+    distance_cost_fn: str,
+    basecost_fn: str,
+):
+    """Price AC lines and DC links by voltage class and by route region.
+
+    Both components are costed per **great-circle km**: ``n.lines.length`` already
+    carries ``length_factor`` from ``build_base_network.assign_line_length``, so it
+    is divided back out rather than multiplied again, and the ReEDS unit costs
+    already embed route detour in the price (their ``length_miles`` is a
+    centroid-to-centroid great-circle distance). Applying ``length_factor`` twice --
+    as this did, giving AC lines 1.25^2 while links got 1.25 -- double counts it.
+
+    ``capital_cost`` stays exactly proportional to ``length``, which is what makes
+    the three aggregation passes downstream preserve it: parallel merging averages
+    it by capacity, series merging sums cost and length together, and pypsa's
+    ``length_capacity_weighted_average`` rebuilds it as
+    ``new_length * capacity-weighted mean unit cost``.
+
+    Links are handled by :func:`recompute_link_transmission_costs` off two stored
+    columns instead, because their endpoints move under aggregation while pypsa
+    does not rescale their cost.
     """
-    assert geography in n.buses.columns
+    basecost = load_transmission_basecost(basecost_fn)
+    voltage_exponent = voltage_cost_exponent(voltage_cost_anchors(basecost))
+    pair_table = load_transmission_pair_costs(distance_cost_fn)
+    pair_costs = pair_unit_costs(pair_table)
+    field = county_unit_cost_field(pair_table)
 
-    gens = n.generators.copy()
-    gens[geography] = gens.bus.map(n.buses[geography])
-    gens = gens[(gens.carrier == carrier) & (gens[geography].isin(df.columns))]
+    # ReEDS quotes both tables in 2004 USD; the rest of the workflow is 2022 USD.
+    to_usd2022 = get_currency_conversion_factor(REEDS_TRANSMISSION_COST_YEAR, "USD")
+    bus_county = n.buses.get("county")
+    if bus_county is None:
+        raise ValueError(
+            "n.buses has no 'county' column; transmission costs need it to resolve the "
+            "route region. It is assigned in build_base_network and dropped later in "
+            "simplify_network, so update_transmission_costs must run before that.",
+        )
 
-    if gens.empty:
-        return
+    def unit_cost_usd2022(branches):
+        return (
+            transmission_unit_costs(
+                bus_county.reindex(branches["bus0"]).set_axis(branches.index),
+                bus_county.reindex(branches["bus1"]).set_axis(branches.index),
+                pair_costs,
+                field,
+            )
+            * to_usd2022
+        )
 
-    eff = n.get_switchable_as_dense("Generator", "efficiency").T
-    eff = eff[eff.index.isin(gens.index)].T
-    eff.columns.name = ""
-
-    fuel_cost_per_gen = {gen: df[gens.at[gen, geography]] for gen in gens.index}
-    fuel_costs = pd.DataFrame.from_dict(fuel_cost_per_gen)
-    fuel_costs.index = pd.to_datetime(fuel_costs.index)
-    fuel_costs = broadcast_investment_horizons_index(n, fuel_costs)
-
-    marginal_costs = fuel_costs.div(eff, axis=1)
-    marginal_costs = marginal_costs + vom
-
-    # drop any data that has been assigned at a coarser resolution
-    n.generators_t["marginal_cost"] = n.generators_t["marginal_cost"][
-        [x for x in n.generators_t["marginal_cost"] if x not in marginal_costs]
-    ]
-
-    # assign new marginal costs
-    n.generators_t["marginal_cost"] = n.generators_t["marginal_cost"].join(
-        marginal_costs,
-        how="inner",
-    )
-
-
-def update_transmission_costs(n, costs, length_factor=1.0):
-    # TODO: line length factor of lines is applied to lines and links.
-    # Separate the function to distinguish
-    n.lines["capital_cost"] = (
-        n.lines["length"] * length_factor * costs.at["HVAC overhead", "annualized_capex_per_mw_km"]
-    )
+    if not n.lines.empty:
+        ac_factor = _annualization_factor(costs, "HVAC overhead")
+        n.lines["capital_cost"] = (
+            unit_cost_usd2022(n.lines)
+            * voltage_ratio(n.lines["v_nom"], voltage_exponent)
+            * ac_factor
+            * (n.lines["length"] / length_factor)
+        )
+        per_km = n.lines["capital_cost"] / n.lines["length"].where(n.lines["length"] > 0)
+        logger.info(
+            "AC line annualized cost per network-km: min=%.0f median=%.0f max=%.0f USD2022/MW/km.",
+            per_km.min(),
+            per_km.median(),
+            per_km.max(),
+        )
 
     if n.links.empty:
         return
 
-    dc_b = n.links.carrier == "DC"
-
-    # If there are no dc links, then the 'underwater_fraction' column
-    # may be missing. Therefore we have to return here.
-    if n.links.loc[dc_b].empty:
+    transmission = n.links.index[n.links.carrier.isin(["AC", "DC"])]
+    if transmission.empty:
         return
 
-    costs = (
-        n.links.loc[dc_b, "length"]
-        * length_factor
-        * (
-            (1.0 - n.links.loc[dc_b, "underwater_fraction"]) * costs.at["HVDC overhead", "annualized_capex_per_mw_km"]
-            + n.links.loc[dc_b, "underwater_fraction"] * costs.at["HVDC submarine", "annualized_capex_per_mw_km"]
-        )
-        + costs.at["HVDC inverter pair", "annualized_capex_per_mw"]
+    links = n.links.loc[transmission]
+    dc_ratio = dc_ac_line_cost_ratio(basecost)
+    unit = unit_cost_usd2022(links)
+
+    # DC corridors are 500 kV bipoles, so the AC voltage ratio is 1.0 by
+    # construction and only the DC/AC line ratio applies. An AC-carrier transport
+    # link is priced as a 500 kV AC line with no converters.
+    is_dc = links.carrier == "DC"
+    line_ratio = pd.Series(1.0, index=transmission).where(~is_dc, dc_ratio)
+    factor = pd.Series(_annualization_factor(costs, "HVAC overhead"), index=transmission).where(
+        ~is_dc,
+        _annualization_factor(costs, "HVDC overhead"),
     )
-    n.links.loc[dc_b, "capital_cost"] = costs
+
+    n.links[LINK_UNIT_COST_COL] = 0.0
+    n.links[LINK_FIXED_COST_COL] = 0.0
+    n.links.loc[transmission, LINK_UNIT_COST_COL] = unit * line_ratio * factor
+    n.links.loc[transmission, LINK_FIXED_COST_COL] = np.where(
+        is_dc,
+        costs.at["HVDC inverter pair", "annualized_capex_fom"],
+        0.0,
+    )
+    recompute_link_transmission_costs(n)
 
 
 def load_powerplants(
@@ -265,7 +290,7 @@ def match_nearest_bus(plants_subset, buses_subset):
     )
 
     # Map the nearest bus information back to the plants subset
-    plants_subset["bus_assignment"] = buses_subset.reset_index().iloc[indices.flatten()]["Bus"].values
+    plants_subset["bus_assignment"] = buses_subset.index.to_numpy()[indices.flatten()]
     plants_subset["distance_nearest"] = distances.flatten()
 
     return plants_subset
@@ -273,8 +298,8 @@ def match_nearest_bus(plants_subset, buses_subset):
 
 def match_plant_to_bus(n, plants):
     """
-    Matches each plant to it's corresponding bus in the network enfocing a
-    match to the correct State.
+    Matches each plant to it's corresponding bus in the network, keeping the
+    match inside the region the plant was located in.
 
     Efficient matching taken from:
     https://stackoverflow.com/questions/58893719/find-nearest-point-in-other-dataframe-with-a-lot-of-data
@@ -283,24 +308,84 @@ def match_plant_to_bus(n, plants):
     plants_matched["bus_assignment"] = None
     plants_matched["distance_nearest"] = None
 
-    # Get a copy of buses and create a geometry column with GPS coordinates
     buses = n.buses.copy()
-    buses["geometry"] = gpd.points_from_xy(buses["x"], buses["y"])
 
-    # First pass: Assign each plant to the nearest bus in the same reeds zone
-    for zone_id in buses["reeds_zone"].unique():
-        buses_in_zone = buses[buses["reeds_zone"] == zone_id]
-        plants_in_zone = plants_matched[
-            (plants_matched["country"] == zone_id) & (plants_matched["bus_assignment"].isnull())
-        ]
+    # First pass: the raw bus-region GeoJSON is named by substation ID, while
+    # the unsimplified network is indexed by individual bus ID.  Select one
+    # existing bus per substation so a plant remains inside the region that
+    # owns its ground.  Once transformers/substations are collapsed downstream,
+    # all such representatives map to the same final bus.
+    n_in_region = 0
+    region_bus = plants_matched.get("name")
+    if region_bus is not None:
+        if "sub_id" in buses.columns:
+            sub_to_bus = (
+                pd.DataFrame(
+                    {
+                        "sub_id": normalize_bus_keys(buses.sub_id).to_numpy(),
+                        "bus_id": buses.index.to_numpy(),
+                    },
+                )
+                .drop_duplicates("sub_id")
+                .set_index("sub_id")
+                .bus_id
+            )
+            assigned = normalize_bus_keys(region_bus).map(sub_to_bus)
+        else:
+            assigned = region_bus.astype(str)
+        in_region = assigned.isin(buses.index).to_numpy()
+        n_in_region = int(in_region.sum())
+        assigned = assigned[in_region]
+        plants_matched.loc[in_region, "bus_assignment"] = assigned.to_numpy()
+        plants_matched.loc[in_region, "distance_nearest"] = np.hypot(
+            plants_matched.loc[in_region, "longitude"].to_numpy(dtype=float) - buses.loc[assigned.to_numpy(), "x"].to_numpy(),
+            plants_matched.loc[in_region, "latitude"].to_numpy(dtype=float) - buses.loc[assigned.to_numpy(), "y"].to_numpy(),
+        )
 
-        # Update plants_matched with the nearest bus within the same REEDS zone
-        plants_matched.update(match_nearest_bus(plants_in_zone, buses_in_zone))
+    # Second pass: use a county/FIPS constraint whenever the source provides
+    # one.  Existing PHS has plant coordinates and county FIPS, while buses
+    # carry the same `p`-prefixed FIPS code in their `county` field.
+    n_in_county = 0
+    if "county" in plants_matched.columns and "county" in buses.columns:
+        county = plants_matched.county.astype(str).str.strip()
+        available_counties = set(buses.county.dropna().astype(str))
+        for county_id in county[county.isin(available_counties)].unique():
+            buses_in_county = buses[buses.county.astype(str) == county_id]
+            plants_in_county = plants_matched[
+                (county == county_id) & plants_matched.bus_assignment.isnull()
+            ].copy()
+            matched = match_nearest_bus(plants_in_county, buses_in_county)
+            n_in_county += len(matched)
+            plants_matched.update(matched)
 
-    # Second pass: Assign any remaining unmatched plants to the nearest bus regardless of REEDS zone
-    unmatched_plants = plants_matched[plants_matched["bus_assignment"].isnull()]
+    # Third pass: inputs that arrive with a ReEDS zone label instead of a
+    # region -- PHS uses this as a fallback when its county has no bus.
+    n_in_zone = 0
+    if "country" in plants_matched.columns:
+        for zone_id in buses["reeds_zone"].unique():
+            buses_in_zone = buses[buses["reeds_zone"] == zone_id]
+            plants_in_zone = plants_matched[
+                (plants_matched["country"] == zone_id) & (plants_matched["bus_assignment"].isnull())
+            ].copy()
+
+            matched = match_nearest_bus(plants_in_zone, buses_in_zone)
+            n_in_zone += len(matched)
+            plants_matched.update(matched)
+
+    # Final pass: whatever is left -- offshore units pulled in by the ReEDS shape
+    # fallback, mostly -- goes to the nearest bus regardless of region or zone.
+    unmatched_plants = plants_matched[plants_matched["bus_assignment"].isnull()].copy()
     if not unmatched_plants.empty:
         plants_matched.update(match_nearest_bus(unmatched_plants, buses))
+
+    logger.info(
+        "Matched %s of %s plants to the bus owning their region, %s to the nearest bus in their county, %s to the nearest bus in their zone, %s to the nearest bus anywhere.",
+        n_in_region,
+        len(plants_matched),
+        n_in_county,
+        n_in_zone,
+        len(unmatched_plants),
+    )
 
     return plants_matched
 
@@ -390,22 +475,42 @@ def filter_plants_by_region(
     return pd.DataFrame(plants_filt)
 
 
-def attach_renewable_capacities_to_atlite(
+def attach_existing_renewable_capacities(
     n: pypsa.Network,
     plants_df: pd.DataFrame,
     renewable_carriers: list,
+    costs: pd.DataFrame,
 ):
     plants = plants_df.query(
         "bus_assignment in @n.buses.index",
     )
+    planning_horizon = n.investment_periods[0]
     for tech in renewable_carriers:
         plants_filt = plants.query("carrier == @tech").copy()
         if plants_filt.empty:
             continue
 
+        # Existing plants whose technical lifetime ends at or before the planning
+        # horizon won't survive to it, so they shouldn't count as capacity the
+        # model must keep -- only carry forward those still operating past it.
+        lifetime = costs.at[tech, "lifetime"]
+        plants_filt = plants_filt[plants_filt.build_year + lifetime > planning_horizon]
+        if plants_filt.empty:
+            continue
+
+        # `simplify_network` aggregates the grid onto its substations, so the bus
+        # index *is* the substation id from that point on and the separate
+        # `sub_id` column is gone. Fall back to the bus itself so existing
+        # capacity still lands on the same key the generators carry.
+        sub_of_bus = (
+            n.buses["sub_id"]
+            if "sub_id" in n.buses.columns
+            else pd.Series(n.buses.index, index=n.buses.index)
+        )
+
         generators_tech = n.generators[n.generators.carrier == tech].copy()
-        generators_tech["sub_assignment"] = generators_tech.bus.map(n.buses.sub_id)
-        plants_filt["sub_assignment"] = plants_filt.bus_assignment.map(n.buses.sub_id)
+        generators_tech["sub_assignment"] = generators_tech.bus.map(sub_of_bus)
+        plants_filt["sub_assignment"] = plants_filt.bus_assignment.map(sub_of_bus)
 
         build_year_avg = plants_filt.groupby(["sub_assignment"])[plants_filt.columns].apply(
             lambda x: pd.Series(
@@ -433,6 +538,13 @@ def attach_renewable_capacities_to_atlite(
         mapped_values = generators_tech.sub_assignment.map(caps_per_bus).dropna()
         n.generators.loc[mapped_values.index, "p_nom"] = mapped_values
         n.generators.loc[mapped_values.index, "p_nom_min"] = mapped_values
+        # Installed capacity can exceed the atlite-derived resource potential
+        # (data mismatch/clustering artifacts); widen p_nom_max to match so the
+        # generator stays feasible (p_nom_min must never exceed p_nom_max).
+        n.generators.loc[mapped_values.index, "p_nom_max"] = n.generators.loc[
+            mapped_values.index,
+            "p_nom_max",
+        ].clip(lower=mapped_values)
         mapped_values = generators_tech.sub_assignment.map(
             build_year_avg.build_year,
         ).dropna()
@@ -500,8 +612,6 @@ def attach_conventional_generators(
         ),  # enforces that plants cannot be retired/sold-off at their capital cost
         p_nom=plants.p_nom.where(plants.carrier.isin(conventional_carriers), 0),
         p_nom_extendable=plants.carrier.isin(extendable_carriers["Generator"]),
-        ramp_limit_up=plants.ramp_limit_up,
-        ramp_limit_down=plants.ramp_limit_down,
         efficiency=plants.efficiency.round(3),
         marginal_cost=plants.marginal_cost,
         capital_cost=plants.annualized_capex_fom,
@@ -520,8 +630,119 @@ def attach_conventional_generators(
     n.generators.loc[plants.index, "ba_eia"] = plants.balancing_authority_code
 
 
+def add_existing_phs(n: pypsa.Network, data_file: str):
+    """
+    Add existing pumped hydro storage units (ReEDS/NEMS generator database)
+    to the network, matching each unit to its nearest bus by coordinates.
+    """
+    data = pd.read_csv(data_file)
+
+    phs = data[data["tech"] == "pumped-hydro"][
+        ["cap", "reeds_ba", "FIPS", "T_LAT", "T_LONG", "T_FOM"]
+    ].copy()
+    phs = phs.rename(
+        columns={
+            "reeds_ba": "country",
+            "FIPS": "county",
+            "T_LAT": "latitude",
+            "T_LONG": "longitude",
+        },
+    )
+    for col in ["cap", "T_FOM", "latitude", "longitude"]:
+        phs[col] = pd.to_numeric(phs[col], errors="coerce")
+    phs["county"] = phs.county.astype(str).str.strip()
+    phs = phs.dropna(subset=["cap", "T_FOM", "latitude", "longitude"])
+    if phs.empty:
+        logger.info("No existing PHS units found in %s.", data_file)
+        return
+
+    phs = match_plant_to_bus(n, phs)
+    phs = phs.dropna(subset=["bus_assignment"])
+    if phs.empty:
+        logger.info("No existing PHS units could be matched to a bus.")
+        return
+
+    # Aggregate units sharing a bus: sum capacity, capacity-weighted average T_FOM.
+    phs_aggregated = phs.groupby("bus_assignment").agg(
+        cap=("cap", "sum"),
+        T_FOM=(
+            "T_FOM",
+            lambda x: (
+                (x * phs.loc[x.index, "cap"]).sum() / phs.loc[x.index, "cap"].sum()
+                if phs.loc[x.index, "cap"].sum() > 0
+                else x.mean()
+            ),
+        ),
+    )
+
+    efficiency_store = 0.894427191  # 0.894427191^2 = 0.8
+    efficiency_dispatch = 0.894427191  # 0.894427191^2 = 0.8
+
+    capital_cost = phs_aggregated["T_FOM"].values * 1000
+
+    add_missing_carriers(n, ["PHS"])
+    n.carriers.loc["PHS", "co2_emissions"] = 0
+
+    n.madd(
+        "StorageUnit",
+        names=phs_aggregated.index,
+        suffix=" PHS",
+        bus=phs_aggregated.index,
+        carrier="PHS",
+        p_nom_extendable=False,
+        p_nom=phs_aggregated["cap"].values,
+        p_nom_max=phs_aggregated["cap"].values,
+        capital_cost=capital_cost,
+        marginal_cost=0,
+        efficiency_store=efficiency_store,
+        efficiency_dispatch=efficiency_dispatch,
+        max_hours=553.0 / 23.0 / efficiency_dispatch,
+        cyclic_state_of_charge=True,
+        lifetime=np.inf,
+    )
+
+    logger.info(
+        "Added %d existing PHS storage units (%.1f MW total) matched to buses by coordinates.",
+        len(phs_aggregated),
+        phs_aggregated["cap"].sum(),
+    )
+
+
 def normed(s):
     return s / s.sum()
+
+
+def normalize_bus_keys(values) -> pd.Series:
+    """Canonicalize numeric bus/substation IDs read from CSV and NetCDF.
+
+    GeoPandas writes the region name as a float in this dataset (``1.0``),
+    while the base-network and bus2sub CSV use integral strings (``1``).
+    Keeping that distinction would make every profile generator reference an
+    undefined bus.
+    """
+    keys = pd.Series(values, copy=True).astype(str).str.strip()
+    numeric = pd.to_numeric(keys, errors="coerce")
+    integral = numeric.notna() & np.isclose(numeric % 1, 0.0)
+    keys.loc[integral] = numeric.loc[integral].astype(np.int64).astype(str)
+    return keys
+
+
+def load_sub_to_bus(input_profiles) -> pd.DataFrame:
+    """Map raw substation ids to raw buses before topology reduction."""
+    bus2sub = pd.read_csv(input_profiles.bus2sub, dtype=str)
+    bus_column = "bus_id" if "bus_id" in bus2sub.columns else "Bus"
+    required = {"sub_id", bus_column}
+    if not required.issubset(bus2sub.columns):
+        raise ValueError(f"bus2sub must contain {sorted(required)}.")
+    return (
+        pd.DataFrame(
+            {
+                "sub_id": normalize_bus_keys(bus2sub["sub_id"]),
+                "bus_id": bus2sub[bus_column].astype(str),
+            },
+        )
+        .drop_duplicates("sub_id")
+    )
 
 
 def attach_wind_and_solar(
@@ -530,129 +751,79 @@ def attach_wind_and_solar(
     input_profiles: str,
     carriers: list[str],
     extendable_carriers: dict[str, list[str]],
-    config: dict,
+    source_timesteps=None,
+    cost_multipliers: dict | None = None,
 ):
     add_missing_carriers(n, carriers)
 
-    # Check if we're using horizon-specific profiles
-    godeeep_future = (
-        config.get("renewable", {}).get("dataset") == "godeeep" and config["renewable_scenarios"][0] != "historical"
-    )
+    # Wind/solar get no ReEDS reg_cap_cost_diff multiplier (that table has no
+    # wind/UPV column). Their regional cost differentiation is the per-site
+    # interconnection cost the profiles already carry; see regional_cost.py.
+    use_reeds_interconnection = bool((cost_multipliers or {}).get("enable", False))
 
     for car in carriers:
         if car in ["hydro", "EGS"]:
             continue
 
         capital_cost = costs.at[car, "annualized_capex_fom"]
+        sub_to_bus = load_sub_to_bus(input_profiles).set_index("sub_id").bus_id
 
-        bus2sub = (
-            pd.read_csv(input_profiles.bus2sub, dtype=str)
-            .drop("interconnect", axis=1)
-            .rename(columns={"Bus": "bus_id"})
-            .drop_duplicates(subset="sub_id")
-        )
-
-        # For GODEEEP future scenarios, load horizon-specific profiles
-        if godeeep_future:
-            # Load horizon-specific profiles and concatenate
-            logger.info(f"Loading multi-horizon {car} profiles for planning horizons: {n.investment_periods.tolist()}")
-
-            all_profiles = []
-            p_nom_max_bus = None
-            weight_bus = None
-            bus_list = None
-
-            for horizon in n.investment_periods:
-                profile_attr = f"profile_{car}_{horizon}"
-                if not hasattr(input_profiles, profile_attr):
-                    raise ValueError(f"Missing profile for {car} at horizon {horizon}")
-
-                with xr.open_dataset(getattr(input_profiles, profile_attr)) as ds:
-                    if ds.indexes["bus"].empty:
-                        continue
-
-                    # Get bus list
-                    if bus_list is None:
-                        bus_list = ds.bus.to_dataframe("sub_id").merge(bus2sub).bus_id.astype(str).values
-
-                        # Get p_nom_max and weight
-                        p_nom_max_bus = (
-                            ds["p_nom_max"]
-                            .to_dataframe()
-                            .merge(bus2sub[["bus_id", "sub_id"]], left_on="bus", right_on="sub_id")
-                            .set_index("bus_id")
-                            .p_nom_max
-                        )
-                        weight_bus = (
-                            ds["weight"]
-                            .to_dataframe()
-                            .merge(bus2sub[["bus_id", "sub_id"]], left_on="bus", right_on="sub_id")
-                            .set_index("bus_id")
-                            .weight
-                        )
-
-                    # Get profile for this horizon
-                    horizon_profile = (
-                        ds["profile"]
-                        .transpose("time", "bus")
-                        .to_pandas()
-                        .T.merge(
-                            bus2sub[["bus_id", "sub_id"]],
-                            left_on="bus",
-                            right_on="sub_id",
-                        )
-                        .set_index("bus_id")
-                        .drop(columns="sub_id")
-                        .T
-                    )
-
-                    # Update timestamps to match the horizon year
-                    horizon_profile.index = horizon_profile.index.map(lambda x: x.replace(year=int(horizon)))
-                    all_profiles.append(horizon_profile)
-
-            # Concatenate all horizon profiles
-            bus_profiles = pd.concat(all_profiles)
-
-            # Align with network snapshots (which should already be multi-indexed)
-            bus_profiles = bus_profiles.reindex(n.snapshots.get_level_values(1))
-            bus_profiles.index = n.snapshots
-
-        else:
-            # Single profile
-            with xr.open_dataset(getattr(input_profiles, "profile_" + car)) as ds:
-                if ds.indexes["bus"].empty:
-                    continue
-
-                bus_list = ds.bus.to_dataframe("sub_id").merge(bus2sub).bus_id.astype(str).values
-                p_nom_max_bus = (
-                    ds["p_nom_max"]
-                    .to_dataframe()
-                    .merge(bus2sub[["bus_id", "sub_id"]], left_on="bus", right_on="sub_id")
-                    .set_index("bus_id")
-                    .p_nom_max
+        with xr.open_dataset(getattr(input_profiles, "profile_" + car)) as ds:
+            if ds.indexes["bus"].empty:
+                continue
+            profile_sub_ids = normalize_bus_keys(ds.bus.values)
+            bus_list = profile_sub_ids.map(sub_to_bus)
+            missing = profile_sub_ids[bus_list.isna()]
+            if not missing.empty:
+                raise ValueError(
+                    f"{car} profile has {len(missing)} substation IDs absent from bus2sub "
+                    f"(first: {missing.iloc[0]}).",
                 )
-                weight_bus = (
-                    ds["weight"]
-                    .to_dataframe()
-                    .merge(bus2sub[["bus_id", "sub_id"]], left_on="bus", right_on="sub_id")
-                    .set_index("bus_id")
-                    .weight
-                )
-                bus_profiles = (
-                    ds["profile"]
-                    .transpose("time", "bus")
-                    .to_pandas()
-                    .T.merge(
-                        bus2sub[["bus_id", "sub_id"]],
-                        left_on="bus",
-                        right_on="sub_id",
-                    )
-                    .set_index("bus_id")
-                    .drop(columns="sub_id")
-                    .T
-                )
-                # Broadcast single profile across all horizons
-                bus_profiles = broadcast_investment_horizons_index(n, bus_profiles)
+            # `Network.madd` treats a Series as an indexed static attribute;
+            # use an Index so its *values*, not its 0..N positional index, are
+            # supplied as the Generator.bus values.
+            bus_list = pd.Index(bus_list.astype(str).to_numpy())
+            p_nom_max_bus = ds["p_nom_max"].to_pandas().set_axis(bus_list)
+            weight_bus = ds["weight"].to_pandas().set_axis(bus_list)
+            bus_profiles = ds["profile"].transpose("time", "bus").to_pandas()
+            bus_profiles.columns = bus_list
+            # Slice to representative hours, or broadcast across all horizons
+            bus_profiles = align_timeseries_to_snapshots(n, bus_profiles, source_timesteps)
+            # Per-site ReEDS interconnection cost. Taken as a bare array so it
+            # aligns positionally with bus_list, which was built from this same
+            # `bus` dimension just above -- no index alignment involved.
+            cost_trans = (
+                np.nan_to_num(ds["cost_trans_usd_per_mw"].to_pandas().to_numpy(), nan=0.0)
+                if "cost_trans_usd_per_mw" in ds
+                else None
+            )
+
+        if use_reeds_interconnection and cost_trans is not None:
+            annuity_factor = calculate_annuity(
+                costs.at[car, "cost_recovery_period_years"],
+                costs.at[car, "wacc_real"],
+            )
+            capital_cost = renewable_interconnection_capital_cost(
+                costs.at[car, "capex_overnight_per_kw"],
+                costs.at[car, "capex_construction_finance_factor"],
+                costs.at[car, "opex_fixed_per_kw"],
+                cost_trans,
+                annuity_factor,
+            )
+            logger.info(
+                "%s: replaced ATB grid connection (%.1f USD/kW) with ReEDS per-site "
+                "interconnection cost (min=%.0f mean=%.0f max=%.0f USD/MW).",
+                car,
+                costs.at[car, "capex_grid_connection_per_kw"],
+                cost_trans.min(),
+                cost_trans.mean(),
+                cost_trans.max(),
+            )
+        elif use_reeds_interconnection:
+            logger.warning(
+                "%s profile has no cost_trans_usd_per_mw; keeping the uniform ATB capital cost.",
+                car,
+            )
 
         logger.info(f"Adding {car} capacity-factor profiles to the network.")
 
@@ -681,6 +852,7 @@ def attach_egs(
     carriers: list[str],
     extendable_carriers: dict[str, list[str]],
     line_length_factor=1,
+    source_timesteps=None,
 ):
     """
     Attached STM Calculated wind and solar capacity factor profiles to the
@@ -689,6 +861,12 @@ def attach_egs(
     car = "EGS"
     if (car not in carriers) and (car not in extendable_carriers["Generator"]):
         return
+    if source_timesteps is not None:
+        raise NotImplementedError(
+            "EGS profiles are indexed by (year, Date) rather than a plain weather-hour index, so they "
+            "cannot yet be sliced to representative hours. Disable EGS or "
+            "clustering.temporal.representative_periods.",
+        )
     add_missing_carriers(n, carriers)
     capital_recovery_period = 25  # Following EGS supply curves by Aljubran et al. (2024)
     discount_rate = 0.07  # load_costs(snakemake.input.tech_costs).loc["geothermal", "wacc_real"]
@@ -702,15 +880,13 @@ def attach_egs(
             getattr(input_profiles, "profile_egs"),
         ) as ds_profile,
     ):
-        bus2sub = (
-            pd.read_csv(input_profiles.bus2sub, dtype=str)
-            .drop("interconnect", axis=1)
-            .rename(columns={"Bus": "bus_id"})
-        )
+        bus2sub = load_sub_to_bus(input_profiles)
 
         # IGNORE: Remove dropna(). Rather, apply dropna when creating the original dataset
+        specs = ds_specs.to_dataframe().reset_index().dropna()
+        specs["sub_id"] = normalize_bus_keys(specs["sub_id"])
         df_specs = pd.merge(
-            ds_specs.to_dataframe().reset_index().dropna(),
+            specs,
             bus2sub,
             on="sub_id",
             how="left",
@@ -752,8 +928,10 @@ def attach_egs(
             efficiency = df_q["efficiency"]  # for now.
 
             # IGNORE: Remove dropna(). Rather, apply dropna when creating the original dataset
+            profile = ds_profile.sel(Quality=q).to_dataframe().dropna().reset_index()
+            profile["sub_id"] = normalize_bus_keys(profile["sub_id"])
             df_q_profile = pd.merge(
-                ds_profile.sel(Quality=q).to_dataframe().dropna().reset_index(),
+                profile,
                 bus2sub,
                 on="sub_id",
                 how="left",
@@ -826,6 +1004,23 @@ def broadcast_investment_horizons_index(n: pypsa.Network, df: pd.DataFrame):
     investment periods of a PyPSA network.
     """
     sns = n.snapshots
+    if isinstance(sns, pd.MultiIndex):
+        source_index = pd.DatetimeIndex(df.index)
+        target_times = pd.DatetimeIndex(sns.get_level_values("timestep"))
+        period_count = len(n.investment_periods)
+        if (
+            len(df) * period_count == len(sns)
+            and all(
+                target_times[sns.get_level_values("period") == period].equals(
+                    source_index,
+                )
+                for period in n.investment_periods
+            )
+        ):
+            broadcast = pd.concat([df.copy() for _ in n.investment_periods], ignore_index=True)
+            broadcast.index = sns
+            return broadcast
+
     if not len(df.index) == len(sns):  # if broadcasting is necessary
         df.index = pd.to_datetime(df.index)
         dfs = []
@@ -845,38 +1040,29 @@ def broadcast_investment_horizons_index(n: pypsa.Network, df: pd.DataFrame):
     return df
 
 
-def apply_seasonal_capacity_derates(
+def align_timeseries_to_snapshots(
     n: pypsa.Network,
-    plants: pd.DataFrame,
-    conventional_carriers: list,
-    sns: pd.DatetimeIndex,
+    df: pd.DataFrame,
+    source_timesteps=None,
+    calendar_year_profile: bool = False,
 ):
-    """Applies conventional rerate factor p_max_pu based on the seasonal capacity derates defined in eia860."""
-    sns_dt = sns.get_level_values(1)
-    summer_sns = sns_dt[sns_dt.month.isin([6, 7, 8])]
-    winter_sns = sns_dt[~sns_dt.month.isin([6, 7, 8])]
+    """
+    Attach a raw source time series to the network snapshots.
 
-    # conventional_carriers = ['geothermal'] # testing override impact
+    When representative periods are active, ``source_timesteps`` gives the real
+    weather hour behind each (synthetic) snapshot, so the series is sliced down to
+    those hours instead of broadcast across a full timeline.
 
-    conv_plants = plants.query("carrier in @conventional_carriers")
-    conv_plants.index = "C" + conv_plants.index
-    conv_gens = n.generators.query("carrier in @conventional_carriers")
-
-    p_max_pu = pd.DataFrame(1.0, index=sns_dt, columns=conv_gens.index)
-    p_max_pu.loc[summer_sns, conv_gens.index] *= conv_plants.loc[
-        :,
-        "summer_derate",
-    ].astype(float)
-    p_max_pu.loc[winter_sns, conv_gens.index] *= conv_plants.loc[
-        :,
-        "winter_derate",
-    ].astype(float)
-
-    p_max_pu = broadcast_investment_horizons_index(n, p_max_pu)
-    n.generators_t.p_max_pu = pd.concat(
-        [n.generators_t.p_max_pu, p_max_pu],
-        axis=1,
-    ).round(3)
+    Set ``calendar_year_profile`` for inputs published on one canonical year
+    (e.g. the Breakthrough hydro profiles) rather than on the real weather years:
+    those are matched by (month, day, hour), since they carry no weather-hour
+    identity to slice on.
+    """
+    if source_timesteps is not None:
+        if calendar_year_profile:
+            return reindex_calendar_timeseries_to_snapshots(n, df, source_timesteps)
+        return reindex_source_timeseries_to_snapshots(n, df, source_timesteps)
+    return broadcast_investment_horizons_index(n, df)
 
 
 def apply_must_run_ratings(
@@ -912,7 +1098,6 @@ def clean_bus_data(n: pypsa.Network):
         # "Pd",
         "load_dissag",
         "LAF",
-        "LAF_state",
     ]
     n.buses = n.buses.drop(columns=[col for col in col_list if col in n.buses])
 
@@ -923,6 +1108,7 @@ def attach_breakthrough_renewable_plants(
     renewable_carriers,
     extendable_carriers,
     costs,
+    source_timesteps=None,
 ):
     add_missing_carriers(n, renewable_carriers)
 
@@ -958,7 +1144,13 @@ def attach_breakthrough_renewable_plants(
 
         leap_day = p_max_pu.loc["2016-02-29 00:00:00":"2016-02-29 23:00:00"]
         p_max_pu = p_max_pu.drop(leap_day.index)
-        p_max_pu = broadcast_investment_horizons_index(n, p_max_pu)
+        # Breakthrough profiles live on a fixed 2016 calendar, not on the weather years.
+        p_max_pu = align_timeseries_to_snapshots(
+            n,
+            p_max_pu,
+            source_timesteps,
+            calendar_year_profile=True,
+        )
 
         n.madd(
             "Generator",
@@ -977,56 +1169,38 @@ def attach_breakthrough_renewable_plants(
     return n
 
 
-def apply_pudl_fuel_costs(
-    n,
-    plants,
-    costs,
-):
-    # Apply PuDL Fuel Costs for plants where listed
-    pudl_fuel_costs = pd.read_csv(snakemake.input["pudl_fuel_costs"], index_col=0)
-
-    # Check if any of the plants are in the pudl fuel costs
-    if not set(plants.index).intersection(pudl_fuel_costs.columns):
-        return n
-
-    # Construct the VOM table for each generator by carrier
-    vom = pd.DataFrame(index=pudl_fuel_costs.columns)
-    for gen in pudl_fuel_costs.columns:
-        if gen not in plants.index:
-            continue
-        carrier = plants.loc[gen, "carrier"]
-        if carrier not in costs.index:
-            continue
-        vom.loc[gen, "VOM"] = costs.at[carrier, "opex_variable_per_mwh"]
-
-    # Apply the VOM to the fuel costs
-    pudl_fuel_costs = pudl_fuel_costs + vom.squeeze()
-    pudl_fuel_costs = broadcast_investment_horizons_index(n, pudl_fuel_costs)
-
-    # Drop any columns that are not in the network
-    pudl_fuel_costs.columns = "C" + pudl_fuel_costs.columns
-    pudl_fuel_costs = pudl_fuel_costs[[x for x in pudl_fuel_costs.columns if x in n.generators.index]]
-
-    # drop any data that has been assigned at a coarser resolution
-    n.generators_t["marginal_cost"] = n.generators_t["marginal_cost"][
-        [x for x in n.generators_t["marginal_cost"] if x not in pudl_fuel_costs]
-    ]
-
-    # assign new marginal costs
-    n.generators_t["marginal_cost"] = n.generators_t["marginal_cost"].join(
-        pudl_fuel_costs,
-    )
-    logger.info(
-        f"Applied PuDL fuel costs to {len(pudl_fuel_costs.columns)} generators.",
-    )
-    return n
-
-
 def main(snakemake):
     params = snakemake.params
-    interconnection = snakemake.wildcards["interconnect"]
+    interconnection = snakemake.params.interconnect
 
     n = pypsa.Network(snakemake.input.base_network)
+
+    # With representative periods active the network is built directly on the
+    # selected snapshots, so the full 15-weather-year timeline is never created.
+    # `source_timesteps` carries the real weather hour behind each snapshot and is
+    # threaded into every time-series attachment below.
+    source_timesteps = None
+    representative_snapshots = getattr(snakemake.input, "representative_snapshots", None)
+    if representative_snapshots is not None:
+        snapshots, snapshot_weightings, source_timesteps = read_representative_snapshots(
+            representative_snapshots,
+        )
+        n.snapshots = snapshots
+        n.set_investment_periods(periods=params.planning_horizons)
+        n.snapshot_weightings = snapshot_weightings
+        logger.info(
+            "Using %s representative snapshots from %s.",
+            len(snapshots),
+            representative_snapshots,
+        )
+    else:
+        n.snapshots = get_multiindex_snapshots(
+            params.snapshots,
+            params.planning_horizons,
+            params.renewable_weather_years,
+        )
+        n.set_investment_periods(periods=params.planning_horizons)
+        n.snapshot_weightings.loc[:, :] = 1.0 / len(params.renewable_weather_years)
 
     regions_onshore = gpd.read_file(snakemake.input.regions_onshore)
     regions_offshore = gpd.read_file(snakemake.input.regions_offshore)
@@ -1036,7 +1210,13 @@ def main(snakemake):
 
     costs = pd.read_csv(snakemake.input.tech_costs)
     costs = costs.pivot(index="pypsa-name", columns="parameter", values="value")
-    update_transmission_costs(n, costs, params.length_factor)
+    update_transmission_costs(
+        n,
+        costs,
+        params.length_factor,
+        distance_cost_fn=snakemake.input.transmission_distance_cost,
+        basecost_fn=snakemake.input.transmission_basecost,
+    )
 
     renewable_carriers = set(params.renewable_carriers)
     extendable_carriers = params.extendable_carriers
@@ -1065,6 +1245,7 @@ def main(snakemake):
         renewable_carriers,
         extendable_carriers,
         params.length_factor,
+        source_timesteps=source_timesteps,
     )
 
     attach_conventional_generators(
@@ -1079,13 +1260,6 @@ def main(snakemake):
         unit_commitment=params.conventional["unit_commitment"],
         fuel_price=None,  # update fuel prices later
     )
-    apply_seasonal_capacity_derates(
-        n,
-        plants,
-        conventional_carriers,
-        n.snapshots,
-    )
-
     if params.conventional.get("must_run", False):
         # TODO (@ktehranchi): In the future the plants that are must-run should
         # not be clustered and instead retire according to lifetime
@@ -1096,11 +1270,14 @@ def main(snakemake):
             n.snapshots,
         )
 
-    attach_battery_storage(
-        n,
-        costs,
-        plants,
-    )
+    if params.add_existing_phs:
+        add_existing_phs(n, snakemake.input.existing_PHS)
+
+    # attach_battery_storage(
+    #     n,
+    #     costs,
+    #     plants,
+    # )
 
     attach_wind_and_solar(
         n,
@@ -1108,98 +1285,38 @@ def main(snakemake):
         snakemake.input,
         renewable_carriers,
         extendable_carriers,
-        snakemake.config,
+        source_timesteps=source_timesteps,
+        cost_multipliers=snakemake.params.cost_multipliers,
     )
     renewable_carriers = list(
-        set(snakemake.config["electricity"]["renewable_carriers"]).intersection(
+        set(params.renewable_carriers).intersection(
             {"onwind", "solar", "offwind", "offwind_floating"},
         ),
     )
-    attach_renewable_capacities_to_atlite(
+
+    attach_existing_renewable_capacities(
         n,
         plants,
         renewable_carriers,
+        costs,
     )
 
     # temporarily adding hydro with breakthrough only data until I can correctly import hydro_data
     n = attach_breakthrough_renewable_plants(
         n,
         snakemake.input["plants_breakthrough"],
-        ["hydro"],
+        list(set(params.renewable_carriers).intersection({"hydro"})),
         extendable_carriers,
         costs,
+        source_timesteps=source_timesteps,
     )
 
     update_p_nom_max(n)
 
-    # apply regional multipliers to capital cost data
-    for carrier, multiplier_data in const.CAPEX_LOCATIONAL_MULTIPLIER.items():
-        if n.generators.query(f"carrier == '{carrier}'").empty:
-            continue
-        multiplier_file = snakemake.input[f"gen_cost_mult_{multiplier_data}"]
-        df_multiplier = pd.read_csv(multiplier_file)
-        df_multiplier = clean_locational_multiplier(df_multiplier)
-        update_capital_costs(n, carrier, costs, df_multiplier)
-
-    if params.conventional["dynamic_fuel_price"].get("enable", False):
-        logger.info("Applying dynamic fuel pricing to conventional generators")
-        if params.conventional["dynamic_fuel_price"]["wholesale"]:
-            assert params.eia_api, "Must provide EIA API key for dynamic fuel pricing"
-
-            dynamic_fuel_prices = {
-                "OCGT": {
-                    "state": "state_ng_fuel_prices",
-                    "balancing_area": "ba_ng_fuel_prices",  # name of file in snakefile
-                },
-                "CCGT": {
-                    "state": "state_ng_fuel_prices",
-                    "balancing_area": "ba_ng_fuel_prices",
-                },
-                "coal": {"state": "state_coal_fuel_prices"},
-            }
-
-            # NOTE: Must go from most to least coarse data (ie. state then ba) to apply the
-            # data correctly!
-            for carrier, prices in dynamic_fuel_prices.items():
-                for area in ("state", "reeds_zone", "balancing_area"):
-                    # check if data is supplied for the area
-                    try:
-                        datafile = prices[area]
-                    except KeyError:
-                        continue
-                    # if data should exist, try to read it in
-                    try:
-                        df = pd.read_csv(
-                            snakemake.input[datafile],
-                            index_col="snapshot",
-                        )
-                        if df.empty:
-                            logger.warning(f"No data provided for {datafile}")
-                            continue
-                    except KeyError:
-                        logger.warning(f"Can not find dynamic price file {datafile}")
-                        continue
-
-                    vom = costs.at[carrier, "opex_variable_per_mwh"]
-
-                    apply_dynamic_pricing(
-                        n=n,
-                        carrier=carrier,
-                        geography=area,
-                        df=df,
-                        vom=vom,
-                    )
-                    logger.info(
-                        f"Applied dynamic price data for {carrier} from {datafile}",
-                    )
-
-        if params.conventional["dynamic_fuel_price"]["pudl"]:
-            n = apply_pudl_fuel_costs(n, plants, costs)
-
     # fix p_nom_min for extendable generators
     # The "- 0.001" is just to avoid numerical issues
     n.generators["p_nom_min"] = n.generators.apply(
-        lambda x: (x["p_nom"] - 0.001) if (x["p_nom_extendable"] and x["p_nom_min"] == 0) else x["p_nom_min"],
+        lambda x: x["p_nom"] if (x["p_nom_extendable"] and x["p_nom_min"] == 0) else x["p_nom_min"],
         axis=1,
     )
 
@@ -1218,6 +1335,6 @@ if __name__ == "__main__":
     if "snakemake" not in globals():
         from _helpers import mock_snakemake
 
-        snakemake = mock_snakemake("add_electricity", interconnect="western")
+        snakemake = mock_snakemake("add_electricity", demand_level="High")
     configure_logging(snakemake)
     main(snakemake)

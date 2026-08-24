@@ -576,46 +576,6 @@ REEDS_NERC_INTERCONNECT_MAPPER = {
 }
 
 
-REC_TRADING_ZONE_MAPPER = {
-    "CA": "WREGIS",
-    "OR": "WREGIS",
-    "AZ": "WREGIS",
-    "WA": "WREGIS",
-    "NM": "WREGIS",
-    "UT": "WREGIS",
-    "CO": "WREGIS",
-    "NV": "WREGIS",
-    "ID": "WREGIS",
-    "WY": "WREGIS",
-    "MT": "WREGIS",
-    "ND": "MRETS",
-    "SD": "MRETS",
-    "MN": "MRETS",
-    "IA": "MRETS",
-    "WI": "MRETS",
-    "MI": "MIRECS",
-    "MO": "NAR",
-    "KS": "NAR",
-    "IL": "MRETS",
-    "IN": "MRETS",
-    "OH": "MRETS",
-    "KY": "PJM-GATS",
-    "VA": "PJM-GATS",
-    "WV": "PJM-GATS",
-    "MD": "PJM-GATS",
-    "DE": "PJM-GATS",
-    "NJ": "PJM-GATS",
-    "PA": "PJM-GATS",
-    "NY": "NYGATS",
-    "CT": "NEPOOL",
-    "RI": "NEPOOL",
-    "MA": "NEPOOL",
-    "NH": "NEPOOL",
-    "ME": "NEPOOL",
-    "VT": "NEPOOL",
-    "NC": "NC-RETS",
-    "TX": "ERCOT",
-}
 ################################
 # Constants for Breakthrough mapping
 ################################
@@ -643,7 +603,7 @@ ATB_TECH_MAPPER = {
         "display_name": "Biopower - Dedicated",
         "technology": "Biopower",
         "techdetail": "Dedicated",
-        "crp": 45,
+        "crp": 30,
     },
     "coal": {
         "display_name": "Coal-new",
@@ -709,13 +669,13 @@ ATB_TECH_MAPPER = {
         "display_name": "Nuclear - AP1000",
         "technology": "Nuclear",
         "techdetail": "Nuclear - Large",
-        "crp": 60,
+        "crp": 30,
     },
     "SMR": {  # small modular reactor
         "display_name": "Nuclear - Small Modular Reactor",
         "technology": "Nuclear",
         "techdetail": "Nuclear - Small",
-        "crp": 60,
+        "crp": 30,
     },
     "onwind": {
         "display_name": "Land-Based Wind - Class 4 - Technology 1",
@@ -779,7 +739,9 @@ ATB_TECH_MAPPER = {
         "crp": 100,
     },
     "EGS": {
-        "display_name": "Geothermal - Hydro / Flash",
+        "display_name": "Geothermal - Deep EGS / Flash",
+        "technology": "Geothermal",
+        "techdetail2": "Deep EGS / Flash",
         "crp": 30,
     },
     "8hr_PHS": {  # Costs replaced with location specific data in workflow
@@ -803,23 +765,7 @@ ATB_TECH_MAPPER = {
 }
 
 ###########################################
-# Constants for NREL Locational Multipliers
-###########################################
-
-# {pypsa-name: csv-name}
-CAPEX_LOCATIONAL_MULTIPLIER = {
-    "nuclear": "nuclear-1117mw",
-    "CCGT": "natural-gas-430mw-90ccs",
-    "OCGT": "natural-gas-430mw-90ccs",
-    "coal": "coal-ultra-supercritical-90ccs",
-    "geothermal": "geothermal-50mw",
-    "solar": "spv-150mw",
-    "onwind": "onshore-wind-200mw",
-    "hydro": "hydro-100mw",
-}
-
-###########################################
-# Constants for NREL Locational Multipliers
+# Constants for EIA Fuel Mapping
 ###########################################
 
 EIA_FUEL_MAPPER = {

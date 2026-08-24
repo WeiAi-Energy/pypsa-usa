@@ -9,15 +9,15 @@ HTTP = HTTPRemoteProvider()
 
 from os.path import normpath
 from itertools import chain
-from pathlib import Path
 import pandas as pd
 
 FIGURES_MAPS = [
-    "capacity_map_base.pdf",
-    "capacity_map_optimized.pdf",
-    "capacity_map_new.pdf",
-    "emissions_map.pdf",
-    "renewable_potential_map.pdf",
+    "capacity_map_base_pie.png",
+    "capacity_map_base_transmission.png",
+    "capacity_map_optimized_pie.png",
+    "capacity_map_optimized_transmission.png",
+    "capacity_map_new_pie.png",
+    "capacity_map_new_transmission.png",
     "demand_map.pdf",
     # "lmp_map.pdf",
 ]
@@ -40,28 +40,13 @@ FIGURES_SYSTEM = [
     "bar_regional_capacity_additions.pdf",
     "bar_regional_production.pdf",
     "global_constraint_shadow_prices.pdf",
+    "cost_breakdown_bar.pdf",
     "generator_data_panel.pdf",
     "fuel_costs.pdf",
     "region_lmps.pdf",
     "renewable_capacity_factors.pdf",
     "seasonal_generation.pdf",
 ]
-
-FIGURES_VALIDATE = [
-    "daily_stacked_comparison.pdf",
-    "carrier_production_bar.pdf",
-    "val_bar_state_emissions.pdf",
-    "val_generator_data_panel.pdf",
-    "val_box_region_lmps.pdf",
-    "val_map_load_shedding.pdf",
-    "val_generator_stack.pdf",
-    # "val_map_line_loading.pdf",
-    "val_state_generation_deviation.pdf",
-    "val_heatmap_state_generation_carrier.pdf",
-    "val_cap_state_generation.pdf",
-    "val_fuel_costs.pdf",
-]
-
 
 # --------------------------- Workflow constraints --------------------------- #
 localrules:
@@ -70,179 +55,137 @@ localrules:
 
 
 wildcard_constraints:
-    interconnect="usa|texas|western|eastern",
-    simpl="[a-zA-Z0-9]*|all",
-    clusters="[0-9]+m?+a?+c?|all",
-    ll="(v|c)([0-9\.]+|opt|all)|all",
+    case="[A-Za-z0-9._-]+",
+    ll="(v|c)([0-9\.]+|opt|inf|all)|all",
     opts="[-+a-zA-Z0-9\.]*",
-    sector="([EG]-)*[EG]",
 
 
 # -------------------------- Config and Subworkflows ------------------------- #
 
 
 # Merge subworkflow configs and main config
+configfile: "config/config.default.yaml"
 configfile: "config/config.cluster.yaml"
 configfile: "config/config.common.yaml"
 configfile: "config/config.plotting.yaml"
 configfile: "config/config.api.yaml"
-configfile: "config/config.sector.yaml"
-
-
-# configfile: "config/config.default.yaml"
+configfile: "config/cases.yaml"
 
 
 run = config.get("run", {})
-RDIR = run["name"] + "/" if run.get("name") else ""
-CDIR = RDIR if not run.get("shared_cutouts") else ""
+CASES_ENABLED = bool(config.get("cases"))
+CASES = list(config.get("cases", {})) if CASES_ENABLED else [run.get("name") or "default"]
+RDIR = run["name"] + "/" if run.get("name") and not CASES_ENABLED else ""
+CDIR = "" if CASES_ENABLED or run.get("shared_cutouts") else RDIR
 
 LOGS = "logs/" + RDIR
 BENCHMARKS = "benchmarks/" + RDIR
 DATA = "data/"
-RESOURCES = "resources/" + RDIR if not run.get("shared_resources") else "resources/"
+RESOURCES = "resources/shared/"
+CASE_RESOURCES = "resources/cases/{case}/" if CASES_ENABLED else "resources/cases/" + RDIR
+CASE_RESOURCES_WC = CASE_RESOURCES.replace("{case}", "{{case}}")
 RESULTS = "results/" + RDIR
+CASE_RESULTS = "results/{case}/" if CASES_ENABLED else RESULTS
+CASE_RESULTS_WC = CASE_RESULTS.replace("{case}", "{{case}}")
+CASE_LOGS = "logs/{case}/" if CASES_ENABLED else LOGS
+CASE_BENCHMARKS = "benchmarks/{case}/" if CASES_ENABLED else BENCHMARKS
+FIGURE_ROOT = CASE_RESULTS + "figure/"
+def result_network_path(suffix=""):
+    return CASE_RESULTS + "network/network" + suffix + ".nc"
+
+
+def result_config_path():
+    return CASE_RESULTS + "config/config.yaml"
+
+
+def result_figure_path(*parts, figure="{figure}"):
+    return FIGURE_ROOT + "/".join(parts) + "/" + figure
 
 
 include: "rules/common.smk"
 include: "rules/retrieve.smk"
 include: "rules/build_electricity.smk"
-include: "rules/build_sector.smk"
 include: "rules/solve_electricity.smk"
 include: "rules/postprocess.smk"
-include: "rules/postprocess_sector.smk"
-include: "rules/validate.smk"
 
 
-if "E" not in config["scenario"]["sector"]:
-    if not config["scenario"]["sector"]:
-        config["scenario"]["sector"] = "E"
-    else:
-        config["scenario"]["sector"] = f"E-{config['scenario']['sector']}"
+normalize_electricity_config(config)
 
 # ----------------------------------- Rules ---------------------------------- #
 
 
+def iter_case_configs():
+    if CASES_ENABLED:
+        for case_name in CASES:
+            yield case_name, case_config(case_name)
+    else:
+        yield CASES[0], config
+
+
+def expand_case_targets(pattern, **kwargs):
+    targets = []
+    for case_name, cfg in iter_case_configs():
+        targets.extend(expand_case_targets_for(case_name, cfg, pattern, **kwargs))
+    return targets
+
+
+def expand_case_targets_for(case_name, cfg, pattern, **kwargs):
+    expand_kwargs = dict(cfg["scenario"])
+    if CASES_ENABLED:
+        expand_kwargs["case"] = [case_name]
+    expand_kwargs.update(kwargs)
+    return expand(pattern, **expand_kwargs)
+
+
 def electricity_figures(wildcards):
     figs = []
-    if "G" in config["scenario"]["sector"].split("-"):
-        return []
-    elif not config["run"]["validation"]:
-        # maps
+    for case_name, cfg in iter_case_configs():
         figs.append(
-            expand(
-                RESULTS
-                + "{interconnect}/figures/s{simpl}_cluster_{clusters}/l{ll}_{opts}_{sector}/maps/{figure}",
-                **config["scenario"],
+            expand_case_targets_for(
+                case_name,
+                cfg,
+                result_figure_path("maps"),
                 figure=FIGURES_MAPS,
             )
         )
-        # emissions
         figs.append(
-            expand(
-                RESULTS
-                + "{interconnect}/figures/s{simpl}_cluster_{clusters}/l{ll}_{opts}_{sector}/emissions/{figure}",
-                **config["scenario"],
+            expand_case_targets_for(
+                case_name,
+                cfg,
+                result_figure_path("emissions"),
                 figure=FIGURES_EMISSIONS,
             )
         )
-        # production
         figs.append(
-            expand(
-                RESULTS
-                + "{interconnect}/figures/s{simpl}_cluster_{clusters}/l{ll}_{opts}_{sector}/production/{figure}",
-                **config["scenario"],
+            expand_case_targets_for(
+                case_name,
+                cfg,
+                result_figure_path("production"),
                 figure=FIGURES_PRODUCTION,
             )
         )
-        # system
         figs.append(
-            expand(
-                RESULTS
-                + "{interconnect}/figures/s{simpl}_cluster_{clusters}/l{ll}_{opts}_{sector}/system/{figure}",
-                **config["scenario"],
+            expand_case_targets_for(
+                case_name,
+                cfg,
+                result_figure_path("system"),
                 figure=FIGURES_SYSTEM,
             )
         )
-        return list(chain(*figs))  # expand list of lists to single list
-    else:
-        return []
-
-
-def sector_figures(wildcards):
-
-    figs = []
-
-    if "G" in config["scenario"]["sector"].split("-"):
-        figs.append(
-            expand(
-                RESULTS
-                + "{interconnect}/figures/s{simpl}_c{clusters}/l{ll}_{opts}_{sector}/system/natural_gas/{figure}.png",
-                **config["scenario"],
-                figure=FIGURES_SECTOR_NATURAL_GAS,
-            )
-        )
-        figs.append(
-            expand(
-                RESULTS
-                + "{interconnect}/figures/s{simpl}_c{clusters}/l{ll}_{opts}_{sector}/system/emissions/{figure}.png",
-                **config["scenario"],
-                figure=FIGURES_SECTOR_EMISSIONS,
-            )
-        )
-        figs.append(
-            expand(
-                RESULTS
-                + "{interconnect}/figures/s{simpl}_c{clusters}/l{ll}_{opts}_{sector}/system/production/res/{figure}.png",
-                **config["scenario"],
-                figure=FIGURES_SECTOR_PRODUCTION,
-            )
-        )
-        figs.append(
-            expand(
-                RESULTS
-                + "{interconnect}/figures/s{simpl}_c{clusters}/l{ll}_{opts}_{sector}/system/capacity/res/{figure}.png",
-                **config["scenario"],
-                figure=FIGURES_SECTOR_CAPACITY,
-            )
-        )
-        figs.append(
-            expand(
-                RESULTS
-                + "{interconnect}/figures/s{simpl}_c{clusters}/l{ll}_{opts}_{sector}/system/sankey/{figure}.html",
-                **config["scenario"],
-                figure=FIGURES_SECTOR_SANKEY,
-            )
-        )
-        return list(chain(*figs))
-    return figs
-
-
-def validation_figures(wildcards):
-    if config["run"]["validation"]:
-        return expand(
-            RESULTS
-            + "{interconnect}/figures/s{simpl}_cluster_{clusters}/l{ll}_{opts}_{sector}/{figure}",
-            **config["scenario"],
-            figure=FIGURES_VALIDATE,
-        )
-    else:
-        return []
+    return list(chain(*figs))
 
 
 rule all:
     input:
         #"repo_data/dag.jpg",
         electricity_figures,
-        sector_figures,
-        validation_figures,
 
 
 rule data_model:
     input:
-        expand(
-            RESOURCES
-            + "{interconnect}/elec_s{simpl}_c{clusters}_ec_l{ll}_{opts}_{sector}.nc",
-            **config["scenario"],
+        expand_case_targets(
+            CASE_RESOURCES
+            + "elec_ec_l{ll}_{opts}.nc",
         ),
 
 

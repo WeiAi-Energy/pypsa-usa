@@ -86,8 +86,6 @@ When selecting between the three ReEDS NARIS networks, you will need to also spe
 
 IF you are using the TAMU/BE network, you can flexibly set an arbitrary number of clusters between the min and max number of nodes. If using a ReEDS NARIS network, you need to specify the minimum number of clusters (nodes) for your modeled interconnection. The number of nodes for each zone is **detailed in the table below**.
 
-If you're working with custom configurations, PyPSA-USA will notify you during the cluster_network stage, indicating the correct number of nodes to set in the clusters configuration.
-
 ```{eval-rst}
 .. csv-table::
    :header-rows: 1

@@ -1,0 +1,18 @@
+pypsa-name,parameter,value,unit,source,currency_year
+h2 electrolysis,FOM,3,%/year,ADP,
+h2 electrolysis,electricity-input,1.351,MW_e/MW_H2,ADP,
+h2 electrolysis,investment,396,USD/kW_e,ADP,2022
+h2 electrolysis,lifetime,20,years,,
+h2 electrolysis,crp,20,years,,
+h2 electrolysis,wacc_real,0.07,,,
+TES,FOM,2.25,%/year,ATB NGCC,
+TES,VOM,1,USD/MWh_th,ATB NGCC,2022
+TES,charge_cost,150000,USD/MW_el,The design space for long-duration energy storage in decarbonized power systems,2022
+TES,charge_efficiency,0.98,,The design space for long-duration energy storage in decarbonized power systems,
+TES,discharge_cost,500000,USD/MW_th,The design space for long-duration energy storage in decarbonized power systems,2022
+TES,discharge_efficiency,0.5,,The design space for long-duration energy storage in decarbonized power systems,
+TES,energy_cost,7500,USD/MWh_th,The design space for long-duration energy storage in decarbonized power systems,2022
+TES,loss,0.0002,,0.5%/day,
+TES,lifetime,55,years,,
+TES,crp,20,years,,
+TES,wacc_real,0.07,,,

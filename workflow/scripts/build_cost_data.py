@@ -6,13 +6,26 @@ import constants as const
 import duckdb
 import pandas as pd
 from _helpers import calculate_annuity
-from build_sector_costs import (
-    EfsIceTransportationData,
-    EfsTechnologyData,
-    EiaBuildingData,
-)
 
 logger = logging.getLogger(__name__)
+CCS_CAPTURE_COST_USD_PER_TON = 20
+
+# Natural gas emissions are split into two components [tCO2/MWh_thermal]:
+#  - direct: stack CO2 from combustion, which CCS can capture
+#  - indirect: upstream CO2e (extraction, processing, transport), which CCS
+#    cannot capture and therefore stays on every gas MWh_th regardless of the
+#    capture rate
+GAS_DIRECT_CO2_PER_MWHTH = 0.1811
+GAS_INDIRECT_CO2_PER_MWHTH = 0.0285
+GAS_CO2_PER_MWHTH = GAS_DIRECT_CO2_PER_MWHTH + GAS_INDIRECT_CO2_PER_MWHTH
+
+# Emission parameters written to the cost table, kept at higher precision than
+# the other parameters (see the rounding step at the end of __main__).
+EMISSION_PARAMETERS = [
+    "co2_emissions",
+    "co2_emissions_direct",
+    "co2_emissions_indirect",
+]
 
 # Impute emissions factor data
 # https://www.eia.gov/environment/emissions/co2_vol_mass.php
@@ -22,9 +35,39 @@ EMISSIONS_DATA = [
     {"pypsa-name": "oil", "parameter": "co2_emissions", "value": 0.34851},
     {"pypsa-name": "geothermal", "parameter": "co2_emissions", "value": 0.04029},
     {"pypsa-name": "waste", "parameter": "co2_emissions", "value": 0.1016},
-    {"pypsa-name": "gas", "parameter": "co2_emissions", "value": 0.18058},
-    {"pypsa-name": "CCGT", "parameter": "co2_emissions", "value": 0.18058},
-    {"pypsa-name": "OCGT", "parameter": "co2_emissions", "value": 0.18058},
+    {"pypsa-name": "gas", "parameter": "co2_emissions", "value": GAS_CO2_PER_MWHTH},
+    {
+        "pypsa-name": "gas",
+        "parameter": "co2_emissions_direct",
+        "value": GAS_DIRECT_CO2_PER_MWHTH,
+    },
+    {
+        "pypsa-name": "gas",
+        "parameter": "co2_emissions_indirect",
+        "value": GAS_INDIRECT_CO2_PER_MWHTH,
+    },
+    {"pypsa-name": "CCGT", "parameter": "co2_emissions", "value": GAS_CO2_PER_MWHTH},
+    {
+        "pypsa-name": "CCGT",
+        "parameter": "co2_emissions_direct",
+        "value": GAS_DIRECT_CO2_PER_MWHTH,
+    },
+    {
+        "pypsa-name": "CCGT",
+        "parameter": "co2_emissions_indirect",
+        "value": GAS_INDIRECT_CO2_PER_MWHTH,
+    },
+    {"pypsa-name": "OCGT", "parameter": "co2_emissions", "value": GAS_CO2_PER_MWHTH},
+    {
+        "pypsa-name": "OCGT",
+        "parameter": "co2_emissions_direct",
+        "value": GAS_DIRECT_CO2_PER_MWHTH,
+    },
+    {
+        "pypsa-name": "OCGT",
+        "parameter": "co2_emissions_indirect",
+        "value": GAS_INDIRECT_CO2_PER_MWHTH,
+    },
     {
         "pypsa-name": "geothermal",
         "parameter": "heat_rate_mmbtu_per_mwh",
@@ -38,10 +81,10 @@ LIFETIME_DATA = [
     # Confirm with Jabs / NREL. 30 is way too small
     {"pypsa-name": "geothermal", "parameter": "lifetime", "value": 70},
     {"pypsa-name": "waste", "parameter": "lifetime", "value": 55},  # using gas CT
-    {"pypsa-name": "CCGT", "parameter": "lifetime", "value": 55},
-    {"pypsa-name": "OCGT", "parameter": "lifetime", "value": 55},
-    {"pypsa-name": "CCGT-95CCS", "parameter": "lifetime", "value": 55},
-    {"pypsa-name": "CCGT-97CCS", "parameter": "lifetime", "value": 55},
+    {"pypsa-name": "CCGT", "parameter": "lifetime", "value": 40},
+    {"pypsa-name": "OCGT", "parameter": "lifetime", "value": 40},
+    {"pypsa-name": "CCGT-95CCS", "parameter": "lifetime", "value": 40},
+    {"pypsa-name": "CCGT-97CCS", "parameter": "lifetime", "value": 40},
     {"pypsa-name": "coal-95CCS", "parameter": "lifetime", "value": 70},
     {"pypsa-name": "coal-99CCS", "parameter": "lifetime", "value": 70},
     {"pypsa-name": "SMR", "parameter": "lifetime", "value": 40},
@@ -51,6 +94,7 @@ LIFETIME_DATA = [
     {"pypsa-name": "offwind", "parameter": "lifetime", "value": 30},
     {"pypsa-name": "onwind", "parameter": "lifetime", "value": 30},
     {"pypsa-name": "solar", "parameter": "lifetime", "value": 30},
+    {"pypsa-name": "EGS", "parameter": "lifetime", "value": 30},
     {
         "pypsa-name": "2hr_battery_storage",
         "parameter": "lifetime",
@@ -124,101 +168,6 @@ def match_technology(row, tech_dict):
             return key
 
     return None
-
-
-def get_sector_costs(
-    efs_tech_costs: str,
-    efs_icev_costs: str,
-    eia_tech_costs,
-    year: int,
-    additional_costs_csv: str | None = None,
-) -> pd.DataFrame:
-    """Gets end-use tech costs for sector coupling studies."""
-
-    def correct_units(df: pd.DataFrame) -> pd.DataFrame:
-        # USD/gal -> USD/MWh (water storage)
-        # assume cp = 4.186 kJ/kg/C
-        # (USD / gal) * (1 gal / 3.75 liter) * (1L / 1 kg H2O) = 0.267 USD / kg water
-        # (0.267 USD / kg) * (1 / 4.186 kJ/kg/C) * (1 / 1C) = 0.0637 USD / kJ
-        # (0.0637 USD / kJ) * (1000 kJ / 1 MJ) * (3600sec / 1hr) = 229335 USD / MWh
-        df.loc[df.unit.str.contains("USD/gal"), "value"] *= 229335
-        df.unit = df.unit.str.replace("USD/gal", "USD/MWh")
-
-        df.unit = df.unit.str.replace("$/", "USD/")
-
-        df.loc[df.unit.str.contains("/kW"), "value"] *= 1e3
-        df.unit = df.unit.str.replace("/kW", "/MW")
-
-        # 1 euro = 1.11 USD
-        # taked on Sept. 2, 2024
-
-        df.loc[df.unit.str.contains("EUR/"), "value"] *= 1.11
-        df.unit = df.unit.str.replace("EUR/", "USD/")
-
-        return df
-
-    def get_investment_year_data(df: pd.DataFrame, year: int) -> pd.DataFrame:
-        return df[df.year == year].drop(columns="year")
-
-    def calculate_capex(df: pd.DataFrame, discount_rate: float) -> pd.DataFrame:
-        """Calcualtes capex based on annuity payments."""
-        capex = df.copy().set_index(["technology", "parameter"])
-        capex = capex.value.unstack().fillna(0)
-
-        # n years should be
-        # n.snapshot_weightings.loc[n.investment_periods[x]].objective.sum() / 8760.0
-
-        capex["capital_cost"] = (
-            (
-                calculate_annuity(
-                    capex["lifetime"],
-                    discount_rate,
-                )
-                + capex["FOM"] / 100
-            )
-            * capex["investment"]
-            * 1
-        )
-
-        capex = capex["capital_cost"].dropna().to_frame(name="value")
-
-        investment = df[df.parameter == "investment"].set_index("technology")
-
-        assert len(capex) == len(investment)
-
-        final = capex.reindex_like(investment)
-        final["parameter"] = "capital_cost"
-        final["unit"] = investment.unit
-        final["source"] = investment.source
-        final["further_description"] = investment.further_description
-
-        return final
-
-    bev = EfsTechnologyData(efs_tech_costs).get_data("Transportation")
-    ice = EfsIceTransportationData(efs_icev_costs).get_data()
-    builidng = EiaBuildingData(eia_tech_costs).get_data()
-
-    df = pd.concat([bev, ice, builidng])
-    df = get_investment_year_data(df, year)
-    df = df.rename(columns={"further description": "further_description"})
-
-    if additional_costs_csv:
-        additional = pd.read_csv(additional_costs_csv)
-        assert all(x in df.columns for x in additional.columns)
-        df = pd.concat([df, additional]).reset_index(drop=True)
-
-    df = correct_units(df)
-
-    discount_rate = 0.05
-    capex = calculate_capex(df, discount_rate)
-    capex = capex.reset_index()[df.columns]
-
-    final = pd.concat([df, capex])
-    final["value"] = final.value.round(4)
-
-    final = final.rename(columns={"technology": "pypsa-name"})
-
-    return final
 
 
 if __name__ == "__main__":
@@ -314,54 +263,58 @@ if __name__ == "__main__":
     emissions_data = EMISSIONS_DATA
 
     # Impute Transmission Data
-    # TEPCC 2023
+    # https://docs.nrel.gov/docs/fy21osti/78195.pdf
     # WACC & Lifetime: https://emp.lbl.gov/publications/improving-estimates-transmission
     # Subsea costs: Purvins et al. (2018): https://doi.org/10.1016/j.jclepro.2018.03.095
+    # FOM assumed at 1% of capex per year for all transmission assets
+    TRANSMISSION_FOM_PCT = 0.01
+    hvdc_inverter_pair_capex_per_kw = 311.19  # https://docs.nlr.gov/docs/fy21osti/78195.pdf
+
+    # AC line and DC line capex are no longer national scalars: they are resolved per
+    # line from voltage class and route region in `add_electricity`, off the ReEDS
+    # county-pair and base-cost tables. What is still needed here is the annualization
+    # basis (recovery period, WACC) and the FOM percentage -- FOM is a share of capex,
+    # so once capex varies by line the FOM has to follow it, which means exporting the
+    # percentage rather than a pre-multiplied `opex_fixed_per_mw_km`.
     transmission_data = [
         {
             "pypsa-name": "HVAC overhead",
-            "parameter": "capex_per_mw_km",
-            "value": 1541,
+            "parameter": "opex_fixed_pct_of_capex",
+            "value": TRANSMISSION_FOM_PCT,
         },
         {
             "pypsa-name": "HVAC overhead",
             "parameter": "cost_recovery_period_years",
-            "value": 60,
+            "value": 40,
         },
-        {"pypsa-name": "HVAC overhead", "parameter": "wacc_real", "value": 0.044},
+        {"pypsa-name": "HVAC overhead", "parameter": "wacc_real", "value": 0.036},
         {
             "pypsa-name": "HVDC overhead",
-            "parameter": "capex_per_mw_km",
-            "value": 1026.53,
+            "parameter": "opex_fixed_pct_of_capex",
+            "value": TRANSMISSION_FOM_PCT,
         },
         {
             "pypsa-name": "HVDC overhead",
             "parameter": "cost_recovery_period_years",
-            "value": 60,
+            "value": 40,
         },
-        {"pypsa-name": "HVDC overhead", "parameter": "wacc_real", "value": 0.044},
-        {
-            "pypsa-name": "HVDC submarine",
-            "parameter": "capex_per_mw_km",
-            "value": 504.141,
-        },
-        {
-            "pypsa-name": "HVDC submarine",
-            "parameter": "cost_recovery_period_years",
-            "value": 60,
-        },
-        {"pypsa-name": "HVDC submarine", "parameter": "wacc_real", "value": 0.044},
+        {"pypsa-name": "HVDC overhead", "parameter": "wacc_real", "value": 0.036},
         {
             "pypsa-name": "HVDC inverter pair",
             "parameter": "capex_per_kw",
-            "value": 173.730,
+            "value": hvdc_inverter_pair_capex_per_kw,
+        },
+        {
+            "pypsa-name": "HVDC inverter pair",
+            "parameter": "opex_fixed_per_kw",
+            "value": hvdc_inverter_pair_capex_per_kw * TRANSMISSION_FOM_PCT,
         },
         {
             "pypsa-name": "HVDC inverter pair",
             "parameter": "cost_recovery_period_years",
-            "value": 60,
+            "value": 40,
         },
-        {"pypsa-name": "HVDC inverter pair", "parameter": "wacc_real", "value": 0.044},
+        {"pypsa-name": "HVDC inverter pair", "parameter": "wacc_real", "value": 0.036},
     ]
     pudl_atb = pd.concat(
         [
@@ -402,9 +355,9 @@ if __name__ == "__main__":
                 "value": 2.782,
             },
             {
-                "pypsa-name": "biomass",
+                "pypsa-name": "EGS",
                 "parameter": "fuel_cost_real_per_mwhth",
-                "value": 7.49,
+                "value": 0,
             },
         ],
     )
@@ -444,19 +397,57 @@ if __name__ == "__main__":
     # https://nrel.github.io/ReEDS-2.0/model_documentation.html#hydrogen
     hydrogen_ct = pivot_atb[pivot_atb["pypsa-name"] == "OCGT"].copy()
     hydrogen_ct["pypsa-name"] = "hydrogen_ct"
-    hydrogen_ct["capex_overnight_per_kw"] *= 1.03
-    hydrogen_ct["capex_per_kw"] = (
-        (hydrogen_ct["capex_overnight_per_kw"] + hydrogen_ct["capex_grid_connection_per_kw"])
-        * hydrogen_ct["capex_construction_finance_factor"]
-        / 100
-    )
+    hydrogen_ct["capex_overnight_per_kw"] *= 1.1
+    hydrogen_ct["capex_per_kw"] = (hydrogen_ct["capex_overnight_per_kw"]
+                            + hydrogen_ct["capex_grid_connection_per_kw"]
+                            + hydrogen_ct["capex_construction_finance_factor"])
     hydrogen_ct["fuel_cost_real_per_mwhth"] = 20 * 3.412  # 20 USD/MMBtu * 3.412 MMBtu/MWh_th
     hydrogen_ct["co2_emissions"] = 0
+    hydrogen_ct["co2_emissions_direct"] = 0
+    hydrogen_ct["co2_emissions_indirect"] = 0
     pivot_atb = pd.concat([pivot_atb, hydrogen_ct], ignore_index=True)
 
+    # Apply heat rate corrections
+    heat_rate_corrections = {
+        "hydrogen_ct": 1.076422072,
+        "OCGT": 1.039104223,
+        "CCGT": 1.076422072,
+        "CCGT-95CCS": 1.076422072,
+        "CCGT-97CCS": 1.076422072,
+    }
+
+    for tech, correction_factor in heat_rate_corrections.items():
+        mask = pivot_atb["pypsa-name"] == tech
+        if mask.any():
+            pivot_atb.loc[mask, "heat_rate_mmbtu_per_mwh"] *= correction_factor
+
     pivot_atb["efficiency"] = 3.412 / pivot_atb["heat_rate_mmbtu_per_mwh"]
+    egs_mask = pivot_atb["pypsa-name"] == "EGS"
+    pivot_atb.loc[egs_mask, "efficiency"] = 1.0
+    pivot_atb.loc[egs_mask, "opex_variable_per_mwh"] = 0.0
+
+    # Only the direct (combustion) share of gas emissions can be captured; the
+    # indirect (upstream) share passes through unabated.
+    pivot_atb["capture_cost_per_mwh"] = 0.0
+    for carrier in ("CCGT-95CCS", "CCGT-97CCS"):
+        carrier_mask = pivot_atb["pypsa-name"] == carrier
+        if not carrier_mask.any():
+            continue
+        capture_rate = int(carrier.split("-")[1].replace("CCS", "")) / 100
+        captured_co2_per_mwh = GAS_DIRECT_CO2_PER_MWHTH / pivot_atb.loc[carrier_mask, "efficiency"] * capture_rate
+        pivot_atb.loc[carrier_mask, "capture_cost_per_mwh"] = captured_co2_per_mwh * CCS_CAPTURE_COST_USD_PER_TON
+
+        unabated_direct = (1 - capture_rate) * GAS_DIRECT_CO2_PER_MWHTH
+        pivot_atb.loc[carrier_mask, "co2_emissions_direct"] = unabated_direct
+        pivot_atb.loc[carrier_mask, "co2_emissions_indirect"] = GAS_INDIRECT_CO2_PER_MWHTH
+        pivot_atb.loc[carrier_mask, "co2_emissions"] = unabated_direct + GAS_INDIRECT_CO2_PER_MWHTH
+
     pivot_atb["fuel_cost"] = pivot_atb["fuel_cost_real_per_mwhth"] / pivot_atb["efficiency"]
-    pivot_atb["marginal_cost"] = pivot_atb["opex_variable_per_mwh"] + pivot_atb["fuel_cost"]
+    pivot_atb["marginal_cost"] = (
+        pivot_atb["opex_variable_per_mwh"] + pivot_atb["fuel_cost"] + pivot_atb["capture_cost_per_mwh"]
+    )
+    pivot_atb.loc[egs_mask, "fuel_cost"] = 0.0
+    pivot_atb.loc[egs_mask, "marginal_cost"] = 0.0
 
     # Impute storage WACC from Utility Scale Solar. TODO: Revisit this assumption
     for x in [2, 4, 6, 8, 10]:
@@ -482,15 +473,10 @@ if __name__ == "__main__":
         # change to nyears
     ) * 1e3
 
-    pivot_atb["annualized_capex_per_mw_km"] = (
-        calculate_annuity(
-            pivot_atb["cost_recovery_period_years"],
-            pivot_atb["wacc_real"],
-        )
-        * pivot_atb["capex_per_mw_km"]
-        * 1
-        # change to nyears
-    )
+    # No `annualized_capex_per_mw_km` here: HVAC/HVDC overhead were the only
+    # technologies that ever supplied `capex_per_mw_km`, and their per-km capex is now
+    # resolved per line in `add_electricity` from `opex_fixed_pct_of_capex`,
+    # `cost_recovery_period_years` and `wacc_real` instead.
 
     # Calculate grid interrconnection costs per MW-KM
     # All land-based resources assume 1 mile of spur line
@@ -519,22 +505,15 @@ if __name__ == "__main__":
         value_name="value",
     )
     pudl_atb = pudl_atb.reset_index(drop=True)
-    pudl_atb["value"] = pudl_atb["value"].round(3)
-
-    egs_costs = pd.read_csv(snakemake.input.egs_costs)
-    egs_costs = egs_costs.query("investment_horizon == @tech_year").drop(
-        columns="investment_horizon",
+    # Emission factors are small enough that the 3-decimal default would break
+    # the direct + indirect = total bookkeeping (0.0285 rounds to 0.028, so the
+    # implied direct share becomes 0.182 instead of 0.1811), so they keep more
+    # precision.
+    emission_rows = pudl_atb["parameter"].isin(EMISSION_PARAMETERS)
+    pudl_atb["value"] = pudl_atb["value"].where(
+        emission_rows,
+        pudl_atb["value"].round(3),
     )
-    pudl_atb = pd.concat([pudl_atb, egs_costs], ignore_index=True)
+    pudl_atb.loc[emission_rows, "value"] = pudl_atb.loc[emission_rows, "value"].round(6)
 
     pudl_atb.to_csv(snakemake.output.tech_costs, index=False)
-
-    # sector costs
-    sector_costs = get_sector_costs(
-        snakemake.input.efs_tech_costs,
-        snakemake.input.efs_icev_costs,
-        snakemake.input.eia_tech_costs,
-        tech_year,
-        snakemake.input.additional_costs,
-    )
-    sector_costs.to_csv(snakemake.output.sector_costs, index=False)

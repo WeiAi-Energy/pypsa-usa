@@ -103,3 +103,40 @@ def floor_precision(a, precision=0):
 
 def get_model_horizon(model: linopy.Model) -> list[int]:
     return model.variables.indexes["snapshot"].get_level_values(0).unique()
+
+
+def patch_linopy_multiindex_assign() -> None:
+    """Fix linopy's ``LinearExpression`` arithmetic to stop corrupting MultiIndex snapshots.
+
+    ``LinearExpression.mul``/``add``/``sub`` (used throughout the representative-period,
+    ERM and hydrogen-target constraints, since every ``coeff * variable`` and
+    ``lhs + rhs`` goes through them) assign their result via the plain
+    ``xarray.Dataset.assign``. When the "snapshot" dim is a (period, timestep) MultiIndex,
+    that path partially drops the "period"/"timestep" level coordinates without the
+    "snapshot" index itself, which is exactly the deprecated, soon-to-error pattern
+    xarray warns about on every single call. linopy already ships
+    ``assign_multiindex_safe`` to avoid this and uses it in some of its own methods
+    (e.g. ``Variable.ffill``), but not in ``LinearExpression.assign`` -- swap it in
+    globally so every arithmetic op on a MultiIndex-snapshot expression is safe.
+    See https://github.com/PyPSA/linopy/issues/303 (open as of linopy 0.3.14/0.3.15).
+    """
+    from linopy.common import assign_multiindex_safe
+    from linopy.expressions import LinearExpression, exprwrap
+
+    if getattr(LinearExpression.assign, "_pypsa_usa_multiindex_safe", False):
+        return
+
+    try:
+        safe_assign = exprwrap(assign_multiindex_safe)
+        safe_assign._pypsa_usa_multiindex_safe = True
+        LinearExpression.assign = safe_assign
+    except Exception:
+        logger.warning(
+            "Could not patch linopy.expressions.LinearExpression.assign to be "
+            "MultiIndex-safe; representative-period/ERM/hydrogen-target constraint "
+            "building may emit spurious xarray MultiIndex DeprecationWarnings.",
+            exc_info=True,
+        )
+
+
+patch_linopy_multiindex_assign()

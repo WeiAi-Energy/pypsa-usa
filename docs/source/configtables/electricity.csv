@@ -3,14 +3,10 @@ conventional_carriers,--,"Any subset of {nuclear, oil, OCGT, CCGT, coal, geother
 renewable_carriers,--,"Any subset of {solar, onwind, offwind-ac, offwind-dc, hydro}",List of renewable generators to include in the model.
 retirement, --,One of ``economic`` or ``technical``,"Sets the retirement method for converntional generators. If ``technical`` all generators ``p_nom_min`` are set to ``p_nom`` to prevent selling off of the asset. Retirements are then tracked in post-proccessing. If ``economic`` existing plants have their ``p_nom_min`` set as ``0``,  ``p_nom_max`` set to ``p_nom``,  and capital costs set to fixed costs. Generators with ``p_nom`` are then added to handle capacity expansion."""
 ,,,
-operational_reserve:,,,Settings for reserve requirements following `GenX <https://genxproject.github.io/GenX.jl/stable/Model_Reference/core/#Operational-Reserves>`_
-activate,bool,true or false,Whether to take operational reserve requirements into account during optimisation
-epsilon_load,--,float,share of total load
-epsilon_vres,--,float,share of total renewable supply
-contingency,MW,float,fixed reserve capacity
+post_2032_gas_average_power_limit,bool,true or false,"Whether to limit the weighted annual average dispatch of CCGT/OCGT generators built after 2032 to 40% of their nameplate capacity. Defaults to ``false``."
 ,,,
-erm:,,,Energy Reserve Margin settings (used when ERM opt is enabled). Ensures sufficient firm capacity to meet demand plus reserve margin at every timestep.
-<region>,--,float,"Reserve margin as a fraction (e.g., 0.15 for 15%). Use ``all`` for all regions, or specify region codes (state, interconnect, NERC region, or ReEDS zone). Defaults to ``all: 0.15`` if not specified."
+erm:,,,"Energy Reserve Margin settings (used when ERM opt is enabled). Requires a feasible reserve state at every timestep that serves each bus its demand plus, in aggregate over each region, that region's reserve margin."
+<region>,--,float,"Reserve margin as a fraction (e.g., 0.15 for 15%) applied to the region's *total* demand. The reserve state must balance at every bus, but the requirement is only enforced on the regional sum, so intra-regional transmission earns no adequacy value -- use finer regions where that matters. Use ``all`` for one system-wide region, or specify region codes (state, interconnect, NERC region, or ReEDS zone). Each region gets its own constraint row and one shared reserve state satisfies all of them simultaneously. Defaults to ``all: 0.15`` if not specified."
 ,,,
 extendable_carriers:,,,
 Generator,--,Any extendable carrier,"Defines existing or non-existing conventional and renewable power plants to be extendable during the optimization. Conventional generators can only be built/expanded where already existent today. If a listed conventional carrier is not included in the ``conventional_carriers`` list, the lower limit of the capacity expansion is set to 0."
@@ -20,26 +16,9 @@ Links,--,Any subset of {},Adds extendable linksat every connection where there a
 ,,,
 demand:,,,
 profile,--,"One of {``efs``, ``eia``}",Datasource for electrical load data. ``EFS`` pulls future state level electrical demand data. ``EIA`` pulls historical balancing level electrical demand dataa.
+efs_scaling_factor,--,float >= 0,Multiplies total EFS electricity demand before adding optional exogenous data-center demand.
+data_center_demand_growth,--,"One of {``false``, ``eer_central``, ``eer_high``, ``epri_low``, ``epri_mid``, ``epri_high``}","Adds exogenous data-center demand on top of AC demand. ``eer_central`` and ``eer_high`` subtract the 2021 ``Historical`` national total from ``repo_data/data_center/EPRI Powering Intelligence.csv`` from the selected national projection in ``repo_data/data_center/EER_projection.csv`` and distribute that national increment to states using the ``Medium`` 2030 state shares from ``EPRI Powering Intelligence.csv``. ``epri_low``, ``epri_mid``, and ``epri_high`` read state annual demand from ``repo_data/data_center/EPRI Powering Intelligence.csv`` and distribute each year's increment above the 2021 historical baseline to buses using state load-allocation factors. EPRI scenarios require all planning horizons to be ``<= 2030``."
 scenario:,,,
 -efs_case,--,"One of {``reference``, ``medium``, ``high``}",(UNDER DEVELOPMENT) Extracts EFS data according to level of adoption
 -efs_speed,--,"One of {``slow``, ``moderate``, ``fast``}",(UNDER DEVELOPMENT) Extracts EFS data according to speed of electrification
 -aeo,--,One of the AEO scenarios `here <https://www.eia.gov/outlooks/aeo/data/browser/>`_,(UNDER DEVELOPMENT) Scales future demand according to the AEO scenario
-,,,
-demand_response:,,,Settings to activate and configure demand response
--shift,per_unit,"float {0 <=, >= 1} or 'inf'",Allowable load to be shifted per snapshot. Set to 0 to turn off demand response. Set to 'inf' to not enforce capacity limits.
--marginal_cost,$/MWh,float {0 <=},Cost to store one unit of energy for one hour
-,,,
-imports:,,,Configure electric imports from regions outside of model scope
--enable,,``true`` or ``false``,Enable electric imports
--costs,$/MWh,``wholesale`` or ``<name of carrier>`` or ``float``,Cost of electric imports from regions outside of model scope. ``Wholesale`` will use in monthly wholesales electric prices. ``float`` will assign a user specified value. ``carrier`` will take average marginal cost of the carrier.
--co2_emissions,CO2/MWh,``float``,CO2 emissions of electric imports from regions outside of model scope.
--capacity_limit,,``true`` or ``false``,Enable capacity limit for electric imports from regions outside of model scope
--volume_limit,percent,"float {0 <=, >= 100} or 'inf'",Volume limit for electric imports from regions outside of model scope (in % of total demand). Set to ``inf`` to not enforce volume limits.
--balancing_period,,``day`` or ``week`` or ``month`` or ``year``,Balancing period for electric imports from regions outside of model scope.
-,,,
-exports:,,,Configure electric exports to regions outside of model scope
--enable,,``true`` or ``false``,Enable electric exports
--costs,$/MWh,``wholesale`` or ``<name of carrier>`` or ``float``,Cost of electric imports from regions outside of model scope. ``Wholesale`` will use in monthly wholesales electric prices. ``float`` will assign a user specified value. ``carrier`` will take average marginal cost of the carrier.
--capacity_limit,,``true`` or ``false``,Enable capacity limit for electric exports to regions outside of model scope
--volume_limit,percent,"float {0 <=, >= 100} or 'inf'",Volume limit for electric exports to regions outside of model scope (in % of total demand). Set to ``inf`` to not enforce volume limits.
--balancing_period,,``day`` or ``week`` or ``month`` or ``year``,Balancing period for electric exports to regions outside of model scope.

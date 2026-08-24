@@ -48,10 +48,8 @@ if __name__ == "__main__":
         rootpath = "."
     configure_logging(snakemake)
 
-    interconnect = snakemake.config["scenario"]["interconnect"][0]  # snakemake.wildcards.interconnect
+    interconnect = snakemake.config["scenario"]["interconnect"][0]
     dispatch = snakemake.params.dispatch
     subdir = snakemake.params.subdir
-    # interconnect = snakemake.params[1]
-    # subdir = snakemake.output[0]
 
     download_egs_repository(interconnect, dispatch, subdir)

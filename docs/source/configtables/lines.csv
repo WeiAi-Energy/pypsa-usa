@@ -4,3 +4,6 @@ s_max_pu,--,"Value in [0.,1.]",Correction factor for line capacities (`s_nom`) t
 s_nom_max,MW,float,Global upper limit for the maximum capacity of each extendable line.
 max_extension,MW,float,Upper limit for the extended capacity of each extendable line.
 length_factor,--,float,Correction factor to account for the fact that buses are *not* connected by lines through air-line distance. Only used in TAMU network.
+convert_lines_to_line_xs:,,,Settings for converting eligible AC lines into LineX assets during network preparation.
+-enable,--,bool,Whether to convert eligible lines to ``LineX``.
+-sssc_nom_max_pu,--,float,"Per-branch cap on the SSSC rating as a share of the line's own capacity (``sssc_nom <= sssc_nom_max_pu * s_nom``). Follows the optimized ``s_nom`` where the line is extendable. Set to ``null`` to disable the cap."
