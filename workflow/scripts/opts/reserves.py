@@ -7,6 +7,7 @@ that the capacity the region can call on covers its demand plus a reserve margin
     sum over the region of  p_nom * availability_factor           (physical generators)
   + sum over the region of  energy-backed discharge potential     (storage)
   + net actual power flow into the region across its boundary     (base state)
+  - actual loss on the branches inside the region                 (base state)
   + (1 + erm) * actual load-shedding dispatch
   >= (1 + erm) * gross regional demand
 
@@ -52,6 +53,17 @@ electrolysis link would otherwise be mistaken for a boundary crossing.
 
 Where losses are modelled, half of a branch's loss is charged at each end, matching
 PyPSA's own nodal balance.
+
+Internal losses
+---------------
+A branch with both ends in the region books both of its half-losses inside the
+region, so its whole loss is subtracted from the left-hand side. This is what keeps
+the requirement flush with the base-state nodal balance summed over the region:
+without it, at ``erm = 0`` a fully dispatched region would pass while its own
+transmission losses went unserved. Like the boundary flow the loss is read off the
+base state and is not scaled by ``1 + erm``, since the reserve state carries no power
+flow of its own to derive a stressed-state loss from. Link losses enter through the
+efficiency; a reversible link is left out rather than counted with the wrong sign.
 
 Requirement granularity
 -----------------------
@@ -386,6 +398,76 @@ def _erm_boundary_flow(n, sns, region_buses, electric_links_i):
     return terms
 
 
+def _erm_internal_loss(n, sns, region_buses, electric_links_i):
+    """
+    Base-state loss on the branches with *both* ends inside the region, as a negative
+    term on the left-hand side.
+
+    Summing PyPSA's nodal balance over the region's buses leaves the identity::
+
+        in-region dispatch + boundary net inflow - in-region branch loss = demand
+
+    The boundary term already carries the half-loss a crossing branch books at its
+    in-region end, but an internal branch books both halves inside the region and so
+    contributes its *whole* loss. Without this term the requirement is slack by
+    exactly that amount: at ``erm = 0`` a fully dispatched region would still pass
+    while its own transmission losses go unserved.
+
+    The loss is read off the base state and is *not* scaled by ``1 + erm``, for the
+    same reason the boundary flow is not: the reserve state has no power flow of its
+    own to derive a stressed-state loss from, and the base state is the only
+    consistent source for both terms.
+
+    Returns
+    -------
+    list of linopy.LinearExpression
+        One term per branch component, each already summed over the internal branches.
+    """
+    m = n.model
+    terms = []
+
+    for c in _passive_branch_components(n):
+        if f"{c}-loss" not in m.variables:
+            continue
+
+        df = n.df(c)
+        internal = df.index[df.bus0.isin(region_buses) & df.bus1.isin(region_buses)]
+        if internal.empty:
+            continue
+
+        active = DataArray(get_activity_mask(n, c, sns, internal))
+        loss = m[f"{c}-loss"].sel({c: internal})
+        terms.append((-1.0 * loss).where(active).sum(c))
+
+    if len(electric_links_i):
+        c = "Link"
+        df = n.links.loc[electric_links_i]
+        internal = df.index[df.bus0.isin(region_buses) & df.bus1.isin(region_buses)]
+
+        # A link's loss is ``(1 - efficiency) * p``, which is only a loss while
+        # ``p >= 0``. A reversible link flowing backwards would turn the term into a
+        # credit, so it is dropped rather than counted with the wrong sign.
+        if not internal.empty:
+            reversible = internal[get_as_dense(n, c, "p_min_pu", sns)[internal].min() < 0]
+            if not reversible.empty:
+                logger.warning(
+                    "%d reversible link(s) inside an ERM region are excluded from the "
+                    "internal loss term: %s",
+                    len(reversible),
+                    ", ".join(reversible[:5]),
+                )
+                internal = internal.difference(reversible)
+
+        if not internal.empty:
+            efficiency = get_as_dense(n, c, "efficiency", sns)[internal]
+            coef = -(1.0 - efficiency)
+            coef.columns = coef.columns.rename(c)
+            active = DataArray(get_activity_mask(n, c, sns, internal))
+            terms.append((DataArray(coef) * m[f"{c}-p"].sel({c: internal})).where(active).sum(c))
+
+    return terms
+
+
 def _masked_factor(n, c, sns, assets_i, factor):
     """
     A per-asset, per-snapshot ``factor`` restricted to ``assets_i`` and zeroed where
@@ -414,12 +496,13 @@ def define_erm_regional_requirements(n, sns, regions, buses):
         physical generator capacity * availability
       + storage discharge potential
       + net actual boundary flow
+      - actual loss on the branches inside the region
       + (1 + erm) * actual load-shedding dispatch
       >= (1 + erm) * gross regional demand
 
     Fixed capacity contributes a constant and is moved to the right-hand side, so the
     row only carries the extendable capacities, the reserve-state discharge variables
-    and the base-state boundary flows.
+    and the base-state boundary flows and losses.
 
     Parameters
     ----------
@@ -496,6 +579,7 @@ def define_erm_regional_requirements(n, sns, regions, buses):
                 terms.append((DataArray(efficiency) * m["Link-p_ERM"].sel(Link=links_i)).sum("Link"))
 
         terms.extend(_erm_boundary_flow(n, sns, region_buses, electric_links_i))
+        terms.extend(_erm_internal_loss(n, sns, region_buses, electric_links_i))
 
         if not terms:
             logger.warning(f"No assets or boundary branches for ERM region {name}. Skipping.")
@@ -603,8 +687,9 @@ def add_ERM_constraints(
 
     For each region and snapshot, the region's generator capacity times its
     availability factor, plus the energy-backed discharge potential of its storage,
-    plus the base state's actual net flow across the region boundary, has to cover
-    demand plus the region's reserve margin. Only the storage dischargers carry a
+    plus the base state's actual net flow across the region boundary, less the
+    base-state loss on the branches inside the region, has to cover demand plus the
+    region's reserve margin. Only the storage dischargers carry a
     reserve-state variable; see the module docstring for the full formulation.
 
     Parameters
@@ -622,8 +707,8 @@ def add_ERM_constraints(
         Direct input of ERM requirements as ``{region_name: erm_value}``. If provided,
         this takes precedence over config data.
     transmission_losses : int, optional
-        Not used. Whether the boundary term carries a loss share is read off the base
-        state, which is the only thing it can consistently follow.
+        Not used. Whether the boundary and internal-loss terms carry a loss share is
+        read off the base state, which is the only thing they can consistently follow.
     """
     # Get ERM data: dict {region_name: erm_value}
     # Default to 15% reserve margin for all regions if not specified

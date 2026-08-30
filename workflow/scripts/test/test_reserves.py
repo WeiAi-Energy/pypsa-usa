@@ -458,6 +458,81 @@ def test_erm_boundary_flow_charges_half_the_branch_loss(meshed_reserve_network):
             )
 
 
+def test_erm_internal_line_loss_is_charged_in_full(meshed_reserve_network):
+    """A branch with both ends in the region books both of its half-losses there."""
+    n = meshed_reserve_network.copy()
+    n.optimize.create_model(multi_investment_periods=True, transmission_losses=1)
+    add_ERM_constraints(n, n.snapshots, regional_erm_data={"CA_Z1": 0.15, "TX_Z1": 0.15})
+
+    snapshot = n.snapshots[0]
+    # line2 (z2 -> z3) is internal to TX_Z1: its flow nets out, its loss does not.
+    internal_loss = _label(n, "Line-loss", snapshot=snapshot, Line="line2")
+    assert _requirement_row(n, "TX_Z1", snapshot)[internal_loss] == pytest.approx(-1.0)
+    assert internal_loss not in _requirement_row(n, "CA_Z1", snapshot), (
+        "line2 has neither end in CA_Z1"
+    )
+
+
+def test_erm_carries_no_internal_loss_without_transmission_losses(meshed_reserve_network):
+    """With a lossless base state there is no loss variable and no term to add."""
+    n = meshed_reserve_network.copy()
+    n.optimize.create_model(multi_investment_periods=True)
+    add_ERM_constraints(n, n.snapshots, regional_erm_data={"TX_Z1": 0.15})
+
+    assert "Line-loss" not in n.model.variables
+    row = _requirement_row(n, "TX_Z1", n.snapshots[0])
+    flow = _label(n, "Line-s", snapshot=n.snapshots[0], Line="line2")
+    assert flow not in row, "an internal branch contributes nothing to a lossless region"
+
+
+def test_erm_internal_link_loss_enters_through_efficiency(meshed_reserve_network):
+    """An internal link's ``(1 - efficiency) * p`` is subtracted; a crossing one is not."""
+    n = meshed_reserve_network.copy()
+    n.add(
+        "Link",
+        "link2",
+        bus0="z2",
+        bus1="z3",
+        carrier="AC",
+        efficiency=0.9,
+        p_nom=200,
+        p_min_pu=0.0,
+    )
+    n.optimize.create_model(multi_investment_periods=True)
+    add_ERM_constraints(n, n.snapshots, regional_erm_data={"TX_Z1": 0.15})
+
+    snapshot = n.snapshots[0]
+    row = _requirement_row(n, "TX_Z1", snapshot)
+    assert row[_label(n, "Link-p", snapshot=snapshot, Link="link2")] == pytest.approx(-0.1)
+    # link1 (z1 -> z3) crosses the boundary, so it keeps the boundary coefficient.
+    assert row[_label(n, "Link-p", snapshot=snapshot, Link="link1")] == pytest.approx(
+        n.links.at["link1", "efficiency"],
+    )
+
+
+def test_erm_skips_reversible_internal_link(meshed_reserve_network, caplog):
+    """A link that can flow backwards is left out rather than credited a negative loss."""
+    n = meshed_reserve_network.copy()
+    n.add(
+        "Link",
+        "link2",
+        bus0="z2",
+        bus1="z3",
+        carrier="AC",
+        efficiency=0.9,
+        p_nom=200,
+        p_min_pu=-1.0,
+    )
+    n.optimize.create_model(multi_investment_periods=True)
+    with caplog.at_level("WARNING"):
+        add_ERM_constraints(n, n.snapshots, regional_erm_data={"TX_Z1": 0.15})
+
+    snapshot = n.snapshots[0]
+    row = _requirement_row(n, "TX_Z1", snapshot)
+    assert _label(n, "Link-p", snapshot=snapshot, Link="link2") not in row
+    assert "reversible link" in caplog.text
+
+
 def test_erm_all_expands_to_every_reeds_zone(reserve_margin_network, caplog):
     """``all`` is shorthand for every ReEDS zone, not one nationwide row."""
     n = reserve_margin_network.copy()
