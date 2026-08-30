@@ -28,6 +28,21 @@ FLEXIBLE_ELECTROLYSIS_LINK_SUFFIX = " flexible electrolysis"
 
 NEW_GAS_COST_CARRIERS = {"OCGT", "CCGT"}
 
+# Base carriers whose existing units make a bus eligible for new nuclear. New
+# nuclear is sited on the footprint of the existing thermal fleet -- coal,
+# gas (OCGT/CCGT and their -CCS variants) and nuclear -- because those buses
+# already have the steam/turbine interconnection, cooling and transmission
+# headroom a new reactor needs. Matching is on the base carrier, so
+# "CCGT-95CCS" counts as "CCGT" and "coal-95CCS" as "coal".
+NUCLEAR_SITING_BASE_CARRIERS = {"coal", "CCGT", "OCGT", "nuclear"}
+
+# `coal` is kept in electricity.conventional_carriers (and in
+# extendable_carriers) purely so the existing coal fleet is loaded into the
+# network and can define the new-nuclear siting set above. No coal capacity --
+# existing or new-build -- is meant to survive into the solved network; see
+# drop_coal_generators and its call site in __main__.
+COAL_BASE_CARRIER = "coal"
+
 # Carriers with one generator per bus already attached by attach_wind_and_solar
 # in add_electricity.py (real atlite resource p_nom_max + capacity-factor
 # profile, using the same unified cost table). Their new-build capacity is
@@ -50,8 +65,12 @@ def carrier_new_build_buses(
     already have their own resource-capped, per-bus new-build option from
     add_electricity.py and never reach this function.
 
-    - nuclear is buildable at every AC bus, not restricted to existing
-      nuclear sites.
+    - nuclear is restricted to the union of buses that already host a
+      coal, OCGT, CCGT, CCGT-CCS or nuclear unit (see
+      NUCLEAR_SITING_BASE_CARRIERS) -- the existing thermal footprint --
+      rather than being buildable at every AC bus. If no such bus exists,
+      nuclear is simply unbuildable (no fallback to all AC buses, which
+      would void the restriction).
     - OCGT/CCGT/CCGT-CCS share one pool: the union of buses with existing
       OCGT or CCGT capacity, since gas new-build is about existing gas
       infrastructure rather than a siting resource.
@@ -59,13 +78,34 @@ def carrier_new_build_buses(
       restricted to buses that already have that carrier -- or, for a
       "-CCS" variant, its base carrier -- installed, since that's where the
       underlying site/interconnection exists.
-    - If no such bus exists, fall back to all AC buses rather than making
-      it unbuildable.
+    - For those other carriers, if no such bus exists, fall back to all AC
+      buses rather than making it unbuildable.
       This inverts the siting restriction into no restriction at all, so it
       is logged -- it adds one extendable generator per AC bus.
     """
     if carrier == "nuclear":
-        return all_buses_i
+        thermal_buses_i = pd.Index(
+            n.generators.loc[
+                n.generators.carrier.str.split("-").str[0].isin(NUCLEAR_SITING_BASE_CARRIERS),
+                "bus",
+            ].unique(),
+        )
+        if thermal_buses_i.empty:
+            # Deliberately no fallback to all AC buses here (unlike the generic
+            # branch below): falling back would turn the siting restriction into
+            # no restriction at all and make nuclear buildable everywhere.
+            logger.warning(
+                "No existing %s capacity in the network -- new nuclear is unbuildable.",
+                sorted(NUCLEAR_SITING_BASE_CARRIERS),
+            )
+            return thermal_buses_i
+        logger.info(
+            "New nuclear restricted to %s of %s AC buses with existing %s capacity.",
+            len(thermal_buses_i),
+            len(all_buses_i),
+            sorted(NUCLEAR_SITING_BASE_CARRIERS),
+        )
+        return thermal_buses_i
     base_carrier = carrier.split("-")[0]
     if base_carrier in NEW_GAS_COST_CARRIERS:
         return gas_union_buses_i
@@ -471,6 +511,32 @@ def remove_gas_generators(n: pypsa.Network) -> None:
     if not gens.empty:
         logger.info("100VRE decarbonization: removing %s gas generators (%s).", len(gens), sorted(gas_carriers))
         n.mremove("Generator", gens.index)
+
+
+def drop_coal_generators(n: pypsa.Network) -> None:
+    """
+    Drop every coal generator (``coal`` and its ``-CCS`` variants) from the network.
+
+    Coal is listed in ``electricity.conventional_carriers`` and
+    ``electricity.extendable_carriers`` only so that the existing coal fleet is
+    attached in add_electricity.py and can define which buses are eligible for
+    new nuclear (see ``NUCLEAR_SITING_BASE_CARRIERS``). Once that bus set has
+    been computed, no coal capacity should remain: this must therefore be called
+    after ``carrier_new_build_buses`` and before any coal generator could reach
+    the optimisation.
+    """
+    coal_i = n.generators.index[n.generators.carrier.str.split("-").str[0] == COAL_BASE_CARRIER]
+    if coal_i.empty:
+        return
+    gens = n.generators.loc[coal_i]
+    logger.info(
+        "Removing %s coal generators (%s), total existing p_nom %.1f MW -- coal is only "
+        "used to define the new-nuclear siting set.",
+        len(coal_i),
+        sorted(gens.carrier.unique()),
+        gens.p_nom.fillna(0).sum(),
+    )
+    n.mremove("Generator", coal_i)
 
 
 def remove_negligible_potential_generators(n: pypsa.Network, threshold: float = 1.0) -> None:
@@ -1059,12 +1125,21 @@ if __name__ == "__main__":
     # attach_existing_renewable_capacities (add_electricity.py) already give them a
     # single extendable generator per bus -- existing capacity as p_nom/p_nom_min,
     # resource potential as p_nom_max, new-build cost -- so there's nothing to add here.
+    # Coal is excluded as well: it is configured only to seed the new-nuclear siting
+    # set, so no new coal is ever built (and the existing fleet is dropped below).
     new_carriers = sorted(
-        set(elec_config["extendable_carriers"].get("Generator", [])) - RESOURCE_PROFILE_CARRIERS,
+        c
+        for c in set(elec_config["extendable_carriers"].get("Generator", []))
+        if c not in RESOURCE_PROFILE_CARRIERS and c.split("-")[0] != COAL_BASE_CARRIER
     )
     new_generator_carrier_buses = {
         carrier: carrier_new_build_buses(n, carrier, all_ac_buses_i, gas_union_buses_i) for carrier in new_carriers
     }
+
+    # The new-build bus sets above are the last consumer of the existing coal fleet,
+    # so coal leaves the network here -- before any generator is attached for the
+    # investment periods and well before prepare_network/solve_network see it.
+    drop_coal_generators(n)
 
     for investment_year in n.investment_periods:
         costs = costs_dict[investment_year]

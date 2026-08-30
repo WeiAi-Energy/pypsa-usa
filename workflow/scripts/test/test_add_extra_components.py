@@ -11,6 +11,7 @@ from add_extra_components import (
     attach_flexible_electrolysis,
     attach_tes_storageunits,
     carrier_new_build_buses,
+    drop_coal_generators,
 )
 from regional_cost import (
     SectorCosts,
@@ -172,6 +173,39 @@ def test_nuclear_new_build_buses_are_empty_without_existing_nuclear_sites():
     )
 
     assert buses.empty
+
+
+def test_nuclear_new_build_buses_include_existing_coal_and_gas_sites():
+    n = network_with_ac_buses()
+    n.add("Bus", "ac_3", carrier="AC", x=5.0, y=6.0, country="US")
+    n.add("Generator", "existing coal", bus="ac_1", carrier="coal", p_nom=100.0)
+    n.add("Generator", "existing ccgt ccs", bus="ac_2", carrier="CCGT-95CCS", p_nom=50.0)
+    n.add("Generator", "existing solar", bus="ac_3", carrier="solar", p_nom=10.0)
+
+    buses = carrier_new_build_buses(
+        n,
+        "nuclear",
+        n.buses.index[n.buses.carrier == "AC"],
+        pd.Index([]),
+    )
+
+    # ac_3 only hosts solar, so it is not an eligible new-nuclear site.
+    assert sorted(buses.tolist()) == ["ac_1", "ac_2"]
+
+
+def test_drop_coal_generators_removes_coal_and_its_ccs_variants_only():
+    n = network_with_ac_buses()
+    n.add("Generator", "existing coal", bus="ac_1", carrier="coal", p_nom=100.0)
+    n.add("Generator", "existing coal ccs", bus="ac_1", carrier="coal-95CCS", p_nom=50.0)
+    n.add("Generator", "existing ccgt", bus="ac_2", carrier="CCGT", p_nom=200.0)
+
+    drop_coal_generators(n)
+
+    assert n.generators.index.tolist() == ["existing ccgt"]
+
+    # Idempotent: a second call on a coal-free network is a no-op.
+    drop_coal_generators(n)
+    assert n.generators.index.tolist() == ["existing ccgt"]
 
 
 def test_flexible_electrolysis_rejects_nonpositive_electricity_input(tmp_path):
