@@ -431,6 +431,105 @@ def progress_retrieve(url, file):
     urllib.request.urlretrieve(url, file, reporthook=dlProgress)
 
 
+PUDL_S3_ENDPOINT = "https://s3.us-west-2.amazonaws.com"
+
+
+def _http_proxy_from_env():
+    """Return the ``host:port`` of the configured HTTP proxy, or None."""
+    for var in ("https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY"):
+        url = os.environ.get(var)
+        if url:
+            return url.split("://", 1)[-1].rstrip("/")
+    return None
+
+
+def _duckdb_accepts_proxy(duckdb) -> bool:
+    """DuckDB grew the ``http_proxy`` setting in 0.10.3."""
+    try:
+        version = tuple(int(part) for part in duckdb.__version__.split(".")[:3])
+    except ValueError:
+        return False
+    return version >= (0, 10, 3)
+
+
+class PudlSource:
+    """
+    Hands DuckDB a readable location for the PUDL parquet files.
+
+    Interpolate it into a query the way a plain path would be --
+    ``read_parquet('{pudl}/some_table.parquet')`` -- and run that query through
+    :meth:`query`.  Which files a run needs is then stated once, in the SQL.
+
+    DuckDB's httpfs extension ignores the ``http_proxy`` environment variables,
+    and before 0.10.3 it cannot be pointed at a proxy at all.  Where the only
+    route out is a proxy -- UMich Great Lakes, for instance -- reading ``s3://``
+    blocks until the scheduler kills the job rather than raising.  ``requests``
+    does honour those variables, so there the files a query names are mirrored
+    to local disk first and the query rewritten to read the mirror.  Set
+    ``PUDL_CACHE_DIR`` to place that mirror (default ``~/.cache/pudl``).
+    """
+
+    def __init__(self, pudl_path: str):
+        import duckdb
+
+        self.pudl_path = pudl_path.rstrip("/")
+        self.remote = self.pudl_path.startswith("s3://")
+        duckdb.connect(database=":memory:", read_only=False)
+
+        proxy = _http_proxy_from_env()
+        self.mirror = self.remote and bool(proxy) and not _duckdb_accepts_proxy(duckdb)
+        if self.mirror:
+            logger.warning(
+                f"DuckDB {duckdb.__version__} cannot be pointed at a proxy ({proxy}); "
+                "mirroring the PUDL parquet files this run needs to local disk.",
+            )
+        elif self.remote:
+            duckdb.query("INSTALL httpfs;")
+            duckdb.query("LOAD httpfs;")
+            duckdb.query("SET s3_region='us-west-2';")
+            if proxy:
+                duckdb.query(f"SET http_proxy='{proxy}';")
+
+    def __str__(self) -> str:
+        return self.pudl_path
+
+    def query(self, sql: str):
+        """Run ``sql``, first making every parquet file it names reachable."""
+        import duckdb
+
+        if self.mirror:
+            sql = re.sub(
+                re.escape(self.pudl_path) + r"/([^'\"\s]+\.parquet)",
+                lambda match: self._localize(match.group(1)),
+                sql,
+            )
+        return duckdb.query(sql)
+
+    def _localize(self, filename: str) -> str:
+        """Download ``filename`` unless it is already cached; return its local path."""
+        root = os.environ.get("PUDL_CACHE_DIR") or Path.home() / ".cache" / "pudl"
+        cache = Path(root) / self.pudl_path.rsplit("/", 1)[-1]
+        cache.mkdir(parents=True, exist_ok=True)
+        target = cache / filename
+
+        if not (target.exists() and target.stat().st_size):
+            url = f"{PUDL_S3_ENDPOINT}/{self.pudl_path[len('s3://') :]}/{filename}"
+            logger.info(f"Caching {filename} from {url}")
+            # A unique suffix keeps parallel jobs off each other's partial files.
+            partial = target.with_name(f"{filename}.{os.getpid()}.part")
+            try:
+                with requests.get(url, stream=True, timeout=(30, 300)) as response:
+                    response.raise_for_status()
+                    with open(partial, "wb") as handle:
+                        for chunk in response.iter_content(chunk_size=8 * 1024 * 1024):
+                            handle.write(chunk)
+                partial.replace(target)
+            finally:
+                partial.unlink(missing_ok=True)
+
+        return target.as_posix()
+
+
 def get_aggregation_strategies(aggregation_strategies):
     # default aggregation strategies that cannot be defined in .yaml format must be specified within
     # the function, otherwise (when defaults are passed in the function's definition) they get lost

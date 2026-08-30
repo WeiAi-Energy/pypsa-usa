@@ -4,29 +4,23 @@ import logging
 import re
 
 import constants as const
-import duckdb
 import numpy as np
 import pandas as pd
-from _helpers import configure_logging, weighted_avg
+from _helpers import PudlSource, configure_logging, weighted_avg
 
 logger = logging.getLogger(__name__)
 
 
-def initialize_duckdb():
-    duckdb.connect(database=":memory:", read_only=False)
-    duckdb.query("INSTALL httpfs;")
-
-
-def load_eia_operable_data(parquet_path: str):
+def load_eia_operable_data(pudl: PudlSource):
     """Queries the parquet files directly for operable plant data."""
-    return duckdb.query(
+    return pudl.query(
         f"""
         WITH monthly_generators AS (
             SELECT
                 plant_id_eia,
                 generator_id,
                 array_agg(unit_heat_rate_mmbtu_per_mwh ORDER BY report_date DESC) FILTER (WHERE unit_heat_rate_mmbtu_per_mwh IS NOT NULL)[1] AS unit_heat_rate_mmbtu_per_mwh
-            FROM read_parquet('{parquet_path}/out_eia__monthly_generators.parquet')
+            FROM read_parquet('{pudl}/out_eia__monthly_generators.parquet')
             WHERE report_date >= '2023-01-01'
             GROUP BY plant_id_eia, generator_id
         )
@@ -58,10 +52,10 @@ def load_eia_operable_data(parquet_path: str):
             array_agg(yg.generator_retirement_date ORDER BY yg.report_date DESC) FILTER (WHERE yg.generator_retirement_date IS NOT NULL)[1] AS generator_retirement_date,
             array_agg(yg.fuel_type_code_pudl ORDER BY yg.report_date DESC) FILTER (WHERE yg.fuel_type_code_pudl IS NOT NULL)[1] AS fuel_type_code_pudl,
             first(mg.unit_heat_rate_mmbtu_per_mwh) AS unit_heat_rate_mmbtu_per_mwh
-        FROM read_parquet('{parquet_path}/out_eia__yearly_generators.parquet') yg
-        LEFT JOIN read_parquet('{parquet_path}/core_eia860__scd_generators_energy_storage.parquet') ges
+        FROM read_parquet('{pudl}/out_eia__yearly_generators.parquet') yg
+        LEFT JOIN read_parquet('{pudl}/core_eia860__scd_generators_energy_storage.parquet') ges
             ON yg.plant_id_eia = ges.plant_id_eia AND yg.generator_id = ges.generator_id
-        LEFT JOIN read_parquet('{parquet_path}/core_eia860__scd_plants.parquet') p
+        LEFT JOIN read_parquet('{pudl}/core_eia860__scd_plants.parquet') p
             ON yg.plant_id_eia = p.plant_id_eia
         LEFT JOIN monthly_generators mg
             ON yg.plant_id_eia = mg.plant_id_eia AND yg.generator_id = mg.generator_id
@@ -73,7 +67,7 @@ def load_eia_operable_data(parquet_path: str):
     ).to_df()
 
 
-def load_heat_rates_data(parquet_path: str, start_date: str, end_date: str):
+def load_heat_rates_data(pudl: PudlSource, start_date: str, end_date: str):
     """Queries the parquet files for heat rate and fuel cost data within the specified date range."""
     query = f"""
     WITH monthly_generators AS (
@@ -84,7 +78,7 @@ def load_heat_rates_data(parquet_path: str, start_date: str, end_date: str):
             unit_heat_rate_mmbtu_per_mwh,
             fuel_cost_per_mwh,
             fuel_cost_per_mmbtu
-        FROM read_parquet('{parquet_path}/out_eia__monthly_generators.parquet')
+        FROM read_parquet('{pudl}/out_eia__monthly_generators.parquet')
         WHERE operational_status = 'existing'
         AND report_date BETWEEN '{start_date}' AND '{end_date}'
         AND unit_heat_rate_mmbtu_per_mwh IS NOT NULL
@@ -106,14 +100,14 @@ def load_heat_rates_data(parquet_path: str, start_date: str, end_date: str):
         p.nerc_region,
         p.balancing_authority_code_eia
     FROM monthly_generators mg
-    LEFT JOIN read_parquet('{parquet_path}/out_eia__yearly_generators.parquet') yg
+    LEFT JOIN read_parquet('{pudl}/out_eia__yearly_generators.parquet') yg
         ON mg.plant_id_eia = yg.plant_id_eia AND mg.generator_id = yg.generator_id
-    LEFT JOIN read_parquet('{parquet_path}/core_eia860__scd_plants.parquet') p
+    LEFT JOIN read_parquet('{pudl}/core_eia860__scd_plants.parquet') p
         ON mg.plant_id_eia = p.plant_id_eia
     WHERE yg.operational_status = 'existing'
     ORDER BY mg.report_date DESC
     """
-    return duckdb.query(query).to_df()
+    return pudl.query(query).to_df()
 
 
 def set_non_conus(eia_data_operable):
@@ -699,9 +693,9 @@ if __name__ == "__main__":
     start_date = f"{data_year}-01-01"
     end_date = f"{data_year + 1}-01-01"
 
-    initialize_duckdb()
-    eia_data_operable = load_eia_operable_data(snakemake.params.pudl_path)
-    heat_rates = load_heat_rates_data(snakemake.params.pudl_path, start_date, end_date)
+    pudl = PudlSource(snakemake.params.pudl_path)
+    eia_data_operable = load_eia_operable_data(pudl)
+    heat_rates = load_heat_rates_data(pudl, start_date, end_date)
 
     eia_data_operable = merge_fc_hr_data(
         eia_data_operable,

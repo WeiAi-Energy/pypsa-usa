@@ -3,9 +3,8 @@
 import logging
 
 import constants as const
-import duckdb
 import pandas as pd
-from _helpers import calculate_annuity
+from _helpers import PudlSource, calculate_annuity
 
 logger = logging.getLogger(__name__)
 CCS_CAPTURE_COST_USD_PER_TON = 20
@@ -107,17 +106,8 @@ LIFETIME_DATA = [
 ]  # https://github.com/NREL/ReEDS-2.0/blob/e65ed5ed4ffff973071839481309f77d12d802cd/inputs/plant_characteristics/maxage.csv#L4
 
 
-def create_duckdb_instance():
-    """Set up DuckDB to read parquet files directly."""
-    duckdb.connect(database=":memory:", read_only=False)
-    # Install httpfs extension to access remote files if needed
-    duckdb.query("INSTALL httpfs;")
-
-
-def load_pudl_atb_data(parquet_path: str):
+def load_pudl_atb_data(pudl: PudlSource):
     """Loads ATB data directly from parquet files."""
-    create_duckdb_instance()
-
     query = f"""
     WITH finance_cte AS (
         SELECT
@@ -128,10 +118,10 @@ def load_pudl_atb_data(parquet_path: str):
             projection_year,
             cost_recovery_period_years,
             report_year
-        FROM read_parquet('{parquet_path}/core_nrelatb__yearly_projected_financial_cases_by_scenario.parquet')
+        FROM read_parquet('{pudl}/core_nrelatb__yearly_projected_financial_cases_by_scenario.parquet')
     )
     SELECT *
-    FROM read_parquet('{parquet_path}/core_nrelatb__yearly_projected_cost_performance.parquet') atb
+    FROM read_parquet('{pudl}/core_nrelatb__yearly_projected_cost_performance.parquet') atb
     LEFT JOIN finance_cte AS finance
         ON atb.technology_description = finance.technology_description
             AND atb.model_case_nrelatb = finance.model_case_nrelatb
@@ -141,17 +131,17 @@ def load_pudl_atb_data(parquet_path: str):
             AND atb.report_year = finance.report_year
     WHERE atb.report_year = 2024
     """
-    return duckdb.query(query).to_df()
+    return pudl.query(query).to_df()
 
 
-def load_pudl_aeo_data(parquet_path: str):
+def load_pudl_aeo_data(pudl: PudlSource):
     """Loads AEO data directly from parquet files."""
     query = f"""
     SELECT *
-    FROM read_parquet('{parquet_path}/core_eiaaeo__yearly_projected_fuel_cost_in_electric_sector_by_type.parquet') aeo
+    FROM read_parquet('{pudl}/core_eiaaeo__yearly_projected_fuel_cost_in_electric_sector_by_type.parquet') aeo
     WHERE aeo.report_year = 2023
     """
-    return duckdb.query(query).to_df()
+    return pudl.query(query).to_df()
 
 
 def match_technology(row, tech_dict):
@@ -193,11 +183,12 @@ if __name__ == "__main__":
 
     emissions_data = EMISSIONS_DATA
 
-    # Path to parquet files
-    parquet_path = snakemake.params.pudl_path
+    # Resolves to the S3 bucket, or to a local mirror where DuckDB cannot
+    # reach it through the proxy.
+    pudl = PudlSource(snakemake.params.pudl_path)
 
     # Import PUDLs ATB data
-    pudl_atb = load_pudl_atb_data(parquet_path)
+    pudl_atb = load_pudl_atb_data(pudl)
     pudl_atb["pypsa-name"] = pudl_atb.apply(
         match_technology,
         axis=1,
@@ -331,7 +322,7 @@ if __name__ == "__main__":
     )
 
     # Load AEO Fuel Cost Data
-    aeo = load_pudl_aeo_data(parquet_path)
+    aeo = load_pudl_aeo_data(pudl)
     aeo = aeo[aeo.projection_year == tech_year]
     aeo = aeo[aeo.model_case_eiaaeo == aeo_params.get("scenario", "Reference")]
     cols = ["fuel_type_eiaaeo", "fuel_cost_real_per_mmbtu_eiaaeo"]
