@@ -55,7 +55,7 @@ if __name__ == "__main__":
     if "snakemake" not in globals():
         snakemake = mock_snakemake(
             "add_demand",
-            demand_level="High",
+            case="test",
         )
     configure_logging(snakemake)
 

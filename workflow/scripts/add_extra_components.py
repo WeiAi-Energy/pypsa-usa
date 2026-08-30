@@ -303,6 +303,21 @@ def attach_tes_storageunits(n: pypsa.Network, sector_costs_path: str, bus_multip
     )
 
 
+def flexible_electrolysis_accounting_region(config: dict) -> str:
+    """Return the validated hydrogen balance accounting level.
+
+    ``h2ptcreg`` (default) balances hydrogen production per 45V hydrogen PTC
+    region; ``nation`` balances it once over the whole modelled system.
+    """
+    accounting_region = config.get("accounting_region", "h2ptcreg")
+    if accounting_region not in ("h2ptcreg", "nation"):
+        raise ValueError(
+            "flexible_electrolysis 'accounting_region' must be 'h2ptcreg' or 'nation'; "
+            f"got {accounting_region!r}.",
+        )
+    return accounting_region
+
+
 def attach_flexible_electrolysis(
     n: pypsa.Network,
     config: dict,
@@ -311,12 +326,16 @@ def attach_flexible_electrolysis(
 ):
     """Attach electrolysis links at every AC bus feeding a pure accounting H2 bus.
 
-    There is one accounting H2 bus per 45V hydrogen PTC region (``h2ptcreg``, a bus
-    attribute assigned in ``build_base_network``), and each AC bus feeds the bus of
-    the region it sits in. The links have ``efficiency = 0``, so nothing is
+    With ``accounting_region: h2ptcreg`` there is one accounting H2 bus per 45V
+    hydrogen PTC region (``h2ptcreg``, a bus attribute assigned in
+    ``build_base_network``), and each AC bus feeds the bus of the region it sits
+    in. With ``accounting_region: nation`` every electrolysis link instead feeds a
+    single national accounting bus, so hydrogen production is only balanced in
+    total. Either way, buses without an ``h2ptcreg`` (non-US) get no link. The
+    links have ``efficiency = 0``, so nothing is
     injected into the H2 buses and their nodal
     balance holds trivially without any sink component. The annual hydrogen
-    production is instead imposed in ``solve_network`` as a per-``h2ptcreg``
+    production is instead imposed in ``solve_network`` as a per-accounting-region
     constraint on the link electricity withdrawal (``p0``) times the conversion
     efficiency implied by ``h2 electrolysis`` / ``electricity-input`` in
     ``simple_sector_costs.csv``. The value is validated here so a broken cost file
@@ -324,6 +343,8 @@ def attach_flexible_electrolysis(
     """
     if not config.get("enable", False):
         return
+
+    accounting_region = flexible_electrolysis_accounting_region(config)
 
     if n.buses.index.str.endswith(FLEXIBLE_ELECTROLYSIS_BUS_SUFFIX).any():
         logger.info("Flexible electrolysis accounting buses already attached. Skipping duplicate attachment.")
@@ -364,6 +385,11 @@ def attach_flexible_electrolysis(
             "No h2ptcreg for %d AC bus(es) (non-US or unmapped location); they get no electrolysis link.",
             len(ac_buses) - len(bus_regions),
         )
+
+    if accounting_region == "nation":
+        # One accounting bus for the whole system: the h2ptcreg attribute is still
+        # what selects the eligible (US) buses, but it no longer splits them.
+        bus_regions = pd.Series("nation", index=bus_regions.index)
 
     add_missing_carriers(n, ["H2", "electrolysis"])
     if "co2_emissions" not in n.carriers.columns:
@@ -413,9 +439,10 @@ def attach_flexible_electrolysis(
         build_year=int(n.investment_periods[0]),
     )
     logger.info(
-        "Attached %d flexible electrolysis links across %d h2ptcreg region(s): %s.",
+        "Attached %d flexible electrolysis links across %d %s accounting region(s): %s.",
         len(bus_regions),
         len(regions),
+        accounting_region,
         ", ".join(regions),
     )
 
@@ -444,6 +471,28 @@ def remove_gas_generators(n: pypsa.Network) -> None:
     if not gens.empty:
         logger.info("100VRE decarbonization: removing %s gas generators (%s).", len(gens), sorted(gas_carriers))
         n.mremove("Generator", gens.index)
+
+
+def remove_negligible_potential_generators(n: pypsa.Network, threshold: float = 1.0) -> None:
+    """Drop generators whose maximum capacity is below `threshold` MW (negligible buildable potential)."""
+    gens = n.generators[n.generators.p_nom_max < threshold]
+    if gens.empty:
+        return
+    with_existing = gens[gens.p_nom > 0]
+    if not with_existing.empty:
+        logger.warning(
+            "Removing %s generators with p_nom_max < %s MW that still carry existing capacity (total p_nom %.1f MW).",
+            len(with_existing),
+            threshold,
+            with_existing.p_nom.sum(),
+        )
+    logger.info(
+        "Removing %s generators with p_nom_max < %s MW (%s).",
+        len(gens),
+        threshold,
+        sorted(gens.carrier.unique()),
+    )
+    n.mremove("Generator", gens.index)
 
 
 def attach_phs_storageunits(n: pypsa.Network, elec_opts, costs: pd.DataFrame):
@@ -1052,6 +1101,8 @@ if __name__ == "__main__":
     trim_network_config = snakemake.params.trim_network
     if snakemake.params.trim_network:
         trim_network(n, trim_network_config)
+
+    remove_negligible_potential_generators(n)
 
     n.consistency_check()
     n.meta = dict(snakemake.config, **dict(wildcards=dict(snakemake.wildcards)))

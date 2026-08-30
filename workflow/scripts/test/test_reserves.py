@@ -63,7 +63,7 @@ def reserve_margin_network(base_network):
 @pytest.fixture
 def meshed_reserve_network(reserve_margin_network):
     """
-    Close the z1-z2-z3 path into a loop, and give NERC1 a second boundary branch.
+    Close the z1-z2-z3 path into a loop, and give CA_Z1 a second boundary branch.
 
     The base network is radial, so z1 has only one line leaving it. A third line makes
     z1 the endpoint of two crossing branches, which is what the boundary-flow tests
@@ -294,7 +294,7 @@ def test_erm_requirement_is_enforced_per_region(reserve_margin_network):
     erm_value = 0.30
 
     def extra_functionality(n, snapshots):
-        add_ERM_constraints(n, snapshots, regional_erm_data={"NERC1": erm_value, "NERC2": erm_value})
+        add_ERM_constraints(n, snapshots, regional_erm_data={"CA_Z1": erm_value, "TX_Z1": erm_value})
 
     status, condition = n.optimize(
         solver_name="highs",
@@ -303,7 +303,7 @@ def test_erm_requirement_is_enforced_per_region(reserve_margin_network):
     )
     assert status == "ok" and condition == "optimal", f"Optimization failed: {status}/{condition}"
 
-    constraints = {region: n.model.constraints[erm_requirement_name(region)] for region in ("NERC1", "NERC2")}
+    constraints = {region: n.model.constraints[erm_requirement_name(region)] for region in ("CA_Z1", "TX_Z1")}
     for region, constraint in constraints.items():
         assert set(constraint.coords["snapshot"].values) == set(n.snapshots)
         # A regional requirement, not a per-bus one: one row per snapshot.
@@ -314,7 +314,7 @@ def test_erm_requirement_is_enforced_per_region(reserve_margin_network):
     values = _solution_lookup(n)
 
     for region, constraint in constraints.items():
-        members = buses[n.buses.nerc_reg[buses] == region]
+        members = buses[n.buses.reeds_zone[buses] == region]
 
         # Fixed capacity is a constant and rides on the right-hand side.
         firm = sum((_firm_capacity(n, bus, n.snapshots) for bus in members), pd.Series(0.0, index=n.snapshots))
@@ -334,7 +334,7 @@ def test_erm_generator_coefficient_is_availability(reserve_margin_network):
     """An extendable generator enters its region's row at p_max_pu of that snapshot."""
     n = reserve_margin_network.copy()
     n.optimize.create_model(multi_investment_periods=True)
-    add_ERM_constraints(n, n.snapshots, regional_erm_data={"NERC1": 0.15})
+    add_ERM_constraints(n, n.snapshots, regional_erm_data={"CA_Z1": 0.15})
 
     p_max_pu = get_as_dense(n, "Generator", "p_max_pu", n.snapshots)
     extendable_at_z1 = n.generators.index[(n.generators.bus == "z1") & n.generators.p_nom_extendable]
@@ -344,7 +344,7 @@ def test_erm_generator_coefficient_is_availability(reserve_margin_network):
     assert varying, "At least one generator should have a time-varying availability"
 
     for snapshot in (n.snapshots[0], n.snapshots[9], n.snapshots[-1]):
-        row = _requirement_row(n, "NERC1", snapshot)
+        row = _requirement_row(n, "CA_Z1", snapshot)
         for gen in extendable_at_z1:
             label = _label(n, "Generator-p_nom", **{"Generator-ext": gen})
             assert row[label] == pytest.approx(p_max_pu.at[snapshot, gen]), (
@@ -352,10 +352,10 @@ def test_erm_generator_coefficient_is_availability(reserve_margin_network):
             )
 
     # Generators outside the region stay out of the row.
-    row = _requirement_row(n, "NERC1", n.snapshots[0])
+    row = _requirement_row(n, "CA_Z1", n.snapshots[0])
     for gen in n.generators.index[(n.generators.bus != "z1") & n.generators.p_nom_extendable]:
         label = _label(n, "Generator-p_nom", **{"Generator-ext": gen})
-        assert label not in row, f"{gen} is outside NERC1 and should not appear in its row"
+        assert label not in row, f"{gen} is outside CA_Z1 and should not appear in its row"
 
 
 def test_erm_load_shedding_reduces_served_demand_without_counting_as_capacity(
@@ -369,10 +369,10 @@ def test_erm_load_shedding_reduces_served_demand_without_counting_as_capacity(
     add_ERM_constraints(
         baseline,
         baseline.snapshots,
-        regional_erm_data={"NERC1": erm_value},
+        regional_erm_data={"CA_Z1": erm_value},
     )
     baseline_rhs = baseline.model.constraints[
-        erm_requirement_name("NERC1")
+        erm_requirement_name("CA_Z1")
     ].rhs.to_pandas()
 
     n = reserve_margin_network.copy()
@@ -391,11 +391,11 @@ def test_erm_load_shedding_reduces_served_demand_without_counting_as_capacity(
     add_ERM_constraints(
         n,
         n.snapshots,
-        regional_erm_data={"NERC1": erm_value},
+        regional_erm_data={"CA_Z1": erm_value},
     )
 
     # Excluding the 10 GW shedding rating leaves the constant RHS unchanged.
-    constraint = n.model.constraints[erm_requirement_name("NERC1")]
+    constraint = n.model.constraints[erm_requirement_name("CA_Z1")]
     pd.testing.assert_series_equal(
         constraint.rhs.to_pandas(),
         baseline_rhs,
@@ -404,7 +404,7 @@ def test_erm_load_shedding_reduces_served_demand_without_counting_as_capacity(
     # Actual shedding subtracts from demand before the margin is applied:
     # physical capacity + (1 + erm) * shedding >= (1 + erm) * gross demand.
     for snapshot in (n.snapshots[0], n.snapshots[-1]):
-        row = _requirement_row(n, "NERC1", snapshot)
+        row = _requirement_row(n, "CA_Z1", snapshot)
         shedding = _label(
             n,
             "Generator-p",
@@ -418,38 +418,38 @@ def test_erm_boundary_flow_is_signed_by_direction(meshed_reserve_network):
     """A branch crossing the boundary enters with the sign of the in-region end."""
     n = meshed_reserve_network.copy()
     n.optimize.create_model(multi_investment_periods=True)
-    add_ERM_constraints(n, n.snapshots, regional_erm_data={"NERC1": 0.15, "NERC2": 0.15})
+    add_ERM_constraints(n, n.snapshots, regional_erm_data={"CA_Z1": 0.15, "TX_Z1": 0.15})
 
     snapshot = n.snapshots[0]
-    row_nerc1 = _requirement_row(n, "NERC1", snapshot)
-    row_nerc2 = _requirement_row(n, "NERC2", snapshot)
+    row_ca = _requirement_row(n, "CA_Z1", snapshot)
+    row_tx = _requirement_row(n, "TX_Z1", snapshot)
     flow = {line: _label(n, "Line-s", snapshot=snapshot, Line=line) for line in n.lines.index}
 
-    # NERC1 is z1 alone. line1 (z1->z2) and line3 (z1->z3) leave it from bus0.
-    assert row_nerc1[flow["line1"]] == pytest.approx(-1.0)
-    assert row_nerc1[flow["line3"]] == pytest.approx(-1.0)
-    assert flow["line2"] not in row_nerc1, "line2 has neither end in NERC1"
+    # CA_Z1 is z1 alone. line1 (z1->z2) and line3 (z1->z3) leave it from bus0.
+    assert row_ca[flow["line1"]] == pytest.approx(-1.0)
+    assert row_ca[flow["line3"]] == pytest.approx(-1.0)
+    assert flow["line2"] not in row_ca, "line2 has neither end in CA_Z1"
 
-    # NERC1 and NERC2 partition the network, so the same branches arrive at bus1.
-    assert row_nerc2[flow["line1"]] == pytest.approx(1.0)
-    assert row_nerc2[flow["line3"]] == pytest.approx(1.0)
-    assert flow["line2"] not in row_nerc2, "line2 is internal to NERC2 and nets out"
+    # CA_Z1 and TX_Z1 partition the network, so the same branches arrive at bus1.
+    assert row_tx[flow["line1"]] == pytest.approx(1.0)
+    assert row_tx[flow["line3"]] == pytest.approx(1.0)
+    assert flow["line2"] not in row_tx, "line2 is internal to TX_Z1 and nets out"
 
-    # link1 runs z1 -> z3, so it leaves NERC1 undiminished and arrives in NERC2
+    # link1 runs z1 -> z3, so it leaves CA_Z1 undiminished and arrives in TX_Z1
     # scaled by the link efficiency.
     link_flow = _label(n, "Link-p", snapshot=snapshot, Link="link1")
-    assert row_nerc1[link_flow] == pytest.approx(-1.0)
-    assert row_nerc2[link_flow] == pytest.approx(n.links.at["link1", "efficiency"])
+    assert row_ca[link_flow] == pytest.approx(-1.0)
+    assert row_tx[link_flow] == pytest.approx(n.links.at["link1", "efficiency"])
 
 
 def test_erm_boundary_flow_charges_half_the_branch_loss(meshed_reserve_network):
     """Where the base state models losses, each end of a branch pays half of it."""
     n = meshed_reserve_network.copy()
     n.optimize.create_model(multi_investment_periods=True, transmission_losses=1)
-    add_ERM_constraints(n, n.snapshots, regional_erm_data={"NERC1": 0.15, "NERC2": 0.15})
+    add_ERM_constraints(n, n.snapshots, regional_erm_data={"CA_Z1": 0.15, "TX_Z1": 0.15})
 
     snapshot = n.snapshots[0]
-    for region in ("NERC1", "NERC2"):
+    for region in ("CA_Z1", "TX_Z1"):
         row = _requirement_row(n, region, snapshot)
         for line in ("line1", "line3"):
             label = _label(n, "Line-loss", snapshot=snapshot, Line=line)
@@ -458,19 +458,19 @@ def test_erm_boundary_flow_charges_half_the_branch_loss(meshed_reserve_network):
             )
 
 
-def test_erm_all_expands_to_every_nerc_region(reserve_margin_network, caplog):
-    """``all`` is shorthand for every NERC region, not one nationwide row."""
+def test_erm_all_expands_to_every_reeds_zone(reserve_margin_network, caplog):
+    """``all`` is shorthand for every ReEDS zone, not one nationwide row."""
     n = reserve_margin_network.copy()
     n.optimize.create_model(multi_investment_periods=True)
 
     with caplog.at_level("INFO"):
         add_ERM_constraints(n, n.snapshots, regional_erm_data={"all": 0.15})
 
-    assert {erm_requirement_name("NERC1"), erm_requirement_name("NERC2")} <= set(n.model.constraints)
-    assert any("expanded to 2 NERC regions" in record.message for record in caplog.records)
+    assert {erm_requirement_name("CA_Z1"), erm_requirement_name("TX_Z1")} <= set(n.model.constraints)
+    assert any("Added 2 ERM constraints" in record.message for record in caplog.records)
 
     # A nationwide row would have no boundary at all, so the branches would drop out.
-    row = _requirement_row(n, "NERC1", n.snapshots[0])
+    row = _requirement_row(n, "CA_Z1", n.snapshots[0])
     assert _label(n, "Line-s", snapshot=n.snapshots[0], Line="line1") in row
 
 
@@ -478,14 +478,73 @@ def test_erm_explicit_region_overrides_all(reserve_margin_network):
     """An explicit region key wins over the value inherited from ``all``."""
     n = reserve_margin_network.copy()
     n.optimize.create_model(multi_investment_periods=True)
+    add_ERM_constraints(n, n.snapshots, regional_erm_data={"all": 0.15, "CA_Z1": 0.40})
+
+    buses = n.buses.index[n.buses.carrier == "AC"]
+    demand = _bus_demand(n, buses)
+
+    for region, erm_value in [("CA_Z1", 0.40), ("TX_Z1", 0.15)]:
+        constraint = n.model.constraints[erm_requirement_name(region)]
+        members = buses[n.buses.reeds_zone[buses] == region]
+        firm = sum((_firm_capacity(n, bus, n.snapshots) for bus in members), pd.Series(0.0, index=n.snapshots))
+        expected = demand[members].sum(axis=1) * (1 + erm_value) - firm
+        assert np.allclose(constraint.rhs.to_pandas(), expected, atol=1e-6)
+
+
+def test_erm_nerc_region_expands_to_its_reeds_zones(reserve_margin_network, caplog):
+    """A NERC-region key expands into one row per ReEDS zone it contains, not one pooled row."""
+    n = reserve_margin_network.copy()
+    # Split NERC2 (z2, z3) across two distinct ReEDS zones so the expansion has more
+    # than one zone to produce.
+    n.buses.loc["z3", "reeds_zone"] = "TX_Z2"
+    n.optimize.create_model(multi_investment_periods=True)
+
+    with caplog.at_level("INFO"):
+        add_ERM_constraints(n, n.snapshots, regional_erm_data={"NERC2": 0.20})
+
+    assert {erm_requirement_name("TX_Z1"), erm_requirement_name("TX_Z2")} <= set(n.model.constraints)
+    assert erm_requirement_name("NERC2") not in n.model.constraints
+    assert any("Added 2 ERM constraints" in record.message for record in caplog.records)
+
+    buses = n.buses.index[n.buses.carrier == "AC"]
+    demand = _bus_demand(n, buses)
+    for region in ("TX_Z1", "TX_Z2"):
+        constraint = n.model.constraints[erm_requirement_name(region)]
+        members = buses[n.buses.reeds_zone[buses] == region]
+        firm = sum((_firm_capacity(n, bus, n.snapshots) for bus in members), pd.Series(0.0, index=n.snapshots))
+        expected = demand[members].sum(axis=1) * 1.20 - firm
+        assert np.allclose(constraint.rhs.to_pandas(), expected, atol=1e-6), (
+            f"{region} should carry its NERC region's margin on its own demand, not the pooled region's"
+        )
+
+
+def test_erm_explicit_zone_overrides_nerc_region(reserve_margin_network):
+    """An explicit ReEDS-zone key wins over the value inherited from its NERC region."""
+    n = reserve_margin_network.copy()
+    n.optimize.create_model(multi_investment_periods=True)
+    add_ERM_constraints(n, n.snapshots, regional_erm_data={"NERC1": 0.15, "CA_Z1": 0.40})
+
+    buses = n.buses.index[n.buses.carrier == "AC"]
+    demand = _bus_demand(n, buses)
+    constraint = n.model.constraints[erm_requirement_name("CA_Z1")]
+    members = buses[n.buses.reeds_zone[buses] == "CA_Z1"]
+    firm = sum((_firm_capacity(n, bus, n.snapshots) for bus in members), pd.Series(0.0, index=n.snapshots))
+    expected = demand[members].sum(axis=1) * 1.40 - firm
+    assert np.allclose(constraint.rhs.to_pandas(), expected, atol=1e-6)
+
+
+def test_erm_nerc_region_overrides_all(reserve_margin_network):
+    """A NERC-region key wins over the value inherited from ``all``."""
+    n = reserve_margin_network.copy()
+    n.optimize.create_model(multi_investment_periods=True)
     add_ERM_constraints(n, n.snapshots, regional_erm_data={"all": 0.15, "NERC1": 0.40})
 
     buses = n.buses.index[n.buses.carrier == "AC"]
     demand = _bus_demand(n, buses)
 
-    for region, erm_value in [("NERC1", 0.40), ("NERC2", 0.15)]:
+    for region, erm_value in [("CA_Z1", 0.40), ("TX_Z1", 0.15)]:
         constraint = n.model.constraints[erm_requirement_name(region)]
-        members = buses[n.buses.nerc_reg[buses] == region]
+        members = buses[n.buses.reeds_zone[buses] == region]
         firm = sum((_firm_capacity(n, bus, n.snapshots) for bus in members), pd.Series(0.0, index=n.snapshots))
         expected = demand[members].sum(axis=1) * (1 + erm_value) - firm
         assert np.allclose(constraint.rhs.to_pandas(), expected, atol=1e-6)
@@ -529,7 +588,7 @@ def test_multiple_non_overlapping_erms(reserve_margin_network):
     """Different regions should impose different reserve requirements."""
     n = reserve_margin_network.copy()
 
-    erm_dict = {"NERC1": 0.15, "NERC2": 0.30}
+    erm_dict = {"CA_Z1": 0.15, "TX_Z1": 0.30}
 
     def extra_functionality(n, snapshots):
         add_ERM_constraints(n, snapshots, regional_erm_data=erm_dict)
@@ -543,17 +602,17 @@ def test_multiple_non_overlapping_erms(reserve_margin_network):
 
     store_ERM_duals(n)
 
-    assert {erm_requirement_name("NERC1"), erm_requirement_name("NERC2")} <= set(n.model.constraints), (
+    assert {erm_requirement_name("CA_Z1"), erm_requirement_name("TX_Z1")} <= set(n.model.constraints), (
         "A per-region reserve requirement should exist"
     )
 
     buses = n.buses.index[n.buses.carrier == "AC"]
     demand = _bus_demand(n, buses)
 
-    # z1 is in NERC1 (0.15), z2/z3 are in NERC2 (0.30)
+    # z1 is in CA_Z1 (0.15), z2/z3 are in TX_Z1 (0.30)
     for region, erm_value in erm_dict.items():
         constraint = n.model.constraints[erm_requirement_name(region)]
-        members = buses[n.buses.nerc_reg[buses] == region]
+        members = buses[n.buses.reeds_zone[buses] == region]
         firm = sum((_firm_capacity(n, bus, n.snapshots) for bus in members), pd.Series(0.0, index=n.snapshots))
         expected = demand[members].sum(axis=1) * (1 + erm_value) - firm
         assert np.allclose(constraint.rhs.to_pandas(), expected, atol=1e-6), (
@@ -561,7 +620,7 @@ def test_multiple_non_overlapping_erms(reserve_margin_network):
         )
 
     assert hasattr(n, "erm_region_price"), "Regional reserve prices should be stored in n.erm_region_price"
-    assert sorted(n.erm_region_price.columns) == ["NERC1", "NERC2"]
+    assert sorted(n.erm_region_price.columns) == ["CA_Z1", "TX_Z1"]
     assert not n.erm_region_price.isnull().values.any()
 
     # The removed reserve state leaves no price behind either.
@@ -645,7 +704,7 @@ def test_tes_discharge_reserve_is_limited_by_connected_store_energy():
     # The discharger reaches the electricity bus through its efficiency, and the
     # charge side of a store link is not a boundary crossing: the base-state Link-p
     # of a link with one end on a tes bus never enters the requirement.
-    row = _requirement_row(n, "NERC1", snapshots[0])
+    row = _requirement_row(n, "CA_Z1", snapshots[0])
     assert row[reserve_var] == pytest.approx(0.524)
     base_link_var = _label(n, "Link-p", snapshot=snapshots[0], Link="z1 tes discharge_2030")
     assert base_link_var not in row, "A store link is not an electric boundary branch"
@@ -669,10 +728,10 @@ def test_multi_period_erm_optimization(multi_period_reserve_network):
 
     # One requirement per region spanning both periods, not one per region per period
     erm_constraints = sorted(c for c in n.model.constraints if c.startswith(f"{ERM_REQUIREMENT}_"))
-    assert erm_constraints == sorted(erm_requirement_name(r) for r in ("NERC1", "NERC2")), (
+    assert erm_constraints == sorted(erm_requirement_name(r) for r in ("CA_Z1", "TX_Z1")), (
         f"Should have exactly one ERM requirement per region, found: {erm_constraints}"
     )
-    for region in ("NERC1", "NERC2"):
+    for region in ("CA_Z1", "TX_Z1"):
         requirement = n.model.constraints[erm_requirement_name(region)]
         assert set(requirement.coords["snapshot"].values) == set(n.snapshots), (
             "The requirement should span all investment periods"
@@ -711,9 +770,9 @@ def test_multi_period_erm_activity_masking(multi_period_reserve_network):
         extra_functionality=extra_functionality,
     )
     assert status == "ok" and condition == "optimal", f"Optimization failed: {status}/{condition}"
-    assert erm_requirement_name("NERC1") in n.model.constraints
+    assert erm_requirement_name("CA_Z1") in n.model.constraints
 
-    # gas_retiring is fixed capacity at z1, so it rides on the NERC1 right-hand side.
+    # gas_retiring is fixed capacity at z1, so it rides on the CA_Z1 right-hand side.
     # After retirement its 150 MW must drop out of that constant.
     firm = _firm_capacity(n, "z1", n.snapshots)
     unmasked = (
@@ -733,7 +792,7 @@ def test_multi_period_erm_activity_masking(multi_period_reserve_network):
     buses = n.buses.index[n.buses.carrier == "AC"]
     demand = _bus_demand(n, buses)
     expected_rhs = demand[["z1"]].sum(axis=1) * 1.15 - firm
-    actual_rhs = n.model.constraints[erm_requirement_name("NERC1")].rhs.to_pandas()
+    actual_rhs = n.model.constraints[erm_requirement_name("CA_Z1")].rhs.to_pandas()
     assert np.allclose(actual_rhs, expected_rhs, atol=1e-6), (
-        "The NERC1 requirement should be built on the masked firm capacity"
+        "The CA_Z1 requirement should be built on the masked firm capacity"
     )

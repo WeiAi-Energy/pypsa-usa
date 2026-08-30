@@ -167,6 +167,7 @@ def add_technology_capacity_target_constraints(n, config):
         carriers = _as_clean_list(target.carrier)
         expressions = []
         existing_capacity = 0.0
+        blocked_new_build = []
         for component_type, variable in (
             ("Generator", "Generator-p_nom"),
             ("StorageUnit", "StorageUnit-p_nom"),
@@ -191,9 +192,16 @@ def add_technology_capacity_target_constraints(n, config):
             existing_capacity += existing.p_nom.sum()
             if not extendable.empty and variable in n.model.variables:
                 expressions.append(n.model[variable].loc[extendable.index].sum())
+                # Extendable assets already at (or past) their in-service capacity — e.g.
+                # existing plants kept extendable only to allow retirement — aren't the
+                # unconstrained new-build candidates this warning is meant to catch.
+                if target["max"] == "existing":
+                    new_build = extendable.loc[~_component_existing_mask(n, extendable)]
+                    if not new_build.empty:
+                        blocked_new_build.append(new_build)
         if not expressions:
             continue
-        if target["max"] == "existing":
+        if target["max"] == "existing" and blocked_new_build:
             logger.warning(
                 "TCT %s has max=existing but extendable %s capacity is still present in the "
                 "model; run remove_tct_blocked_components before optimize() so the new "

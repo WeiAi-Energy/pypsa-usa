@@ -221,6 +221,42 @@ def test_build_reeds_zone_capacity_network_aggregates_transmission_between_zones
     assert zone_link_values.iloc[0] == 75.0
 
 
+def test_build_reeds_zone_capacity_network_counts_complete_dc_fwd_rev_pair_once():
+    n = SimpleNamespace(
+        lines=pd.DataFrame(columns=["s_nom", "s_nom_opt", "bus0", "bus1", "carrier"]),
+        line_xs=pd.DataFrame(columns=["s_nom", "s_nom_opt", "bus0", "bus1", "carrier"]),
+        links=pd.DataFrame(
+            {
+                "carrier": ["DC", "DC"],
+                "p_nom": [75.0, 75.0],
+                "bus0": ["b1", "b3"],
+                "bus1": ["b3", "b1"],
+            },
+            index=["dc1_fwd", "dc1_rev"],
+        ),
+        buses=pd.DataFrame(
+            {
+                "x": [0.0, 2.0],
+                "y": [0.0, 2.0],
+                "carrier": ["AC", "AC"],
+                "reeds_zone": ["Z1", "Z2"],
+            },
+            index=["b1", "b3"],
+        ),
+        carriers=pd.DataFrame({"nice_name": {}, "color": {}}),
+    )
+    link_values = get_transmission_link_values(n, "p_nom")
+
+    _zone_n, _zone_line_values, zone_link_values = build_reeds_zone_capacity_network(
+        n,
+        pd.Series(dtype=float),
+        link_values,
+    )
+
+    assert list(zone_link_values.index) == ["DC::Z1~Z2"]
+    assert zone_link_values.iloc[0] == 75.0
+
+
 def test_resolve_capacity_map_plot_inputs_aggregates_to_zone_and_drops_sssc_when_pie_shown():
     n = make_network()
     bus_values = pd.Series(

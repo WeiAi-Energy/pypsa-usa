@@ -10,9 +10,8 @@ whole month.
 
 Because a month's cutout is cached under one file, a different representative-
 period selection that touches the same month can find a stale cutout on disk
-that is missing hours it needs. That is treated as an error (see the missing-
-hours check in ``main``) rather than a silent redownload -- delete the stale
-``.nc`` file under the cutout directory to force a rebuild.
+that is missing hours it needs. ``build_monthly_cutout`` detects this, deletes
+the stale ``.nc`` file, and rebuilds it for the current selection.
 
 Timezone
 --------
@@ -31,6 +30,7 @@ a bus simply reads off the raw grid cell it falls in.
 """
 
 import logging
+import os
 
 import atlite
 import atlite.datasets.era5 as era5
@@ -79,23 +79,42 @@ def build_monthly_cutout(path, month: pd.Period, hours: pd.DatetimeIndex, bounds
 
     If ``path`` already exists on disk, atlite reuses it as-is and ignores
     ``hours``. A cutout built for a different representative-period selection
-    will then be missing hours the current selection needs; that surfaces as
-    the missing-hours check in ``main`` raising, and the stale file must be
-    deleted manually before rerunning.
+    can then be missing hours the current selection needs; that is detected
+    here and the stale file is deleted so it gets rebuilt from scratch for
+    ``hours``.
     """
     path = str(path)
-    if not str(path).endswith(".nc"):
+    if not path.endswith(".nc"):
         raise ValueError(f"Cutout path must be a .nc file, got {path}.")
 
-    cutout = atlite.Cutout(
-        path,
-        module="era5",
-        x=slice(*bounds["x"]),
-        y=slice(*bounds["y"]),
-        dx=GRID_DEG,
-        dy=GRID_DEG,
-        time=hours,
-    )
+    def open_cutout() -> atlite.Cutout:
+        return atlite.Cutout(
+            path,
+            module="era5",
+            x=slice(*bounds["x"]),
+            y=slice(*bounds["y"]),
+            dx=GRID_DEG,
+            dy=GRID_DEG,
+            time=hours,
+        )
+
+    if os.path.exists(path):
+        existing = open_cutout()
+        available = pd.DatetimeIndex(existing.data.indexes["time"])
+        missing = hours.difference(available)
+        if not missing.empty:
+            logger.warning(
+                "ERA5 cutout for %s is missing %s representative hours (first: %s); deleting "
+                "%s and rebuilding it for the current representative-period selection.",
+                month,
+                len(missing),
+                missing[0],
+                path,
+            )
+            existing.data.close()
+            os.remove(path)
+
+    cutout = open_cutout()
     logger.info("Preparing 2 m air-temperature cutout for %s hours in %s at %s.", len(hours), month, path)
     cutout.prepare(features=["temperature"])
     return cutout
@@ -143,11 +162,9 @@ def main(snakemake) -> None:
         missing = wanted.difference(available)
         if not missing.empty:
             raise ValueError(
-                f"ERA5 cutout for {month} is missing {len(missing)} representative hours "
-                f"(first: {missing[0]}). This cutout file was likely built for a different "
-                "representative-period selection; delete it under the cutout directory so it can "
-                "be rebuilt. ERA5 and the representative source hours are both UTC, so no timezone "
-                "shift should be applied.",
+                f"ERA5 cutout for {month} is still missing {len(missing)} representative hours "
+                f"after a rebuild (first: {missing[0]}). ERA5 and the representative source hours "
+                "are both UTC, so no timezone shift should be applied.",
             )
 
         cutout.data = cutout.data.sel(time=wanted)
@@ -178,7 +195,7 @@ if __name__ == "__main__":
     if "snakemake" not in globals():
         from _helpers import mock_snakemake
 
-        snakemake = mock_snakemake("build_region_temperature", demand_level="High")
+        snakemake = mock_snakemake("build_region_temperature", case="test")
     configure_logging(snakemake)
     configure_cds_api(snakemake)
     main(snakemake)

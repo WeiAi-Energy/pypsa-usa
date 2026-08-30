@@ -83,6 +83,7 @@ electricity:
 flexible_electrolysis:
   enable: true
   annual_hydrogen_twh: 1512
+  accounting_region: h2ptcreg # h2ptcreg: one H2 balance per 45V PTC region | nation: a single national H2 balance
 
 
 
@@ -100,6 +101,7 @@ lines:
   length_factor: 1.0 # routed-length / great-circle. ReEDS prices already embed
     # route detour, so update_transmission_costs divides this back out; it must
     # match the factor used by every aggregation pass or impedance and cost shift.
+  voltage_factor: true # false prices every AC line at the 500 kV reference cost
   convert_lines_to_line_x:
     enable: false
 
@@ -184,7 +186,8 @@ solving:
     track_iterations: false
     min_iterations: 4
     max_iterations: 6
-    method: fixed_point
+    scheme: slp
+    trust_region: true
     transmission_losses: 2
     iterative_method: lossy
     linearized_unit_commitment: true
@@ -237,7 +240,6 @@ solving:
     gurobi-fallback:        # Use gurobi defaults
       name: gurobi
       crossover: 0
-      method: 2             # barrier
       BarHomogeneous: 1     # Use homogeneous barrier if standard does not converge
       BarConvTol: 1.e-5
       FeasibilityTol: 1.e-5

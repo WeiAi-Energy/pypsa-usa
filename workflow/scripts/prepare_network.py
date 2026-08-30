@@ -447,9 +447,15 @@ def set_line_nom_max(
         logger.info(f"Limiting link extensions to {p_nom_max_ext} MW")
         n.links.loc[hvdc, "p_nom_max"] = n.links.loc[hvdc, "p_nom"] + p_nom_max_ext
 
-    n.lines["s_nom_max"] = n.lines.s_nom_max.clip(upper=s_nom_max_set)
+    # Clip to the configured cap, but never below s_nom_min: a branch whose existing
+    # capacity already exceeds s_nom_max_set would otherwise end up with s_nom_max <
+    # s_nom_min, an infeasible bound pair for its own extendable capacity variable.
+    # Two sequential single-bound clips (rather than one clip(lower=..., upper=...)
+    # call) because pandas resolves a lower > upper conflict by returning upper, not
+    # lower -- the floor must be applied only after the cap.
+    n.lines["s_nom_max"] = n.lines.s_nom_max.clip(upper=s_nom_max_set).clip(lower=n.lines.s_nom_min)
     if hasattr(n, "line_xs") and not n.line_xs.empty:
-        n.line_xs["s_nom_max"] = n.line_xs.s_nom_max.clip(upper=s_nom_max_set)
+        n.line_xs["s_nom_max"] = n.line_xs.s_nom_max.clip(upper=s_nom_max_set).clip(lower=n.line_xs.s_nom_min)
         if "sssc_nom_max" in n.line_xs.columns:
             n.line_xs["sssc_nom_max"] = n.line_xs.sssc_nom_max.clip(upper=s_nom_max_set)
     n.links.loc[hvdc, "p_nom_max"] = n.links.loc[hvdc, "p_nom_max"].clip(upper=p_nom_max_set)

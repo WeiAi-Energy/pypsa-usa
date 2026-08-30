@@ -12,6 +12,7 @@ import pandas as pd
 import pypsa
 import pytest
 
+from add_electricity import update_transmission_costs
 from _helpers import (
     LINK_FIXED_COST_COL,
     LINK_UNIT_COST_COL,
@@ -137,6 +138,59 @@ def test_voltage_ratio_is_scale_free(basecost):
 def test_voltage_ratio_prices_missing_voltage_at_the_reference(basecost):
     exponent = voltage_cost_exponent(voltage_cost_anchors(basecost))
     assert voltage_ratio([np.nan, 0.0], exponent) == pytest.approx([1.0, 1.0])
+
+
+def _voltage_factor_network():
+    n = pypsa.Network()
+    n.add("Bus", "a", v_nom=138.0, carrier="AC")
+    n.add("Bus", "b", v_nom=138.0, carrier="AC")
+    n.add("Bus", "c", v_nom=500.0, carrier="AC")
+    n.buses["county"] = "p06001"
+    n.add("Line", "low_voltage", bus0="a", bus1="b", length=100.0, r=0.1, x=1.0)
+    n.add("Line", "reference_voltage", bus0="b", bus1="c", length=100.0, r=0.1, x=1.0)
+    n.lines["v_nom"] = [138.0, 500.0]
+    return n
+
+
+def _transmission_annualization_costs():
+    return pd.DataFrame(
+        {
+            "cost_recovery_period_years": {"HVAC overhead": 40.0},
+            "wacc_real": {"HVAC overhead": 0.05},
+            "opex_fixed_pct_of_capex": {"HVAC overhead": 0.02},
+        },
+    )
+
+
+def test_voltage_factor_switch_uses_500kv_cost_for_every_line():
+    n = _voltage_factor_network()
+    costs = _transmission_annualization_costs()
+
+    update_transmission_costs(
+        n,
+        costs,
+        distance_cost_fn=str(DISTANCE_COST),
+        basecost_fn=str(BASECOST),
+        voltage_factor=False,
+    )
+
+    unit_cost = n.lines.capital_cost / n.lines.length
+    assert unit_cost.loc["low_voltage"] == pytest.approx(unit_cost.loc["reference_voltage"])
+
+
+def test_voltage_factor_is_enabled_by_default():
+    n = _voltage_factor_network()
+    costs = _transmission_annualization_costs()
+
+    update_transmission_costs(
+        n,
+        costs,
+        distance_cost_fn=str(DISTANCE_COST),
+        basecost_fn=str(BASECOST),
+    )
+
+    unit_cost = n.lines.capital_cost / n.lines.length
+    assert unit_cost.loc["low_voltage"] > unit_cost.loc["reference_voltage"]
 
 
 # --------------------------------------------------------------------------

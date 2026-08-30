@@ -302,11 +302,10 @@ def representative_periods_config():
     """
     Return the shared representative-period settings.
 
-    These are deliberately read from the top-level config rather than per case:
-    ``add_electricity`` and ``simplify_network`` write to shared ``RESOURCES``, so
-    their snapshots -- and therefore the selection driving them -- must be
-    identical across cases. ``validate_shared_representative_periods`` warns if a
-    case tries to override them.
+    These are deliberately read from the top-level config rather than per case.
+    Representative-period selection and renewable profiles are upstream shared
+    resources, so their snapshots must be identical across cases.
+    ``validate_shared_representative_periods`` warns if a case overrides them.
     """
     return config.get("clustering", {}).get("temporal", {}).get("representative_periods", {}) or {}
 
@@ -320,8 +319,8 @@ def representative_periods_planning_horizons():
     """
     Return the shared planning horizon driving representative-period selection.
 
-    Read from the top-level config, not per case, for the same reason as
-    ``representative_periods_config``: the selection is shared across cases.
+    Read from the top-level config, not per case, because the selection remains a
+    shared upstream resource.
     """
     return config.get("scenario", {}).get("planning_horizons", [])
 
@@ -348,8 +347,12 @@ def validate_shared_representative_periods():
 
 def demand_level_for_wildcards(wildcards, cfg=None):
     """Resolve the demand level: use the rule's own wildcard if it carries one,
-    otherwise infer it from the case config (for case-scoped rules downstream
-    of ``add_extra_components`` that no longer carry a `demand_level` wildcard)."""
+    otherwise infer it from the case config.
+
+    Only the shared resources under ``RESOURCES`` are keyed by demand level, and
+    just the two rules writing them carry a `demand_level` wildcard.  Everything
+    case-scoped resolves the level from the case config instead, because within a
+    case the level is fixed and does not belong in the path."""
     if "demand_level" in wildcards.keys():
         return wildcards.demand_level
     if cfg is None:
@@ -361,6 +364,12 @@ def representative_periods_dir(wildcards, cfg=None):
     """Return the demand-level-scoped representative-period output directory."""
     level = demand_level_for_wildcards(wildcards, cfg=cfg)
     return RESOURCES + f"{level}Dmd/representative_periods/"
+
+
+def renewable_profile_path(wildcards, technology, cfg=None):
+    """Return the shared, demand-level-scoped renewable profile for a technology."""
+    level = demand_level_for_wildcards(wildcards, cfg=cfg)
+    return RESOURCES + f"{level}Dmd/profile_{technology}.nc"
 
 
 def representative_snapshots_input(wildcards):
@@ -381,8 +390,7 @@ def representative_metadata_input(wildcards):
 
 def region_temperature_path(wildcards, cfg=None):
     """Population-weighted region temperature aligned to the representative snapshots."""
-    level = demand_level_for_wildcards(wildcards, cfg=cfg)
-    return RESOURCES + f"{level}Dmd/region_temperature.csv"
+    return case_resource_dir(wildcards) + "region_temperature.csv"
 
 
 def temperature_derate_input(wildcards):
@@ -421,31 +429,31 @@ def elec_network_path(wildcards, cfg=None):
 
 
 def elec_dem_path(wildcards, cfg=None):
-    """`add_demand` output for the case's demand level (shared across cases with the same level)."""
-    level = demand_level_for_wildcards(wildcards, cfg=cfg)
-    return RESOURCES + f"{level}Dmd/elec_dem.nc"
+    """Case-specific `add_demand` output."""
+    return case_resource_dir(wildcards) + "elec_dem.nc"
+
+
+def electrical_demand_path(wildcards, end_use="power", cfg=None):
+    """Case-specific electrical demand table built on the simplified network."""
+    return case_resource_dir(wildcards) + f"demand/{end_use}_electricity.pkl"
 
 
 def electricity_attached_network_path(wildcards, cfg=None):
-    """`add_electricity` output before topology reduction (shared per demand level)."""
-    level = demand_level_for_wildcards(wildcards, cfg=cfg)
-    return RESOURCES + f"{level}Dmd/elec_pp.pkl"
+    """Case-specific `add_electricity` output before topology reduction."""
+    return case_resource_dir(wildcards) + "elec_pp.pkl"
 
 
 def clustered_network_path(wildcards, cfg=None):
-    """`simplify_network` output (shared per demand level)."""
-    level = demand_level_for_wildcards(wildcards, cfg=cfg)
-    return RESOURCES + f"{level}Dmd/elec.nc"
+    """Case-specific `simplify_network` output."""
+    return case_resource_dir(wildcards) + "elec.nc"
 
 
 def clustered_region_path(wildcards, region="onshore", cfg=None):
-    level = demand_level_for_wildcards(wildcards, cfg=cfg)
-    return RESOURCES + f"{level}Dmd/Geospatial/regions_{region}_elec.geojson"
+    return case_resource_dir(wildcards) + f"Geospatial/regions_{region}_elec.geojson"
 
 
 def clustered_busmap_path(wildcards, cfg=None):
-    level = demand_level_for_wildcards(wildcards, cfg=cfg)
-    return RESOURCES + f"{level}Dmd/busmap.csv"
+    return case_resource_dir(wildcards) + "busmap.csv"
 
 
 def solver_threads(w):

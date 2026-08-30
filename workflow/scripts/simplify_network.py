@@ -2,9 +2,9 @@
 """Aggregates network to substations and simplifies to a single voltage level.
 
 This module also owns the aggregation helpers this stage drives: the
-electrical-distance busmap, the pypsa clustering wrapper carrying the
-repository-standard component strategies, the region dissolve, and the topology
-plots. They used to sit in a separate ``cluster_network`` module that nothing but
+target-bus-count busmap, the pypsa clustering wrapper carrying the
+repository-standard component strategies, the region dissolve, and the
+topology plots. They used to sit in a separate ``cluster_network`` module that nothing but
 this one ever imported, and there is no ``cluster_network`` rule -- every
 aggregation pass runs here.
 """
@@ -12,6 +12,8 @@ aggregation pass runs here.
 import logging
 import warnings
 from functools import reduce
+from heapq import heappop, heappush
+from typing import NamedTuple
 
 import geopandas as gpd
 import matplotlib
@@ -31,7 +33,7 @@ from pypsa.clustering.spatial import get_clustering_from_busmap
 from scipy import sparse
 from scipy.sparse import csgraph
 from scipy.sparse.linalg import splu
-from sklearn.neighbors import BallTree
+from sklearn.cluster import ward_tree
 
 matplotlib.use("Agg")  # rendered to file inside a Snakemake job, never shown
 
@@ -43,9 +45,43 @@ warnings.filterwarnings(action="ignore", category=UserWarning)
 
 logger = logging.getLogger(__name__)
 
+#: Mean earth radius (WGS84 authalic), shared by every geographic distance here.
+EARTH_RADIUS_KM = 6371.0088
+
+#: Probe columns are i.i.d. Rademacher projections, following Spielman and
+#: Srivastava's effective-resistance embedding. Any subsample is still a
+#: Johnson-Lindenstrauss embedding whose relative error is uniform across
+#: scales. PCA is the wrong knife here: it spends its dimensions on the largest
+#: separations and blurs precisely the short ones that decide the early merges.
+#:
+#: The estimator's relative standard deviation is sqrt(2 / dims), so 128 columns
+#: hold it near 13%. The width is close to free: on a 17k-bus mesh, widening
+#: 32 -> 256 cost 29% more wall time, because the tree build is dominated by its
+#: per-merge Python loop rather than by the feature width.
+TARGET_COUNT_FEATURE_DIMS = 128
+
+#: Cluster spread is reported for diagnostics, never enforced, so an exact
+#: all-pairs diameter is not worth its quadratic cost on the biggest clusters.
+SPREAD_SAMPLE_CAP = 64
+
 #: Deepest transformer chain to resolve when collapsing transformers away.
 #: The TAMU network needs 4; the cap only guards against pathological data.
 MAX_TRAFO_CHAIN_DEPTH = 16
+
+#: Bus column naming the zone no topology reduction may merge across. Every
+#: downstream ReEDS-facing constraint (RPS, interzonal transfer limits, capacity
+#: credit) is written per zone, so a bus that migrates into a neighbouring zone
+#: -- or a cluster straddling two of them -- silently moves load and generation
+#: between the accounting buckets those constraints police. Both the low-degree
+#: reduction and the target-count clustering therefore refuse to cross it, which
+#: also guarantees every zone keeps at least one bus. Networks built on a
+#: boundary that drops the column (``state``) simply lose the guard.
+PROTECTED_ZONE_COLUMN = "reeds_zone"
+
+#: Label standing in for a bus whose :data:`PROTECTED_ZONE_COLUMN` is missing.
+#: Such buses group together rather than each becoming its own zone, so absent
+#: zone data relaxes the guard instead of freezing the reduction.
+MISSING_ZONE_LABEL = "__missing_zone__"
 
 
 def convert_to_per_unit(df):
@@ -165,10 +201,13 @@ def aggregate_to_substations(
 ):
     """Aggregate buses to substation level.
 
-    ``line_length_factor`` is the configured routing factor, not a local constant:
-    pypsa rescales ``x``/``r``/``capital_cost`` by ``new_length / old_length`` on every
-    aggregation, so the factor here must be the same one ``assign_line_length`` used
-    for it to cancel instead of biasing impedance and cost.
+    ``line_length_factor`` is the configured routing factor, not a local constant: it
+    sets the aggregated *Link* lengths, which pypsa rebuilds as the crow-fly distance
+    between the clustered buses times this factor, so it must be the same one
+    ``assign_line_length`` used for Line and Link lengths to stay on one convention.
+    Lines no longer consume it -- they take an ``s_nom``-weighted mean of the lengths
+    of the circuits they replace, and their ``x``/``r``/``capital_cost`` are combined
+    without any length rescaling.
     """
     logger.info("Aggregating buses to substation level...")
 
@@ -177,6 +216,7 @@ def aggregate_to_substations(
         aggregation_strategies.get("generators", dict()),
     )
     one_port_strategies = aggregation_strategies.get("one_ports", dict())
+    line_strategies = aggregation_strategies.get("lines", dict())
 
     clustering = get_clustering_from_busmap(
         network,
@@ -184,6 +224,7 @@ def aggregate_to_substations(
         aggregate_generators_weighted=True,
         aggregate_one_ports=["Load"],
         line_length_factor=line_length_factor,
+        line_strategies=line_strategies,
         bus_strategies={
             "type": "max",
             "Pd": "sum",
@@ -411,6 +452,115 @@ def split_one_port_components(
     return moved_generators
 
 
+def bus_zone_labels(n: pypsa.Network) -> pd.Series | None:
+    """Zone label per bus for the no-crossing guard, or ``None`` if unavailable.
+
+    Buses with no :data:`PROTECTED_ZONE_COLUMN` value share
+    :data:`MISSING_ZONE_LABEL` so they can still merge with one another.
+    """
+    if PROTECTED_ZONE_COLUMN not in n.buses.columns:
+        return None
+    labels = n.buses[PROTECTED_ZONE_COLUMN].astype("string")
+    return labels.where(labels.notna() & (labels != ""), MISSING_ZONE_LABEL).astype(str)
+
+
+class MergeHeterogeneity(NamedTuple):
+    """How unlike the members of each merged group were, as one scalar.
+
+    ``ratio`` is ``sum_g(w_g * cv_g) / sum_g(w_g)``, where ``cv_g`` is the
+    group's own ``std_g * n_g / sum_i value_i`` -- the dispersion inside the
+    group, scaled by its size, over what it pooled. It is therefore a mean
+    coefficient of variation over the merged groups: dimensionless and
+    scale-free (doubling every rating leaves it unchanged), 0 when every group
+    pooled identical members, and growing as merges pool increasingly unlike
+    things.
+
+    ``w_g`` is the MW at stake in that merge -- the summed ``s_nom`` of its
+    members -- which is both the right emphasis and the currency the loss is
+    denominated in: what a merge discards is transfer capability, and a wildly
+    mismatched merge of two tiny stubs matters less than a mismatched merge on
+    the transfer backbone. Where the pooled quantity already *is* ``s_nom`` (the
+    series metric) this is just each group's share of the total, and ``ratio``
+    collapses to ``sum_g(std_g * n_g) / sum_g(sum_i value_i)``. The parallel
+    metric measures dispersion in ``x * s_nom`` but takes its weights
+    separately, so both ratios weight a group by its capacity rather than by
+    whatever each happens to measure dispersion in, and the two stay comparable.
+
+    ``std`` is the population standard deviation (``ddof=0``). The sample
+    variant is undefined for a group of one and inflates the very common
+    two-member group by ``sqrt(2)`` for no reason; these groups are complete
+    populations, not samples drawn from anything.
+    """
+
+    ratio: float
+    groups: int
+    members: int
+    coefficients_of_variation: list[float]
+
+
+def merge_heterogeneity(groups: list, weights: list | None = None) -> MergeHeterogeneity:
+    """Fold per-group member values into a :class:`MergeHeterogeneity`.
+
+    Each entry of ``groups`` holds the values one merge pooled -- the ``s_nom``
+    of every segment in a collapsed series string, or the ``x * s_nom`` of every
+    branch in a merged parallel bundle. Groups of fewer than two finite members
+    merged nothing and are skipped, as are groups whose values sum to zero and
+    so have no coefficient of variation.
+
+    ``weights``, when given, holds one member-aligned array per group carrying
+    the MW behind each pooled value; a group weighs the ``s_nom`` of exactly the
+    members that survived the finite-value mask. Omitted, each group weighs its
+    own summed values, which is the same thing whenever the pooled quantity is
+    already ``s_nom``.
+    """
+    numerator = denominator = 0.0
+    group_count = member_count = 0
+    coefficients: list[float] = []
+    for index, values in enumerate(groups):
+        array = np.asarray(values, dtype=float)
+        finite = np.isfinite(array)
+        array = array[finite]
+        if array.size < 2:
+            continue
+        total = float(array.sum())
+        if total <= 0:
+            continue
+        deviation = float(array.std())
+        coefficient = deviation * array.size / total
+        weight = (
+            total if weights is None else float(np.asarray(weights[index], dtype=float)[finite].sum())
+        )
+        numerator += weight * coefficient
+        denominator += weight
+        group_count += 1
+        member_count += array.size
+        coefficients.append(coefficient)
+    ratio = numerator / denominator if denominator > 0 else float("nan")
+    return MergeHeterogeneity(ratio, group_count, member_count, coefficients)
+
+
+def summarize_distribution(values: list[float], fmt: str = "%.4g") -> str:
+    """One-line ``n / mean / median / p90 / max`` summary for a log record.
+
+    The per-event records behind these summaries run to five figures on the
+    full network, so they go out at DEBUG and only this digest is logged at
+    INFO.
+    """
+    if not values:
+        return "n=0"
+    array = np.asarray(values, dtype=float)
+    array = array[np.isfinite(array)]
+    if not array.size:
+        return "n=0 (no finite samples)"
+    parts = [
+        ("mean", float(array.mean())),
+        ("median", float(np.median(array))),
+        ("p90", float(np.quantile(array, 0.9))),
+        ("max", float(array.max())),
+    ]
+    return f"n={array.size}, " + ", ".join(f"{name}=" + fmt % value for name, value in parts)
+
+
 def combine_parallel_impedance(values: np.ndarray) -> float:
     """Standard parallel combination ``1 / sum(1/value)`` for ``r`` or ``x``.
 
@@ -425,7 +575,11 @@ def combine_parallel_impedance(values: np.ndarray) -> float:
     return float(1.0 / np.sum(1.0 / values))
 
 
-def merge_parallel_lines(lines: pd.DataFrame, capacity_cols: list[str]) -> tuple[pd.DataFrame, int]:
+def merge_parallel_lines(
+    lines: pd.DataFrame,
+    capacity_cols: list[str],
+    group_stats: list | None = None,
+) -> tuple[pd.DataFrame, int]:
     """Merge every group of two or more Lines sharing the same unordered bus pair.
 
     ``r`` and ``x`` combine with the standard parallel-impedance formula
@@ -451,6 +605,21 @@ def merge_parallel_lines(lines: pd.DataFrame, capacity_cols: list[str]) -> tuple
     (``cost * s_nom``, summed over the group) unchanged by the merge, matching
     how pypsa's own clustering treats parallel lines. Other static columns are
     inherited from the first name in sort order, as in the series-merge case.
+
+    ``group_stats``, when given, collects one record per merged group for the
+    caller's diagnostics: the branch names, each branch's ``s_nom`` (the weight
+    the caller's ratio gives it), and for each branch its saturation angle
+    ``x * s_nom`` -- the angle difference a branch carrying its own rating
+    stands under, since DC flow puts ``x_i * s_nom_i`` across branch ``i`` at
+    ``s_nom_i``. That is the quantity the merge is really pooling, because the
+    ``min(capacity_i * x_i)`` above is exactly the smallest of these: a group
+    whose branches share one saturation angle ``c`` saturates as one body and
+    merges losslessly -- the formula returns ``c / x_parallel = sum(s_nom_i)``,
+    the full sum of the ratings -- while a wide spread means the narrowest-angle
+    branch caps the corridor and the headroom on the rest is written off. (The
+    conductance-like ``s_nom / x`` is *not* this quantity and says nothing about
+    the loss: two branches with equal ``s_nom / x`` but unequal ``x`` merge to
+    half their summed rating.)
 
     Returns the Lines frame with every such group replaced by one merged row,
     and the number of groups merged.
@@ -494,6 +663,16 @@ def merge_parallel_lines(lines: pd.DataFrame, capacity_cols: list[str]) -> tuple
                 float((rows["capital_cost"].to_numpy(dtype=float) * caps).sum() / total_cap)
                 if total_cap > 0
                 else float(rows["capital_cost"].mean())
+            )
+
+        if group_stats is not None and "s_nom" in capacity_cols:
+            caps = rows["s_nom"].to_numpy(dtype=float)
+            group_stats.append(
+                {
+                    "names": names,
+                    "s_nom": caps,
+                    "x_s_nom": np.where(x > 0, caps * x, np.nan),
+                },
             )
 
         merged_rows[keep] = merged
@@ -540,6 +719,16 @@ def reduce_low_degree_buses_and_merge_parallel_lines(n: pypsa.Network) -> tuple[
     * **degree 0** -- left in place. Deleting it would discard its demand
       weight with nowhere to send it, so it is logged instead.
 
+    A bus is only eliminated when every neighbour absorbing it sits in the same
+    :data:`PROTECTED_ZONE_COLUMN` as the bus itself. Elimination hands the bus's
+    demand weight, one-port capacity and Links to its neighbours, so allowing it
+    across a zone boundary would move load and generation between the accounting
+    buckets every ReEDS-facing constraint downstream is written against. The
+    guard keeps a bus wherever the reduction would otherwise cross, which also
+    means no zone can be emptied. Merged Lines still span zones -- it is the bus
+    contents, not the corridor, that must stay put. If the column is absent the
+    guard is skipped and logged.
+
     Bus attributes and components move as follows:
 
     * ``Pd``/``LAF_state`` split between the two neighbours in the ratio that
@@ -565,6 +754,33 @@ def reduce_low_degree_buses_and_merge_parallel_lines(n: pypsa.Network) -> tuple[
     remaining static attributes from that same segment; by this point every Line
     shares a nominal voltage courtesy of ``convert_to_voltage_level``.
 
+    Two scalars are logged alongside the counts, one per kind of merge, because
+    both discard information no later stage can recover. Each is a
+    :func:`merge_heterogeneity` ratio -- a dimensionless mean coefficient of
+    variation over the merged groups, each group weighted by the ``s_nom`` at
+    stake in it, that is 0 when every merge pooled identical members:
+
+    * **series** -- over the ``s_nom`` of every segment in each collapsed
+      *string*, not each collapsed pair. A chain is collapsed two segments at a
+      time over as many passes as it is long, so provenance is carried on the
+      surviving Line and the string is banked only once it can grow no further
+      (it is drained into a parallel bundle, dropped as a stub, or the fixed
+      point is reached). The merged corridor takes the string's *minimum*
+      rating, so this ratio tracks the headroom written off on every wider
+      segment. A segment that came out of a parallel merge counts once, at the
+      bundle's pooled rating, which is what it now is.
+    * **parallel** -- over the ``x * s_nom`` of every branch in each merged
+      bundle (see :func:`merge_parallel_lines`), the saturation angle the merge
+      is really pooling. 0 means every bundle's branches saturate together and
+      the merged corridor is rated at exactly their summed ``s_nom``; the ratio
+      grows as the narrowest-angle branch caps more of the bundle. Dispersion is
+      measured in saturation angle, but a bundle still weighs its summed
+      ``s_nom``, so this ratio and the series one weight groups alike.
+
+    Only the two ratios are logged, with the distribution of their per-group
+    contributions for context; the per-merge records behind them run to tens of
+    thousands on the full network and are not emitted.
+
     Returns the reduced network and a busmap over the *original* bus index
     giving, for each bus, the surviving bus that absorbed it. Anything keyed
     to the pre-reduction buses -- the Voronoi regions, and the substation-keyed
@@ -584,18 +800,64 @@ def reduce_low_degree_buses_and_merge_parallel_lines(n: pypsa.Network) -> tuple[
     link_endpoints_relocated = 0
     relocated_generators: set = set()
 
+    # Diagnostics: what each merge pooled. See the docstring.
+    #
+    # A series string is collapsed two segments at a time, over as many passes as
+    # it is long, so the pairs seen inside the loop are not the strings the metric
+    # is about. `segment_ratings` carries each surviving Line's provenance -- the
+    # rating of every segment folded into it so far -- and a string is banked in
+    # `collapsed_strings` once it can grow no further.
+    segment_ratings: dict[str, list[float]] = {}
+    collapsed_strings: list[list[float]] = []
+    parallel_bundles: list[np.ndarray] = []
+    parallel_weights: list[np.ndarray] = []
+    track_series = "s_nom" in min_cols
+
+    def close_string(name: str) -> None:
+        """Bank a Line's series string; it is about to stop being extendable."""
+        ratings = segment_ratings.pop(name, None)
+        if ratings is None or len(ratings) < 2:
+            return
+        collapsed_strings.append(ratings)
+
+    zones = bus_zone_labels(n)
+    if zones is None:
+        logger.warning(
+            "Buses carry no '%s' column; low-degree reduction runs without the "
+            "zone-crossing guard and may move demand between zones.",
+            PROTECTED_ZONE_COLUMN,
+        )
+        bus_zone: dict = {}
+    else:
+        bus_zone = zones.to_dict()
+    blocked_by_zone = 0
+
     while True:
         lines = n.lines
         self_loops = lines.index[lines.bus0 == lines.bus1]
         if len(self_loops):
             n.lines = lines.drop(index=self_loops)
             loops_removed += len(self_loops)
+            for name in self_loops:
+                close_string(name)
             continue
 
-        lines, n_parallel_groups = merge_parallel_lines(lines, min_cols)
+        parallel_groups: list = []
+        lines, n_parallel_groups = merge_parallel_lines(lines, min_cols, parallel_groups)
         if n_parallel_groups:
             n.lines = lines
             parallel_merged += n_parallel_groups
+            for group in parallel_groups:
+                # Every branch in the bundle stops being extendable as a series
+                # string here; the bundle becomes one fresh segment rated by the
+                # parallel merge, which is what a later series merge should see.
+                for name in group["names"]:
+                    close_string(name)
+
+                finite = np.isfinite(group["x_s_nom"])
+                if finite.sum() > 1:
+                    parallel_bundles.append(group["x_s_nom"][finite])
+                    parallel_weights.append(group["s_nom"][finite])
             continue
 
         adj: dict = {}
@@ -625,6 +887,12 @@ def reduce_low_degree_buses_and_merge_parallel_lines(n: pypsa.Network) -> tuple[
             if consumed & neighbours:
                 continue  # a neighbour is going away this pass; retry next pass
 
+            # The bus's contents are about to be handed to every neighbour, so
+            # every neighbour has to sit in the bus's own zone. See the docstring.
+            if bus in bus_zone and any(bus_zone.get(b) != bus_zone[bus] for b in neighbours):
+                blocked_by_zone += 1
+                continue
+
             if len(edges) == 1:
                 l1, b1 = edges[0]
                 hand_over(bus, [(b1, 1.0)])
@@ -632,6 +900,7 @@ def reduce_low_degree_buses_and_merge_parallel_lines(n: pypsa.Network) -> tuple[
                 drop_lines.append(l1)
                 consumed.add(bus)
                 stubs_removed += 1
+                close_string(l1)
                 continue
 
             # Parallel merging already ran this pass, so a degree-2 bus's two
@@ -663,6 +932,17 @@ def reduce_low_degree_buses_and_merge_parallel_lines(n: pypsa.Network) -> tuple[
             drop_lines.extend([l1, l2])
             consumed.add(bus)
             series_merged += 1
+
+            if track_series:
+                # Concatenate provenance rather than the two current ratings: a
+                # segment that is itself a collapsed string contributes all of
+                # its own segments, so the banked string spans the whole chain.
+                # A segment that came out of a parallel merge has no entry and
+                # counts once, at the bundle's pooled rating -- which is what it
+                # now is, one segment of this string.
+                segment_ratings[min(l1, l2)] = segment_ratings.pop(
+                    l1, [float(row1["s_nom"])],
+                ) + segment_ratings.pop(l2, [float(row2["s_nom"])])
 
         if not consumed:
             break
@@ -731,6 +1011,43 @@ def reduce_low_degree_buses_and_merge_parallel_lines(n: pypsa.Network) -> tuple[
         loops_removed,
         link_endpoints_relocated,
     )
+    # Any string still standing at the fixed point is as long as it will get.
+    for name in list(segment_ratings):
+        close_string(name)
+
+    series = merge_heterogeneity(collapsed_strings)
+    parallel = merge_heterogeneity(parallel_bundles, parallel_weights)
+    logger.info(
+        "Series s_nom heterogeneity = %.4f -- sum(std(s_nom) * segments) / sum(s_nom) "
+        "over %s collapsed strings spanning %s segments. 0 means every string pooled "
+        "equally rated segments and lost no headroom to its narrowest one. "
+        "Per-string contribution: %s.",
+        series.ratio,
+        series.groups,
+        series.members,
+        summarize_distribution(series.coefficients_of_variation, "%.4f"),
+    )
+    logger.info(
+        "Parallel x*s_nom heterogeneity = %.4f -- s_nom-weighted mean of "
+        "std(x*s_nom) * branches / sum(x*s_nom) over %s merged bundles spanning "
+        "%s branches. 0 means every bundle pooled branches of equal saturation "
+        "angle, which merge losslessly into their summed s_nom. Per-bundle "
+        "contribution: %s.",
+        parallel.ratio,
+        parallel.groups,
+        parallel.members,
+        summarize_distribution(parallel.coefficients_of_variation, "%.4f"),
+    )
+    if zones is not None:
+        surviving_zones = bus_zone_labels(n)
+        logger.info(
+            "Zone-crossing guard on '%s': %s reductions blocked; %s of %s zones still "
+            "hold at least one bus.",
+            PROTECTED_ZONE_COLUMN,
+            blocked_by_zone,
+            surviving_zones.nunique() if surviving_zones is not None else "?",
+            zones.nunique(),
+        )
     return n, busmap
 
 
@@ -809,9 +1126,11 @@ def clustering_from_busmap(
     """Aggregate a network with the repository-standard component strategies.
 
     ``line_length_factor`` is required rather than defaulted: it sets the aggregated
-    ``length``, and therefore the rescaling pypsa applies to ``x``/``r``/
-    ``capital_cost``. A default would let a caller silently pick a routing factor
-    different from the one the lengths were built with, which breaks that cancellation.
+    *Link* lengths, which pypsa rebuilds as the crow-fly distance between the clustered
+    buses times this factor. A default would let a caller silently pick a routing factor
+    different from the one the lengths were built with. Lines ignore it: their length is
+    an ``s_nom``-weighted mean over the circuits they replace, and their ``x``/``r``/
+    ``capital_cost`` are combined without any length rescaling.
     """
     line_strategies = aggregation_strategies.get("lines", dict())
     generator_strategies = apply_wind_solar_cf_aggregation_weights(
@@ -835,17 +1154,39 @@ def clustering_from_busmap(
     )
 
 
+class ReactanceEmbedding(NamedTuple):
+    """Laplacian embedding plus the exact edge set it was built from.
+
+    ``bus0``/``bus1`` are positional indices into ``n.buses``, not names, and
+    cover only the lines that actually entered the Laplacian. Callers needing a
+    connectivity graph consistent with ``islands`` must build it from these two
+    arrays -- deriving it from ``n.lines`` instead silently readmits the zero-
+    and NaN-reactance lines dropped below, which would bridge buses that the
+    island labels place in different connected components.
+    """
+
+    embedding: np.ndarray
+    islands: np.ndarray
+    bus0: np.ndarray
+    bus1: np.ndarray
+
+
 def _effective_reactance_embedding(
     n: pypsa.Network,
     n_probes: int,
     seed: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Approximate effective-reactance distances using Laplacian projections.
+) -> ReactanceEmbedding:
+    """Approximate effective-reactance distances using the S&S JL embedding.
 
     The squared embedding distance estimates the effective reactance
     ``(e_i-e_j)\' L^-1 (e_i-e_j)`` in ohm, where
     ``L = B diag(1/x) B\'``. It uses only AC-line topology and supplied series
-    reactances, never a solved dispatch or base power flow.
+    reactances, never a solved dispatch or base power flow. In the notation of
+    Spielman and Srivastava (2011), it constructs the transpose of
+    ``Q W**0.5 B L+`` with Rademacher ``Q``. The explicit ``1/sqrt(k)`` in
+    ``Q`` is instead applied when callers average squared probe differences.
+    The paper uses a near-linear approximate Laplacian solver; this routine
+    uses direct sparse solves, so it introduces no additional solver error.
     """
     buses = n.buses.index
     bus_position = pd.Series(np.arange(len(buses)), index=buses)
@@ -860,7 +1201,13 @@ def _effective_reactance_embedding(
     x = x.loc[valid].to_numpy(float)
     n_buses, n_lines = len(buses), len(lines)
     if n_lines == 0:
-        return np.zeros((n_buses, n_probes)), np.arange(n_buses)
+        empty = np.zeros(0, dtype=int)
+        return ReactanceEmbedding(
+            np.zeros((n_buses, n_probes)),
+            np.arange(n_buses),
+            empty,
+            empty,
+        )
 
     bus0 = bus_position.loc[lines.bus0].to_numpy()
     bus1 = bus_position.loc[lines.bus1].to_numpy()
@@ -874,34 +1221,174 @@ def _effective_reactance_embedding(
     laplacian = incidence @ sparse.diags(1 / x) @ incidence.T
     _, islands = csgraph.connected_components(laplacian, directed=False)
     rng = np.random.default_rng(seed)
-    rhs = incidence @ (
-        np.sqrt(1 / x)[:, None] * rng.standard_normal((n_lines, n_probes))
-    )
+    # Let ``S`` be this matrix of independent +/-1 signs. The paper's random
+    # projection is ``Q = S.T / sqrt(n_probes)``. Solving the unnormalised
+    # transpose here and averaging squared coordinate differences downstream
+    # is exactly equivalent, while also making a selected subset of columns a
+    # correctly normalised Rademacher projection in its own right.
+    signs = 2.0 * rng.integers(
+        0,
+        2,
+        size=(n_lines, n_probes),
+        dtype=np.int8,
+    ) - 1.0
+    rhs = incidence @ (np.sqrt(1 / x)[:, None] * signs)
     embedding = np.zeros((n_buses, n_probes))
     for island in np.unique(islands):
         members = np.flatnonzero(islands == island)
         if len(members) > 1:
             reduced = laplacian[members][:, members][1:, 1:].tocsc()
             embedding[members[1:]] = splu(reduced).solve(rhs[members[1:]])
-    return embedding, islands
+    return ReactanceEmbedding(embedding, islands, bus0, bus1)
 
 
-def busmap_by_electrical_distance(
+def _earth_centered_km(buses: pd.DataFrame) -> np.ndarray:
+    """Return Earth-centred Cartesian bus coordinates in kilometres.
+
+    Euclidean distances in this three-dimensional feature space are spherical
+    chord lengths, ``2 R sin(d_gc / (2 R))``, where ``d_gc`` is the great-circle
+    distance. They are a globally well-behaved, monotonic approximation to arc
+    length and avoid the latitude- and extent-dependent distortion of a local
+    two-dimensional projection. A standard Euclidean Ward objective cannot
+    represent great-circle arc lengths exactly, whereas these coordinates retain
+    the correct Earth geometry with only three features.
+    """
+    latitude = np.radians(buses.y.to_numpy(float))
+    longitude = np.radians(buses.x.to_numpy(float))
+    return EARTH_RADIUS_KM * np.c_[
+        np.cos(latitude) * np.cos(longitude),
+        np.cos(latitude) * np.sin(longitude),
+        np.sin(latitude),
+    ]
+
+
+def _calibrate_feature_scales(
+    embedding: np.ndarray,
+    bus0: np.ndarray,
+    bus1: np.ndarray,
+    geographic_km: np.ndarray,
+) -> tuple[float, float]:
+    """Return ``(km_ref, ohm_ref)`` read off the network's own typical line.
+
+    Merges only ever happen between adjacent buses, so the scale that matters
+    is the one spanned by a single line, not the diameter of the network. Both
+    references are medians over the lines that entered the Laplacian, which
+    makes them robust to a handful of very long or very reactive corridors and
+    removes the need to hand-match two thresholds carrying different units.
+
+    Calibration is deliberately global rather than per region: the tree cut
+    downstream compares merge costs across regions, and per-region references
+    would make those costs incommensurable.
+    """
+    if len(bus0) == 0:
+        logger.warning(
+            "Target-count clustering found no usable lines; falling back to "
+            "unit feature scales.",
+        )
+        return 1.0, 1.0
+
+    ohm_ref = float(np.median(((embedding[bus0] - embedding[bus1]) ** 2).mean(axis=1)))
+    km_ref = float(
+        np.median(np.linalg.norm(geographic_km[bus0] - geographic_km[bus1], axis=1)),
+    )
+    if not np.isfinite(ohm_ref) or ohm_ref <= 0:
+        logger.warning("Median line effective reactance is %s; using 1 ohm.", ohm_ref)
+        ohm_ref = 1.0
+    if not np.isfinite(km_ref) or km_ref <= 0:
+        logger.warning("Median line length is %s km; using 1 km.", km_ref)
+        km_ref = 1.0
+    return km_ref, ohm_ref
+
+
+def _intra_boundary_components(
+    n_buses: int,
+    bus0: np.ndarray,
+    bus1: np.ndarray,
+    boundary: np.ndarray,
+) -> tuple[int, np.ndarray]:
+    """Label the connected components of the line graph with region edges cut.
+
+    Each label is therefore a connected subgraph lying wholly inside one
+    topological region, which is exactly the unit that may be clustered. No
+    later step can produce a group straddling a region or a synchronous
+    island, and every cluster is guaranteed to be a connected subgraph -- a
+    property the threshold-based clique cover never offered.
+    """
+    keep = boundary[bus0] == boundary[bus1]
+    graph = sparse.coo_matrix(
+        (np.ones(int(keep.sum())), (bus0[keep], bus1[keep])),
+        shape=(n_buses, n_buses),
+    )
+    return csgraph.connected_components(graph, directed=False)
+
+
+def _dsu_find(leaders: np.ndarray, node: int) -> int:
+    """Union-find lookup with path compression, iterative to stay stack-safe."""
+    root = node
+    while leaders[root] != root:
+        root = leaders[root]
+    while leaders[node] != root:
+        leaders[node], node = root, leaders[node]
+    return root
+
+
+def _cluster_spread(
+    members_by_cluster: list[np.ndarray],
+    geographic_km: np.ndarray,
+    embedding: np.ndarray,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-cluster geographic (km) and effective-reactance (ohm) diameters."""
+    geographic, electrical = [], []
+    for members in members_by_cluster:
+        if len(members) < 2:
+            continue
+        if len(members) > SPREAD_SAMPLE_CAP:
+            members = rng.choice(members, SPREAD_SAMPLE_CAP, replace=False)
+        points = geographic_km[members]
+        geographic.append(
+            np.linalg.norm(points[:, None, :] - points[None, :, :], axis=-1).max(),
+        )
+        probes = embedding[members]
+        electrical.append(
+            ((probes[:, None, :] - probes[None, :, :]) ** 2).mean(axis=-1).max(),
+        )
+    return np.array(geographic), np.array(electrical)
+
+
+def busmap_by_target_bus_count(
     n: pypsa.Network,
-    max_geographic_distance_km: float = 10.0,
-    max_electrical_distance_ohm: float = 10.0,
-    n_probes: int = 128,
+    n_clusters: int,
+    lambda_electrical: float = 1.0,
+    n_probes: int = 256,
+    n_feature_dims: int = TARGET_COUNT_FEATURE_DIMS,
     seed: int = 123,
     topological_boundary: str | None = None,
 ) -> pd.Series:
-    """Return a region-respecting, pairwise diameter-constrained busmap.
+    """Return a busmap with exactly ``n_clusters`` groups, ranked by merge cost.
 
-    Every group is a clique in the compatibility graph: any two buses in a
-    group are in the same supplied topological region, at most
-    ``max_geographic_distance_km`` apart, and have effective-reactance distance
-    no larger than
-    ``max_electrical_distance_ohm``. A deterministic dense-first clique cover
-    gives a compact feasible aggregation without introducing a bus-count cap.
+    The caller names the cluster count and the data supplies the distance
+    thresholds. Buses are embedded in one feature space whose squared distance
+    is
+
+        ``lambda_electrical * X_eff / ohm_ref  +  d_geo^2 / km_ref^2``
+
+    with both references calibrated off the network's own typical line, so the
+    single remaining knob is the dimensionless ``lambda_electrical`` (1.0
+    weights the two equally at that scale). Ward linkage under a connectivity
+    constraint then builds one merge tree per connected intra-region subgraph,
+    and a single cut taken globally across all trees -- always accepting the
+    cheapest merge available next -- spends the cluster budget where merging
+    costs least. Dense regions get compressed hard, sparse ones keep their
+    detail, and no one has to apportion clusters between regions by hand.
+
+    No cluster spans two :data:`PROTECTED_ZONE_COLUMN` zones: the zone boundary
+    is cut alongside ``topological_boundary``, so every zone keeps at least one
+    bus and no load or generation moves between zones. With the default
+    ``reeds_zone`` boundary the two cuts are the same one.
+
+    ``n_clusters`` is the count this pass produces, and the last reduction the
+    pipeline applies -- it is the bus count of the exported network.
     """
     required = {"x", "y"}
     if topological_boundary is not None:
@@ -909,20 +1396,34 @@ def busmap_by_electrical_distance(
     missing = required.difference(n.buses.columns)
     if missing:
         raise ValueError(
-            "Electrical-distance clustering requires bus columns "
+            "Target-count clustering requires bus columns "
             f"{sorted(required)}; missing {sorted(missing)}.",
         )
-    if max_geographic_distance_km <= 0 or max_electrical_distance_ohm <= 0:
-        raise ValueError("Electrical-distance thresholds must be strictly positive.")
+    if n_clusters < 1:
+        raise ValueError("Target-count clustering requires at least one cluster.")
+    if lambda_electrical <= 0:
+        raise ValueError("lambda_electrical must be strictly positive.")
     if n_probes < 2:
-        raise ValueError("Electrical-distance clustering requires at least two probes.")
+        raise ValueError("Target-count clustering requires at least two probes.")
+    if not 1 <= n_feature_dims <= n_probes:
+        raise ValueError(
+            f"n_feature_dims must lie in [1, n_probes={n_probes}]; got {n_feature_dims}.",
+        )
 
     buses = n.buses
     if buses[["x", "y"]].isna().any().any():
-        raise ValueError("Electrical-distance clustering requires coordinates for every bus.")
-
-    embedding, islands = _effective_reactance_embedding(n, n_probes, seed)
+        raise ValueError("Target-count clustering requires coordinates for every bus.")
     n_buses = len(buses)
+    if n_clusters >= n_buses:
+        logger.info(
+            "Target-count clustering asked for %s clusters on %s buses; nothing to do.",
+            n_clusters,
+            n_buses,
+        )
+        return pd.Series(buses.index.astype(str), index=buses.index, name="busmap")
+
+    embedding, _, bus0, bus1 = _effective_reactance_embedding(n, n_probes, seed)
+
     if topological_boundary is None:
         boundary = pd.Series("", index=buses.index, dtype="string")
     else:
@@ -931,57 +1432,210 @@ def busmap_by_electrical_distance(
             boundary.notna(),
             pd.Series(buses.index.astype(str), index=buses.index).radd("__missing__"),
         )
-    coordinates = np.radians(np.c_[buses.y.to_numpy(), buses.x.to_numpy()])
-    neighbours = BallTree(coordinates, metric="haversine").query_radius(
-        coordinates,
-        r=max_geographic_distance_km / 6371.0088,
-        return_distance=False,
-    )
-    adjacency = [set() for _ in range(n_buses)]
-    compatible_edges = 0
-    boundary_values = boundary.to_numpy()
-    for bus, nearby in enumerate(neighbours):
-        nearby = nearby[nearby > bus]
-        if not len(nearby):
-            continue
-        electrical_distance = ((embedding[nearby] - embedding[bus]) ** 2).mean(axis=1)
-        compatible = (
-            (islands[nearby] == islands[bus])
-            & (boundary_values[nearby] == boundary_values[bus])
-            & (electrical_distance <= max_electrical_distance_ohm)
-        )
-        for neighbour in nearby[compatible]:
-            adjacency[bus].add(int(neighbour))
-            adjacency[neighbour].add(bus)
-            compatible_edges += 1
 
-    remaining = set(range(n_buses))
-    busmap = pd.Series(index=buses.index, dtype=object, name="busmap")
-    group = 0
-    while remaining:
-        pivot = max(remaining, key=lambda bus: (len(adjacency[bus] & remaining), -bus))
-        members = [pivot]
-        candidates = (adjacency[pivot] & remaining).copy()
-        while candidates:
-            member = max(candidates, key=lambda bus: (len(adjacency[bus] & candidates), -bus))
-            members.append(member)
-            candidates.intersection_update(adjacency[member])
-        busmap.iloc[members] = f"electrical_{group}"
-        remaining.difference_update(members)
-        group += 1
+    # Cut the ReEDS zone boundary as well as the configured one, so no cluster
+    # spans two zones and every zone keeps at least one bus. This is free when
+    # the two coincide -- `reeds_zone` is the default topological boundary -- and
+    # it is the only thing holding the line when the configured boundary is the
+    # coarser `state`. A cluster straddling zones would pool load and generation
+    # across the buckets the downstream ReEDS constraints are written against.
+    zones = bus_zone_labels(n)
+    if zones is None:
+        logger.warning(
+            "Buses carry no '%s' column; target-count clustering runs without the "
+            "zone-crossing guard and may produce clusters spanning zones.",
+            PROTECTED_ZONE_COLUMN,
+        )
+    elif topological_boundary != PROTECTED_ZONE_COLUMN:
+        # Factorised pair rather than a concatenated string: no separator can be
+        # mistaken for one that occurs inside a region or zone name.
+        pair = pd.MultiIndex.from_arrays([boundary.astype(str), zones.astype(str)])
+        boundary = pd.Series(
+            pd.factorize(pair)[0].astype(str),
+            index=buses.index,
+            dtype="string",
+        )
+
+    geographic_km = _earth_centered_km(buses)
+    km_ref, ohm_ref = _calibrate_feature_scales(embedding, bus0, bus1, geographic_km)
+
+    # A subsample of the probes, not a projection of them -- see the comment on
+    # TARGET_COUNT_FEATURE_DIMS. Sorted so the feature layout is reproducible.
+    rng = np.random.default_rng(seed)
+    probes = np.sort(rng.choice(n_probes, n_feature_dims, replace=False))
+    feature = np.ascontiguousarray(
+        np.c_[
+            embedding[:, probes] * np.sqrt(lambda_electrical / (n_feature_dims * ohm_ref)),
+            geographic_km / km_ref,
+        ],
+        dtype=np.float64,
+    )
+
+    n_components, components = _intra_boundary_components(
+        n_buses,
+        bus0,
+        bus1,
+        boundary.to_numpy(),
+    )
+    if n_clusters < n_components:
+        raise ValueError(
+            f"Target-count clustering cannot produce {n_clusters} clusters: the "
+            f"network splits into {n_components} connected subgraphs once "
+            f"{topological_boundary or 'no'} region boundaries are cut, and each "
+            "must yield at least one cluster. Raise the target or coarsen the "
+            "topological boundary.",
+        )
+
+    labels = np.arange(n_components)
+    order = np.argsort(components, kind="stable")
+    starts = np.searchsorted(components[order], labels)
+    ends = np.searchsorted(components[order], labels, side="right")
+    position_in_component = np.empty(n_buses, dtype=int)
+    position_in_component[order] = np.arange(n_buses) - starts[components[order]]
+
+    # Bucket the edges by component once. Rescanning the full edge list inside
+    # the per-component loop below would be quadratic in the component count,
+    # and cutting a fine topological boundary leaves thousands of them.
+    edge_component = np.where(
+        components[bus0] == components[bus1], components[bus0], -1,
+    )
+    edge_order = np.argsort(edge_component, kind="stable")
+    edge_starts = np.searchsorted(edge_component[edge_order], labels)
+    edge_ends = np.searchsorted(edge_component[edge_order], labels, side="right")
+
+    # One Ward tree per component. ``representative`` carries, for every tree
+    # node, one leaf standing for it, so accepted merges replay into a flat
+    # union-find over buses without materialising cluster membership lists.
+    trees: list[dict] = []
+    frontier: list[tuple[float, int, int]] = []
+    leaders = np.arange(n_buses)
+    for component in range(n_components):
+        positions = order[starts[component] : ends[component]]
+        if len(positions) < 2:
+            continue
+        inside = edge_order[edge_starts[component] : edge_ends[component]]
+        rows = position_in_component[bus0[inside]]
+        cols = position_in_component[bus1[inside]]
+        connectivity = sparse.coo_matrix(
+            (np.ones(2 * len(rows)), (np.r_[rows, cols], np.r_[cols, rows])),
+            shape=(len(positions), len(positions)),
+        ).tocsr()
+        children, connected, n_leaves, _, distances = ward_tree(
+            feature[positions],
+            connectivity=connectivity,
+            return_distance=True,
+        )
+        if connected != 1:
+            raise RuntimeError(
+                f"Component {component} was built as a connected subgraph but "
+                f"sklearn reports {connected} components; sklearn would bridge "
+                "them and emit clusters spanning disconnected buses.",
+            )
+        trees.append(
+            {
+                "positions": positions,
+                "children": children,
+                # A connectivity constraint can make a later merge cheaper than
+                # an earlier one, so raw Ward distances are not always monotone
+                # here. The running maximum restores monotonicity without
+                # reordering a tree's own merges, which must stay in sequence:
+                # a merge's operands exist only once its predecessors are in.
+                "keys": np.maximum.accumulate(distances),
+                "representative": np.arange(2 * n_leaves - 1),
+                "n_leaves": n_leaves,
+            },
+        )
+        heappush(frontier, (float(trees[-1]["keys"][0]), len(trees) - 1, 0))
+
+    accepted = 0
+    while frontier and n_buses - accepted > n_clusters:
+        _, tree_index, merge_index = heappop(frontier)
+        tree = trees[tree_index]
+        left, right = tree["children"][merge_index]
+        representative, positions = tree["representative"], tree["positions"]
+        root = _dsu_find(leaders, positions[representative[left]])
+        leaders[_dsu_find(leaders, positions[representative[right]])] = root
+        representative[tree["n_leaves"] + merge_index] = representative[left]
+        accepted += 1
+        following = merge_index + 1
+        if following < len(tree["keys"]):
+            heappush(frontier, (float(tree["keys"][following]), tree_index, following))
+
+    roots = np.array([_dsu_find(leaders, bus) for bus in range(n_buses)])
+    codes = pd.factorize(roots, sort=True)[0]
+    busmap = pd.Series(
+        [f"electrical_{code}" for code in codes],
+        index=buses.index,
+        name="busmap",
+    )
+
+    if zones is not None:
+        zones_per_cluster = zones.groupby(busmap).nunique()
+        if (zones_per_cluster > 1).any():
+            raise RuntimeError(
+                f"{int((zones_per_cluster > 1).sum())} target-count clusters span more "
+                f"than one {PROTECTED_ZONE_COLUMN}; the zone boundary was supposed to "
+                "be cut.",
+            )
+        logger.info(
+            "Zone-crossing guard on '%s': %s zones in, %s zones still represented by "
+            "the %s clusters out.",
+            PROTECTED_ZONE_COLUMN,
+            zones.nunique(),
+            zones.groupby(busmap).first().nunique(),
+            busmap.nunique(),
+        )
 
     logger.info(
-        "Electrical-distance clustering: %s buses -> %s clusters; %s compatible "
-        "pairs; limits %.3f km, %.3f ohm, %s probes; topological boundary=%s.",
+        "Target-count clustering: %s buses -> %s clusters over %s connected "
+        "intra-region subgraphs; calibrated km_ref=%.3f km, ohm_ref=%.4f ohm, "
+        "lambda=%.3f, %s of %s probes as features, seed=%s, boundary=%s.",
         n_buses,
-        group,
-        compatible_edges,
-        max_geographic_distance_km,
-        max_electrical_distance_ohm,
+        busmap.nunique(),
+        n_components,
+        km_ref,
+        ohm_ref,
+        lambda_electrical,
+        n_feature_dims,
         n_probes,
+        seed,
         topological_boundary or "none",
     )
+    geographic_spread, electrical_spread = _cluster_spread(
+        [np.flatnonzero(codes == code) for code in range(codes.max() + 1)],
+        geographic_km,
+        embedding,
+        rng,
+    )
+    for name, spread, unit in (
+        ("geographic", geographic_spread, "km"),
+        ("effective-reactance", electrical_spread, "ohm"),
+    ):
+        if not len(spread):
+            continue
+        logger.info(
+            "Cluster %s diameter over %s multi-bus clusters (%s): "
+            "P50=%.3f P90=%.3f P99=%.3f max=%.3f.",
+            name,
+            len(spread),
+            unit,
+            *np.percentile(spread, [50, 90, 99]),
+            spread.max(),
+        )
     return busmap
+
+
+
+
+def identity_busmap(n: pypsa.Network) -> pd.Series:
+    """The busmap of a disabled stage: every bus maps to itself.
+
+    Each reduction stage contributes its busmap to the region dissolve and to
+    the exported ``busmap.csv``, so a stage that is switched off has to hand
+    back the neutral element rather than drop out of the composition.
+    """
+    return pd.Series(n.buses.index, index=n.buses.index, name="busmap")
+
 
 
 #: Map styling aligns with ``plot_network_maps``; state boundaries are the
@@ -1150,10 +1804,11 @@ if __name__ == "__main__":
     if "snakemake" not in globals():
         from _helpers import mock_snakemake
 
-        snakemake = mock_snakemake("simplify_network", demand_level="High")
+        snakemake = mock_snakemake("simplify_network", case="test")
     configure_logging(snakemake)
     params = snakemake.params
     topological_boundaries = snakemake.params.topological_boundaries
+    low_degree_reduction = bool(getattr(params, "low_degree_reduction", True))
 
     # Components are attached before topology reduction.  `read_network` keeps
     # the pickle hand-off's custom columns and generator time series intact.
@@ -1210,12 +1865,16 @@ if __name__ == "__main__":
         topology_line_width_reference,
     )
 
-    n, reduction_busmap = reduce_low_degree_buses_and_merge_parallel_lines(n)
+    if low_degree_reduction:
+        n, reduction_busmap = reduce_low_degree_buses_and_merge_parallel_lines(n)
+    else:
+        logger.info("Low-degree reduction disabled; leaving degree-1/2 buses in place.")
+        reduction_busmap = identity_busmap(n)
     plot_network_topology(
         n,
         snakemake.output.network_map_after_low_degree,
         snakemake.wildcards,
-        "After low-degree reduction",
+        "After low-degree reduction" if low_degree_reduction else "Low-degree reduction disabled",
         snakemake.input.state_boundaries,
         topology_central_longitude,
         topology_line_width_reference,
@@ -1224,60 +1883,58 @@ if __name__ == "__main__":
     if topological_boundaries in ["reeds_zone", "state"] and "county" in n.buses.columns:
         n.buses = n.buses.drop(columns=["county"])
 
-    distance = params.electrical_distance
-    busmap = busmap_by_electrical_distance(
-        n,
-        max_geographic_distance_km=distance["max_geographic_distance_km"],
-        max_electrical_distance_ohm=distance["max_electrical_distance_ohm"],
-        n_probes=distance.get("n_probes", 128),
-        seed=distance.get("seed", 123),
-        topological_boundary=topological_boundaries,
-    )
-    all_carriers = set(n.generators.carrier).union(set(n.storage_units.carrier))
-    clustering = clustering_from_busmap(
-        n,
-        busmap,
-        aggregate_carriers=all_carriers,
-        line_length_factor=params.length_factor,
-        aggregation_strategies=params.aggregation_strategies,
-    )
-    n = clustering.network
+    target = params.target_count
+    if target.get("enable", True):
+        busmap = busmap_by_target_bus_count(
+            n,
+            n_clusters=int(target["n_clusters"]),
+            lambda_electrical=float(target.get("lambda_electrical", 1.0)),
+            n_probes=int(target.get("n_probes", 256)),
+            n_feature_dims=int(target.get("n_feature_dims", TARGET_COUNT_FEATURE_DIMS)),
+            seed=int(target.get("seed", 123)),
+            topological_boundary=topological_boundaries,
+        )
+        all_carriers = set(n.generators.carrier).union(set(n.storage_units.carrier))
+        clustering = clustering_from_busmap(
+            n,
+            busmap,
+            aggregate_carriers=all_carriers,
+            line_length_factor=params.length_factor,
+            aggregation_strategies=params.aggregation_strategies,
+        )
+        n = clustering.network
+        target_busmap = clustering.busmap
+    else:
+        logger.info("Target-count clustering disabled; bus count left untouched.")
+        target_busmap = identity_busmap(n)
     update_p_nom_max(n)
     if "land_region" in n.generators.columns:
         n.generators["land_region"] = n.generators.land_region.fillna(n.generators.bus)
     n.meta = dict(snakemake.config, **dict(wildcards=dict(snakemake.wildcards)))
     register_topology_carriers(n)
-    plot_network_topology(
-        n,
-        snakemake.output.network_map_after_electrical_distance,
-        snakemake.wildcards,
-        "After constrained electrical-distance aggregation",
-        snakemake.input.state_boundaries,
-        topology_central_longitude,
-        topology_line_width_reference,
-    )
-
-    # The electrical-distance clustering above groups buses by geographic and
-    # electrical distance and region membership -- it has no notion of the
-    # resulting Line-graph degree, so it routinely leaves behind fresh
-    # degree-1/2 buses that the first reduction pass never saw. Run the same
-    # reduction again so the network handed to the model is free of them too.
-    n, reduction_busmap_2 = reduce_low_degree_buses_and_merge_parallel_lines(n)
-    register_topology_carriers(n)
+    # Target-count clustering is the last reduction the pipeline applies, so this
+    # is the exported network. A second low-degree pass used to run here to clear
+    # the degree-1/2 buses that clustering leaves behind; it is gone deliberately.
+    # It reduced across cluster boundaries the target-count pass had just drawn,
+    # undershooting the configured `n_clusters` by an amount nobody could predict
+    # from the config, and its series merges kept collapsing exactly the corridors
+    # clustering had chosen to keep distinct.
     plot_network_topology(
         n,
         snakemake.output.network_map,
         snakemake.wildcards,
-        "After second low-degree reduction",
+        "After target-bus-count aggregation"
+        if target.get("enable", True)
+        else "Target-bus-count aggregation disabled",
         snakemake.input.state_boundaries,
         topology_central_longitude,
         topology_line_width_reference,
     )
 
-    # The Voronoi regions are keyed by substations.  Compose all three maps --
-    # first low-degree pass, electrical-distance clustering, second low-degree
-    # pass -- before dissolving them into final regions and bus labels.
-    busmaps = (reduction_busmap, clustering.busmap, reduction_busmap_2)
+    # The Voronoi regions are keyed by substations.  Compose both maps -- the
+    # low-degree pass and the target-count clustering -- before dissolving them
+    # into final regions and bus labels.
+    busmaps = (reduction_busmap, target_busmap)
     cluster_regions(busmaps, snakemake.input, snakemake.output)
 
     # Anything still keyed by the raw substation ids -- the regions above, and
@@ -1288,15 +1945,15 @@ if __name__ == "__main__":
     composed.rename_axis("sub_id").rename("bus_id").to_csv(snakemake.output.busmap)
 
     # No Line-level counterpart is published. `clustering.linemap` covers only the
-    # electrical-distance pass, so its index is intermediate Line names that match
+    # target-count pass, so its index is intermediate Line names that match
     # nothing a caller holds, while merged Lines inherit the first of their names --
     # which makes a final name coincide with an unrelated original name often enough
     # (17k of 20k on the USA network) that joining the two would silently succeed and
     # be wrong. Tracing an original Line to its corridor needs name bookkeeping
-    # through both low-degree passes as well; nothing consumes it today.
+    # through the low-degree pass as well; nothing consumes it today.
 
-    # Substation aggregation, electrical-distance clustering and both low-degree
-    # passes all move Link endpoints, so the distance their cost was priced on is
+    # Substation aggregation, the low-degree reduction and target-count clustering
+    # all move Link endpoints, so the distance their cost was priced on is
     # stale by now. Lines need no equivalent step: their `capital_cost` is strictly
     # proportional to `length`, which every aggregation rule above preserves.
     recompute_link_transmission_costs(n)

@@ -267,3 +267,44 @@ def test_add_technology_capacity_target_constraints(policy_network, tct_config):
     names = list(n.model.constraints)
     assert any(name.startswith("TCT-") and name.endswith("_min") for name in names)
     assert any(name.startswith("TCT-") and name.endswith("_max") for name in names)
+
+
+def test_remove_tct_blocked_components_max_zero_forces_retirement(policy_network):
+    """A ``max=0`` TCT row (e.g. reeds_GT_forced_retirement) removes both existing and candidate generators of that carrier/region."""
+    from opts.policy import remove_tct_blocked_components
+
+    n = policy_network
+
+    # gas1 (bus z1 / reeds_state CA) is an existing, non-extendable generator.
+    # Add a not-yet-built candidate in the same region/carrier to confirm both are purged.
+    n.add(
+        "Generator",
+        "gas_candidate_ca",
+        bus="z1",
+        p_nom=0,
+        p_nom_extendable=True,
+        carrier="gas",
+        capital_cost=450,
+        marginal_cost=18,
+        p_max_pu=pd.Series(1.0, index=n.snapshots),
+        p_nom_max=1000,
+        build_year=2035,
+        lifetime=20,
+    )
+
+    config = {
+        "electricity": {
+            "technology_capacity_targets": os.path.join(
+                os.path.dirname(__file__),
+                "fixtures/technology_capacity_targets_forced_retirement.csv",
+            ),
+        },
+    }
+
+    removed = remove_tct_blocked_components(n, config, components=("Generator", "StorageUnit", "Link"))
+
+    assert set(removed["Generator"]) == {"gas1", "gas_candidate_ca"}
+    assert "gas1" not in n.generators.index
+    assert "gas_candidate_ca" not in n.generators.index
+    # gas2 sits on bus z3 (reeds_state TX), outside the target's region, so it survives.
+    assert "gas2" in n.generators.index

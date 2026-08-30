@@ -1,4 +1,12 @@
 ﻿,Unit,Value,Description
+low_degree_reduction,bool,"{true, false}","Whether to iteratively eliminate degree-1 and degree-2 buses and merge parallel lines. Runs once before and once after the target-count aggregation. Exact for the rest of the network (series combination is a Kron elimination), so switching it off costs bus count without buying fidelity."
+target_count:,,,Bus aggregation in ``simplify_network``: the caller names the cluster count and the distance references are calibrated from the network.
+-- enable,bool,"{true, false}",Whether to run the target-count aggregation at all. With this and ``low_degree_reduction`` both off the stage still converts voltage levels, removes transformers and aggregates to substations.
+-- n_clusters,int,int,"Number of clusters this pass produces. Not the bus count of the exported network -- the second low-degree reduction that follows shrinks it further. Must be at least the number of connected subgraphs left once region boundaries are cut."
+-- lambda_electrical,--,float,"Dimensionless weight on the electrical term. 1.0 weights effective reactance and geographic distance equally at the scale of a typical line; above 1 favours electrical proximity, below 1 favours geographic proximity."
+-- n_probes,int,int,Random probes used to approximate effective reactance and to calibrate the reference scales.
+-- n_feature_dims,int,"int, <= n_probes","Probe columns kept as clustering features, setting how faithfully the effective-reactance term is reproduced: the relative error of the estimate is sqrt(2 / n_feature_dims). A subsample of the probes rather than a projection of them, so that error stays uniform across scales instead of concentrating on the short distances that decide the early merges."
+-- seed,int,int,Seed for the probe draw and subsample. Fixing it makes the busmap reproducible.
 simplify_network:,,,
 weighting_strategy,str,"{population, demand-capacity}","When building multiple networks, Use 'population' if you want to ensure the clusters are assigned constant names."
 to_substations,bool,"{true, false}",Implementation curerntly overrides to true. Network is simplified to substation nodes with positive or negative power injection.

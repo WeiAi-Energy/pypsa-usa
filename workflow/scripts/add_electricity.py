@@ -136,8 +136,12 @@ def update_transmission_costs(
     *,
     distance_cost_fn: str,
     basecost_fn: str,
+    voltage_factor: bool = True,
 ):
     """Price AC lines and DC links by voltage class and by route region.
+
+    When ``voltage_factor`` is false, AC lines of every nominal voltage use the
+    500 kV reference cost instead of the voltage-specific cost ratio.
 
     Both components are costed per **great-circle km**: ``n.lines.length`` already
     carries ``length_factor`` from ``build_base_network.assign_line_length``, so it
@@ -149,8 +153,9 @@ def update_transmission_costs(
     ``capital_cost`` stays exactly proportional to ``length``, which is what makes
     the three aggregation passes downstream preserve it: parallel merging averages
     it by capacity, series merging sums cost and length together, and pypsa's
-    ``length_capacity_weighted_average`` rebuilds it as
-    ``new_length * capacity-weighted mean unit cost``.
+    clustering takes the capacity-weighted mean of both ``capital_cost`` and
+    ``length`` over each corridor, which leaves their ratio a weighted mean of the
+    same unit costs.
 
     Links are handled by :func:`recompute_link_transmission_costs` off two stored
     columns instead, because their endpoints move under aggregation while pypsa
@@ -185,9 +190,12 @@ def update_transmission_costs(
 
     if not n.lines.empty:
         ac_factor = _annualization_factor(costs, "HVAC overhead")
+        voltage_multiplier = (
+            voltage_ratio(n.lines["v_nom"], voltage_exponent) if voltage_factor else 1.0
+        )
         n.lines["capital_cost"] = (
             unit_cost_usd2022(n.lines)
-            * voltage_ratio(n.lines["v_nom"], voltage_exponent)
+            * voltage_multiplier
             * ac_factor
             * (n.lines["length"] / length_factor)
         )
@@ -1216,6 +1224,7 @@ def main(snakemake):
         params.length_factor,
         distance_cost_fn=snakemake.input.transmission_distance_cost,
         basecost_fn=snakemake.input.transmission_basecost,
+        voltage_factor=params.voltage_factor,
     )
 
     renewable_carriers = set(params.renewable_carriers)
@@ -1335,6 +1344,6 @@ if __name__ == "__main__":
     if "snakemake" not in globals():
         from _helpers import mock_snakemake
 
-        snakemake = mock_snakemake("add_electricity", demand_level="High")
+        snakemake = mock_snakemake("add_electricity", case="test")
     configure_logging(snakemake)
     main(snakemake)

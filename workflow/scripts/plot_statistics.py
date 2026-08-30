@@ -175,7 +175,13 @@ def _calculate_component_capex(
     optimal_col: str | None = None,
     capital_cost_col: str = "capital_cost",
 ) -> pd.Series:
-    """Calculate CAPEX for extendable assets using capital_cost * (nom_opt - nom), grouped by carrier."""
+    """Calculate CAPEX for extendable assets, grouped by carrier.
+
+    Assets whose index is labeled "existing" use capital_cost * nom, since their
+    nom_opt can fall below nom when the optimizer retires capacity, which would
+    otherwise register as negative CAPEX for what is really avoided fixed cost.
+    All other (buildable) assets keep capital_cost * (nom_opt - nom).
+    """
     if df.empty:
         return pd.Series(dtype=float)
 
@@ -194,12 +200,12 @@ def _calculate_component_capex(
     if expandable.empty:
         return pd.Series(dtype=float)
 
-    capex = (
-        expandable[capital_cost_col].fillna(0.0)
-        * (
-        expandable[optimal_col].fillna(expandable[nominal_attr].fillna(0.0)) - expandable[nominal_attr].fillna(0.0)
-    )
-    )
+    capital_cost = expandable[capital_cost_col].fillna(0.0)
+    nom = expandable[nominal_attr].fillna(0.0)
+    nom_opt = expandable[optimal_col].fillna(nom)
+    is_existing = expandable.index.astype(str).str.contains("existing")
+
+    capex = capital_cost * pd.Series(np.where(is_existing, nom, nom_opt - nom), index=expandable.index)
     carrier_labels = _get_carrier_display_series(
         expandable["carrier"],
         n,
@@ -853,6 +859,43 @@ def get_currently_installed_capacity(n: pypsa.Network) -> pd.DataFrame:
     existing_capacity = existing_capacity.droplevel(1)
     existing_capacity = existing_capacity.set_index(nn_carriers, append=True)
     return existing_capacity.groupby(level=[0, 1]).sum()
+
+
+def get_sssc_capacity_by_nerc_region(n: pypsa.Network) -> pd.DataFrame:
+    """Return optimal SSSC capacity (MW) and its share of the national total by NERC region.
+
+    Each LineX's optimal SSSC capacity (sssc_nom_opt) is split evenly between the NERC
+    regions of its two terminal buses, so a line entirely within one region has all of its
+    capacity counted there, while a line crossing regions has half counted in each. NERC
+    regions are listed in a fixed (alphabetical) order.
+    """
+    nerc_regions = sorted(r for r in n.buses["nerc_reg"].dropna().unique() if str(r).strip())
+
+    line_xs = getattr(n, "line_xs", pd.DataFrame())
+    if line_xs.empty or not {"bus0", "bus1"}.issubset(line_xs.columns):
+        capacity = pd.Series(0.0, index=nerc_regions)
+    else:
+        sssc_nom_opt = line_xs.get("sssc_nom_opt", pd.Series(0.0, index=line_xs.index, dtype=float)).fillna(0.0)
+        half_capacity = sssc_nom_opt / 2.0
+        bus0_reg = line_xs["bus0"].map(n.buses["nerc_reg"])
+        bus1_reg = line_xs["bus1"].map(n.buses["nerc_reg"])
+        capacity = (
+            pd.concat([half_capacity.groupby(bus0_reg).sum(), half_capacity.groupby(bus1_reg).sum()])
+            .groupby(level=0)
+            .sum()
+            .reindex(nerc_regions)
+            .fillna(0.0)
+        )
+
+    total = capacity.sum()
+    share_pct = capacity / total * 100 if total > 0 else pd.Series(0.0, index=capacity.index)
+
+    return pd.DataFrame(
+        {
+            "sssc_capacity_mw": capacity.round(3),
+            "pct_of_national_total": share_pct.round(3),
+        },
+    ).rename_axis("nerc_region")
 
 
 def get_statistics(n, column_name):
@@ -2270,26 +2313,6 @@ if __name__ == "__main__":
     # mappers
     generating_link_carrier_map = {"fuel cell": "H2", "battery discharger": "battery"}
 
-    # carriers to plot
-    carriers = (
-        snakemake.params.electricity["conventional_carriers"]
-        + snakemake.params.electricity["renewable_carriers"]
-        + snakemake.params.electricity["extendable_carriers"]["Generator"]
-        + snakemake.params.electricity["extendable_carriers"]["StorageUnit"]
-        + snakemake.params.electricity["extendable_carriers"]["Store"]
-        + snakemake.params.electricity["extendable_carriers"]["Link"]
-        + ["battery_charger", "battery_discharger"]
-    )
-    irb_option = snakemake.params.electricity.get("iron_air_battery", False)
-    irb_enabled = irb_option.get("enable", False) if isinstance(irb_option, dict) else bool(irb_option)
-    if irb_enabled:
-        carriers.append("irb")
-
-    if not n.storage_units.empty and "carrier" in n.storage_units.columns:
-        carriers.extend(n.storage_units.carrier.dropna().unique().tolist())
-
-    carriers = list(set(carriers))  # remove any duplicates
-
     # Export Statistics Tables
     groupers = n.statistics.groupers
     n.statistics(groupby=groupers.get_name_bus_and_carrier).round(3).to_csv(
@@ -2297,6 +2320,7 @@ if __name__ == "__main__":
     )
     build_statistics_summary_table(n).round(4).to_csv(snakemake.output.statistics_summary)
     get_carrier_cost_breakdown(n).round(4).to_csv(snakemake.output.cost_breakdown)
+    get_sssc_capacity_by_nerc_region(n).to_csv(snakemake.output.sssc_capacity_by_nerc)
     n.generators.to_csv(snakemake.output.generators)
     n.storage_units.to_csv(snakemake.output.storage_units)
     n.links.to_csv(snakemake.output.links)
@@ -2304,97 +2328,3 @@ if __name__ == "__main__":
     n.buses.to_csv(snakemake.output.buses)
     n.stores.to_csv(snakemake.output.stores)
     n.global_constraints.to_csv(snakemake.output.global_constraints)
-
-    # Panel Plots
-    plot_generator_data_panel(
-        n,
-        snakemake.output["generator_data_panel.pdf"],
-        **snakemake.wildcards,
-    )
-
-    # Bar Plots
-    plot_capacity_additions_bar(
-        n,
-        carriers,
-        snakemake.output["capacity_additions_bar.pdf"],
-        **snakemake.wildcards,
-    )
-    plot_production_bar(
-        n,
-        carriers,
-        snakemake.output["production_bar.pdf"],
-        **snakemake.wildcards,
-    )
-    plot_global_constraint_shadow_prices(
-        n,
-        snakemake.output["global_constraint_shadow_prices.pdf"],
-        **snakemake.wildcards,
-    )
-    plot_component_cost_breakdown(
-        n,
-        snakemake.output["cost_breakdown_bar.pdf"],
-        **snakemake.wildcards,
-    )
-    plot_regional_capacity_additions_bar(
-        n,
-        snakemake.output["bar_regional_capacity_additions.pdf"],
-    )
-    plot_regional_production_bar(
-        n,
-        snakemake.output["bar_regional_production.pdf"],
-    )
-    plot_regional_emissions_bar(
-        n,
-        snakemake.output["bar_regional_emissions.pdf"],
-    )
-    plot_emissions_bar(
-        n,
-        snakemake.output["bar_emissions.pdf"],
-    )
-
-    # Time Series Plots
-    plot_production_area(
-        n,
-        carriers,
-        snakemake.output["production_area.pdf"],
-        **snakemake.wildcards,
-    )
-    plot_hourly_emissions(
-        n,
-        snakemake.output["emissions_area.pdf"],
-        **snakemake.wildcards,
-    )
-    plot_accumulated_emissions_tech(
-        n,
-        snakemake.output["emissions_accumulated_tech.pdf"],
-        **snakemake.wildcards,
-    )
-    plot_accumulated_emissions(
-        n,
-        snakemake.output["emissions_accumulated.pdf"],
-        **snakemake.wildcards,
-    )
-    plot_fuel_costs(
-        n,
-        snakemake.output["fuel_costs.pdf"],
-        **snakemake.wildcards,
-    )
-
-    # Box Plot
-    plot_region_lmps(
-        n,
-        snakemake.output["region_lmps.pdf"],
-        **snakemake.wildcards,
-    )
-
-    # Renewable Capacity Factor and Seasonal Generation Plots
-    plot_renewable_capacity_factors(
-        n,
-        snakemake.output["renewable_capacity_factors.pdf"],
-        **snakemake.wildcards,
-    )
-    plot_seasonal_generation(
-        n,
-        snakemake.output["seasonal_generation.pdf"],
-        **snakemake.wildcards,
-    )

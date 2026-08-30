@@ -181,7 +181,8 @@ solving:
     track_iterations: false
     min_iterations: 4
     max_iterations: 6
-    method: fixed_point
+    scheme: slp
+    trust_region: true
     transmission_losses: 2
     linearized_unit_commitment: true
     horizon: 8760

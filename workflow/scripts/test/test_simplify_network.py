@@ -1,14 +1,20 @@
 import os
 import sys
+from functools import reduce
 
 import numpy as np
 import pandas as pd
 import pypsa
+import pytest
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from simplify_network import (
-    busmap_by_electrical_distance,
+    EARTH_RADIUS_KM,
+    _earth_centered_km,
+    _effective_reactance_embedding,
+    busmap_by_target_bus_count,
     clustering_from_busmap,
+    identity_busmap,
     merge_parallel_lines,
     reduce_low_degree_buses_and_merge_parallel_lines,
 )
@@ -225,35 +231,237 @@ def test_link_stranded_as_a_self_loop_is_dropped():
     assert "hvdc" not in reduced.links.index
 
 
-def test_electrical_distance_busmap_respects_nerc_and_diameter_limits():
+def _grid_network(rows=3, columns=6, split_column=3):
+    """A rectangular mesh split into two ReEDS zones down the middle."""
     n = pypsa.Network()
-    for name, latitude, country in (
-        ("a", 40.000, "p1"),
-        ("b", 40.010, "p1"),
-        ("c", 40.020, "p2"),
-        ("d", 40.200, "p3"),
-        ("e", 40.015, "p4"),
-    ):
-        n.add("Bus", name, x=-100.0, y=latitude)
-        n.buses.loc[name, "country"] = country
-    n.buses["reeds_zone"] = ["p1", "p1", "p2", "p3", "p4"]
-    n.add("Line", "ab", bus0="a", bus1="b", x=1.0, r=0.0, s_nom=100.0)
-    n.add("Line", "bc", bus0="b", bus1="c", x=1.0, r=0.0, s_nom=100.0)
-    n.add("Line", "cd", bus0="c", bus1="d", x=1.0, r=0.0, s_nom=100.0)
-    n.add("Line", "be", bus0="b", bus1="e", x=1.0, r=0.0, s_nom=100.0)
+    for column in range(columns):
+        for row in range(rows):
+            name = f"b{column}_{row}"
+            n.add("Bus", name, x=-100.0 + 0.1 * column, y=40.0 + 0.1 * row)
+            n.buses.loc[name, "reeds_zone"] = (
+                "west" if column < split_column else "east"
+            )
+    index = 0
+    for column in range(columns):
+        for row in range(rows):
+            for step_column, step_row in ((1, 0), (0, 1)):
+                other = f"b{column + step_column}_{row + step_row}"
+                if other in n.buses.index:
+                    n.add(
+                        "Line",
+                        f"l{index}",
+                        bus0=f"b{column}_{row}",
+                        bus1=other,
+                        x=1.0,
+                        r=0.0,
+                        s_nom=100.0,
+                    )
+                    index += 1
+    return n
 
-    busmap = busmap_by_electrical_distance(
-        n,
-        max_geographic_distance_km=10.0,
-        max_electrical_distance_ohm=10.0,
-        n_probes=128,
-        seed=7,
-        topological_boundary="reeds_zone",
+
+def _clusters_are_connected(n, busmap):
+    """True when every cluster induces a connected subgraph of the line graph."""
+    for cluster, members in busmap.groupby(busmap).groups.items():
+        members = set(members)
+        edges = n.lines[n.lines.bus0.isin(members) & n.lines.bus1.isin(members)]
+        reached, frontier = set(), [next(iter(members))]
+        while frontier:
+            bus = frontier.pop()
+            if bus in reached:
+                continue
+            reached.add(bus)
+            frontier += list(edges.loc[edges.bus0 == bus, "bus1"])
+            frontier += list(edges.loc[edges.bus1 == bus, "bus0"])
+        if reached != members:
+            return False
+    return True
+
+
+def test_effective_reactance_embedding_recovers_series_reactance_distance():
+    """Rademacher Laplacian probes estimate the exact L+ distance on a path."""
+    n = pypsa.Network()
+    for bus in ("a", "b", "c", "d"):
+        n.add("Bus", bus)
+    for name, bus0, bus1, x in (
+        ("ab", "a", "b", 1.0),
+        ("bc", "b", "c", 2.0),
+        ("cd", "c", "d", 3.0),
+    ):
+        n.add("Line", name, bus0=bus0, bus1=bus1, x=x, r=0.0, s_nom=100.0)
+
+    embedding, _, _, _ = _effective_reactance_embedding(n, n_probes=4096, seed=123)
+    estimated = ((embedding[:, None, :] - embedding[None, :, :]) ** 2).mean(axis=-1)
+    # In a series network, effective reactance is the sum of line reactances
+    # along the unique path between buses.
+    exact = np.array(
+        [[0.0, 1.0, 3.0, 6.0], [1.0, 0.0, 2.0, 5.0],
+         [3.0, 2.0, 0.0, 3.0], [6.0, 5.0, 3.0, 0.0]],
+    )
+    upper = np.triu_indices_from(exact, k=1)
+    np.testing.assert_allclose(estimated[upper], exact[upper], rtol=0.03)
+
+
+def test_effective_reactance_embedding_matches_spielman_srivastava_form():
+    """The implementation is Q W**0.5 B L+ up to transpose and scaling."""
+    n = pypsa.Network()
+    for bus in ("a", "b", "c"):
+        n.add("Bus", bus)
+    n.add("Line", "ab", bus0="a", bus1="b", x=2.0, r=0.0, s_nom=100.0)
+    n.add("Line", "bc", bus0="b", bus1="c", x=3.0, r=0.0, s_nom=100.0)
+    n_probes, seed = 17, 11
+
+    embedding, _, _, _ = _effective_reactance_embedding(n, n_probes, seed)
+    incidence = np.array([[1.0, 0.0], [-1.0, 1.0], [0.0, -1.0]])
+    conductance = np.array([1 / 2.0, 1 / 3.0])
+    laplacian = (incidence * conductance) @ incidence.T
+    signs = 2.0 * np.random.default_rng(seed).integers(
+        0,
+        2,
+        size=(2, n_probes),
+        dtype=np.int8,
+    ) - 1.0
+    # Paper notation uses B = incidence.T and Q = signs.T / sqrt(n_probes).
+    paper_embedding = (
+        (signs.T / np.sqrt(n_probes) * np.sqrt(conductance))
+        @ incidence.T
+        @ np.linalg.pinv(laplacian)
+    )
+    expected = ((paper_embedding[:, :, None] - paper_embedding[:, None, :]) ** 2).sum(axis=0)
+    actual = ((embedding[:, None, :] - embedding[None, :, :]) ** 2).mean(axis=-1)
+    np.testing.assert_allclose(actual, expected)
+
+
+def test_earth_centered_coordinates_reproduce_spherical_chord_lengths():
+    buses = pd.DataFrame({"x": [0.0, 90.0, 180.0], "y": [0.0, 0.0, 0.0]})
+    coordinates = _earth_centered_km(buses)
+
+    np.testing.assert_allclose(np.linalg.norm(coordinates, axis=1), EARTH_RADIUS_KM)
+    np.testing.assert_allclose(
+        np.linalg.norm(coordinates[0] - coordinates[1]),
+        np.sqrt(2) * EARTH_RADIUS_KM,
+    )
+    np.testing.assert_allclose(
+        np.linalg.norm(coordinates[0] - coordinates[2]),
+        2 * EARTH_RADIUS_KM,
     )
 
-    assert busmap["a"] == busmap["b"]
-    assert busmap["a"] != busmap["c"]  # ReEDS-zone boundary
-    assert busmap["a"] != busmap["d"]  # geographic diameter
-    assert busmap["a"] != busmap["e"]  # ReEDS-zone boundary
-    clustered = clustering_from_busmap(n, busmap, line_length_factor=1.0)
-    assert clustered.network.buses.at[busmap["a"], "country"] == "p1"
+
+def test_target_bus_count_hits_the_requested_cluster_count_exactly():
+    n = _grid_network()
+    for target in (2, 3, 5, 9, 17):
+        busmap = busmap_by_target_bus_count(
+            n, target, topological_boundary="reeds_zone",
+        )
+        assert busmap.nunique() == target
+
+
+def test_target_bus_count_never_merges_across_a_region_boundary():
+    n = _grid_network()
+    busmap = busmap_by_target_bus_count(n, 4, topological_boundary="reeds_zone")
+    zones = pd.DataFrame({"cluster": busmap, "zone": n.buses.reeds_zone})
+    assert zones.groupby("cluster").zone.nunique().max() == 1
+
+
+def test_target_bus_count_never_merges_across_an_island():
+    """Two disconnected meshes and no region column: islands must stay apart."""
+    n = _grid_network(rows=2, columns=4)
+    severed = n.lines[
+        n.lines.bus0.str.startswith("b1_") & n.lines.bus1.str.startswith("b2_")
+    ].index
+    n.lines = n.lines.drop(index=severed)
+    # Really no region column: otherwise the unconditional ReEDS-zone guard cuts
+    # the zone boundary too, and this fixture's zone split lands mid-island.
+    n.buses = n.buses.drop(columns=["reeds_zone"])
+    busmap = busmap_by_target_bus_count(n, 2)
+    left = {bus for bus in n.buses.index if int(bus[1]) < 2}
+    right = set(n.buses.index) - left
+    assert len({busmap[bus] for bus in left}) == 1
+    assert not {busmap[bus] for bus in left} & {busmap[bus] for bus in right}
+
+
+def test_target_bus_count_clusters_are_connected_subgraphs():
+    n = _grid_network()
+    for target in (3, 6, 11):
+        busmap = busmap_by_target_bus_count(
+            n, target, topological_boundary="reeds_zone",
+        )
+        assert _clusters_are_connected(n, busmap)
+
+
+def test_target_bus_count_rejects_a_target_below_the_component_count():
+    n = _grid_network()
+    with pytest.raises(ValueError, match="connected subgraphs"):
+        busmap_by_target_bus_count(n, 1, topological_boundary="reeds_zone")
+
+
+def test_target_bus_count_cuts_are_nested_across_targets():
+    """A coarser cut must be a coarsening of a finer one: they share a tree."""
+    n = _grid_network()
+    fine = busmap_by_target_bus_count(n, 10, topological_boundary="reeds_zone")
+    coarse = busmap_by_target_bus_count(n, 5, topological_boundary="reeds_zone")
+    assert pd.DataFrame({"fine": fine, "coarse": coarse}).groupby(
+        "fine",
+    ).coarse.nunique().max() == 1
+
+
+def test_target_bus_count_is_deterministic():
+    n = _grid_network()
+    first = busmap_by_target_bus_count(n, 7, seed=5, topological_boundary="reeds_zone")
+    second = busmap_by_target_bus_count(n, 7, seed=5, topological_boundary="reeds_zone")
+    pd.testing.assert_series_equal(first, second)
+
+
+def test_lambda_electrical_shifts_the_merge_order_towards_electrical_proximity():
+    """A geographically short but electrically weak tie loses ground as lambda grows.
+
+    ``a-b`` is a long line with tiny reactance; ``b-c`` is short but highly
+    reactive. At low lambda geography decides and ``b`` merges with ``c``; at
+    high lambda the effective reactance decides and ``b`` merges with ``a``.
+    """
+    n = pypsa.Network()
+    for name, longitude in (("a", -100.20), ("b", -100.00), ("c", -99.99), ("d", -99.00)):
+        n.add("Bus", name, x=longitude, y=40.0)
+    n.add("Line", "ab", bus0="a", bus1="b", x=0.01, r=0.0, s_nom=100.0)
+    n.add("Line", "bc", bus0="b", bus1="c", x=50.0, r=0.0, s_nom=100.0)
+    n.add("Line", "cd", bus0="c", bus1="d", x=50.0, r=0.0, s_nom=100.0)
+
+    geographic = busmap_by_target_bus_count(n, 3, lambda_electrical=1e-3)
+    electrical = busmap_by_target_bus_count(n, 3, lambda_electrical=1e3)
+    assert geographic["b"] == geographic["c"]
+    assert electrical["a"] == electrical["b"]
+
+
+def test_target_bus_count_busmap_feeds_the_standard_clustering_wrapper():
+    n = _grid_network()
+    busmap = busmap_by_target_bus_count(n, 6, topological_boundary="reeds_zone")
+    clustered = clustering_from_busmap(n, busmap, line_length_factor=1.0).network
+    assert len(clustered.buses) == 6
+    # Region membership has to survive onto the clustered buses: cluster_regions
+    # and the downstream policy constraints key off it.
+    assert set(clustered.buses.reeds_zone) == {"west", "east"}
+
+
+def test_identity_busmap_leaves_the_network_untouched():
+    """The neutral element a disabled stage contributes to the busmap chain."""
+    n = _grid_network(rows=2, columns=3)
+    busmap = identity_busmap(n)
+    assert (busmap == n.buses.index).all()
+    clustered = clustering_from_busmap(n, busmap, line_length_factor=1.0).network
+    assert list(clustered.buses.index) == list(n.buses.index)
+    assert len(clustered.lines) == len(n.lines)
+
+
+def test_identity_busmap_composes_as_a_neutral_element():
+    """A disabled later stage must not move any bus in the composed chain.
+
+    Mirrors how ``main`` composes the three stage busmaps: each one is indexed
+    by the buses that existed when that stage ran, so a disabled stage takes
+    its identity map from the network as it stands at that point.
+    """
+    n = _grid_network(rows=2, columns=3)
+    stage = busmap_by_target_bus_count(n, 3, topological_boundary="reeds_zone")
+    clustered = clustering_from_busmap(n, stage, line_length_factor=1.0).network
+    neutral = identity_busmap(clustered)
+    composed = reduce(lambda left, right: left.map(right), [neutral], stage)
+    pd.testing.assert_series_equal(composed, stage, check_names=False)

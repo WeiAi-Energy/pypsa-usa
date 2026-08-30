@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+import pytest
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from plot_statistics import (
@@ -15,6 +16,7 @@ from plot_statistics import (
     _sort_area_plot_columns_by_variability,
     _split_mixed_sign_area_series,
     get_carrier_cost_breakdown,
+    get_sssc_capacity_by_nerc_region,
     normalize_line_x_statistics_columns,
 )
 
@@ -99,6 +101,46 @@ def test_calculate_line_x_capex_counts_sssc_when_line_is_not_extendable():
     assert sssc_capex.to_dict() == {"Ac SSSC": 20.0}
 
 
+def test_get_sssc_capacity_by_nerc_region_splits_cross_region_lines_evenly():
+    n = SimpleNamespace(
+        buses=pd.DataFrame(
+            {
+                "nerc_reg": ["PJM", "PJM", "PJM", "NPCC_NE", "ERCOT"],
+            },
+            index=["pjm1", "pjm2", "pjm3", "ne1", "ercot1"],
+        ),
+        line_xs=pd.DataFrame(
+            {
+                "bus0": ["pjm1", "pjm3"],
+                "bus1": ["pjm2", "ne1"],
+                "sssc_nom_opt": [10.0, 6.0],
+            },
+            index=["lx1", "lx2"],
+        ),
+    )
+
+    result = get_sssc_capacity_by_nerc_region(n)
+
+    assert list(result.index) == ["ERCOT", "NPCC_NE", "PJM"]
+    assert result["sssc_capacity_mw"].to_dict() == {"ERCOT": 0.0, "NPCC_NE": 3.0, "PJM": 13.0}
+    assert result.loc["PJM", "pct_of_national_total"] == pytest.approx(81.25)
+    assert result.loc["NPCC_NE", "pct_of_national_total"] == pytest.approx(18.75)
+    assert result.loc["ERCOT", "pct_of_national_total"] == pytest.approx(0.0)
+
+
+def test_get_sssc_capacity_by_nerc_region_handles_missing_line_xs():
+    n = SimpleNamespace(
+        buses=pd.DataFrame({"nerc_reg": ["PJM", "ERCOT"]}, index=["pjm1", "ercot1"]),
+        line_xs=pd.DataFrame(),
+    )
+
+    result = get_sssc_capacity_by_nerc_region(n)
+
+    assert list(result.index) == ["ERCOT", "PJM"]
+    assert (result["sssc_capacity_mw"] == 0.0).all()
+    assert (result["pct_of_national_total"] == 0.0).all()
+
+
 def test_get_carrier_cost_breakdown_merges_opex_entries_with_same_nice_name():
     class StatisticsStub:
         @staticmethod
@@ -131,6 +173,40 @@ def test_get_carrier_cost_breakdown_merges_opex_entries_with_same_nice_name():
     assert costs.index.tolist() == ["Combined-Cycle Gas"]
     assert costs.at["Combined-Cycle Gas", "OPEX"] == 15.0
     assert costs.at["Combined-Cycle Gas", "CAPEX"] == 0.0
+
+
+def test_get_carrier_cost_breakdown_existing_retirement_yields_positive_capex():
+    class StatisticsStub:
+        @staticmethod
+        def opex():
+            return pd.Series(dtype=float)
+
+    n = SimpleNamespace(
+        statistics=StatisticsStub(),
+        carriers=pd.DataFrame({"nice_name": ["Nuclear"], "color": ["#123456"]}, index=["nuclear"]),
+        generators=pd.DataFrame(
+            {
+                "carrier": ["nuclear", "nuclear"],
+                "p_nom": [1000.0, 0.0],
+                "p_nom_opt": [0.0, 500.0],
+                "p_nom_extendable": [True, True],
+                "capital_cost": [175000.0, 175000.0],
+            },
+            index=["gen1 nuclear existing", "gen2 nuclear_2050"],
+        ),
+        storage_units=pd.DataFrame(),
+        links=pd.DataFrame(),
+        stores=pd.DataFrame(),
+        lines=pd.DataFrame(),
+        line_xs=pd.DataFrame(),
+    )
+
+    costs = get_carrier_cost_breakdown(n)
+
+    # "existing" unit retires (p_nom_opt < p_nom): capex uses capital_cost * p_nom, not the
+    # negative (p_nom_opt - p_nom) delta, so retirement no longer shows up as negative CAPEX.
+    # The non-"existing" build option keeps the original capital_cost * (p_nom_opt - p_nom).
+    assert costs.at["Nuclear", "CAPEX"] == 175000.0 * 1000.0 + 175000.0 * 500.0
 
 
 def test_build_statistics_summary_table_merges_line_x_line_and_splits_sssc():

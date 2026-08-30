@@ -167,8 +167,8 @@ EER_DEMAND_FILES = {
 
 
 def eer_demand_file_for_wildcards(wildcards):
-    """EER demand file for a rule that carries its own `demand_level` wildcard."""
-    return DATA + "eer/" + EER_DEMAND_FILES[wildcards.demand_level]
+    """EER demand file for the demand level of the current wildcards."""
+    return DATA + "eer/" + EER_DEMAND_FILES[demand_level_for_wildcards(wildcards)]
 
 
 validate_shared_representative_periods()
@@ -227,7 +227,6 @@ rule select_representative_periods:
 rule build_electrical_demand:
     wildcard_constraints:
         end_use="power",  # added for consistency in build_demand.py
-        demand_level="Low|Mid|High",
     params:
         planning_horizons=config_provider("scenario", "planning_horizons"),
         renewable_weather_years=config_provider("renewable_weather_years"),
@@ -236,12 +235,11 @@ rule build_electrical_demand:
         network=elec_network_path,
         electricity_demand=eer_demand_file_for_wildcards,
     output:
-        elec_demand=RESOURCES
-        + "{demand_level}Dmd/demand/{end_use}_electricity.pkl",
+        elec_demand=CASE_RESOURCES + "demand/{end_use}_electricity.pkl",
     log:
-        LOGS + "{demand_level}Dmd/demand/{end_use}_build_demand.log",
+        CASE_LOGS + "demand/{end_use}_build_demand.log",
     benchmark:
-        BENCHMARKS + "{demand_level}Dmd/demand/{end_use}_build_demand"
+        CASE_BENCHMARKS + "demand/{end_use}_build_demand"
     threads: 2
     resources:
         mem_mb=lambda wildcards, input, attempt: (input_size_bytes(input) // 100000) * attempt * 2,
@@ -253,20 +251,18 @@ rule build_electrical_demand:
 
 
 rule add_demand:
-    wildcard_constraints:
-        demand_level="Low|Mid|High",
     params:
         planning_horizons=config_provider("scenario", "planning_horizons"),
         snapshots=config_provider("snapshots"),
     input:
         network=elec_network_path,
-        demand=RESOURCES + "{demand_level}Dmd/demand/power_electricity.pkl",
+        demand=electrical_demand_path,
     output:
-        network=RESOURCES + "{demand_level}Dmd/elec_dem.nc",
+        network=CASE_RESOURCES + "elec_dem.nc",
     log:
-        LOGS + "{demand_level}Dmd/demand/add_demand.log",
+        CASE_LOGS + "demand/add_demand.log",
     benchmark:
-        BENCHMARKS + "{demand_level}Dmd/demand/add_demand"
+        CASE_BENCHMARKS + "demand/add_demand"
     resources:
         mem_mb=lambda wildcards, input, attempt: (input_size_bytes(input) // 70000) * attempt * 2,
         walltime=config_provider("walltime", "add_demand", default="00:50:00"),
@@ -304,8 +300,7 @@ def add_electricity_profile_inputs(wildcards):
     cfg = config_for_wildcards(wildcards)
     renewable_carriers = cfg["electricity"]["renewable_carriers"]
     return {
-        f"profile_{tech}": RESOURCES
-        + f"{wildcards.demand_level}Dmd/profile_{tech}.nc"
+        f"profile_{tech}": renewable_profile_path(wildcards, tech, cfg=cfg)
         for tech in renewable_carriers
         if tech != "hydro"
     }
@@ -339,11 +334,10 @@ def add_electricity_egs_inputs(wildcards):
 
 
 rule add_electricity:
-    wildcard_constraints:
-        demand_level="Low|Mid|High",
     params:
-        interconnect=get_interconnect(),
+        interconnect=get_interconnect,
         length_factor=config_provider("lines", "length_factor"),
+        voltage_factor=config_provider("lines", "voltage_factor", default=True),
         snapshots=config_provider("snapshots"),
         renewable_carriers=config_provider("electricity", "renewable_carriers"),
         extendable_carriers=config_provider("electricity", "extendable_carriers"),
@@ -381,14 +375,14 @@ rule add_electricity:
         hydro_breakthrough=DATA + "breakthrough_network/base_grid/hydro.csv",
         bus2sub=RESOURCES + "bus2sub.csv",
     output:
-        RESOURCES + "{demand_level}Dmd/elec_pp.pkl",
+        CASE_RESOURCES + "elec_pp.pkl",
     log:
-        LOGS + "{demand_level}Dmd/add_electricity.log",
+        CASE_LOGS + "add_electricity.log",
     benchmark:
-        BENCHMARKS + "{demand_level}Dmd/add_electricity"
+        CASE_BENCHMARKS + "add_electricity"
     threads: 1
     resources:
-        mem_mb=lambda wildcards, input, attempt: (input_size_bytes(input) // 400000) * attempt * 2,
+        mem_mb=lambda wildcards, input, attempt: (input_size_bytes(input) // 200000) * attempt * 2,
         walltime=config_provider("walltime", "add_electricity", default="01:00:00"),
     script:
         "../scripts/add_electricity.py"
@@ -396,11 +390,14 @@ rule add_electricity:
 
 ################# ----------- Mandatory topology reduction ---------- #################
 rule simplify_network:
-    wildcard_constraints:
-        demand_level="Low|Mid|High",
     params:
-        aggregation_strategies=config["clustering"].get("aggregation_strategies", {}),
-        electrical_distance=config_provider("clustering", "electrical_distance"),
+        aggregation_strategies=config_provider(
+            "clustering", "aggregation_strategies", default={}
+        ),
+        low_degree_reduction=config_provider(
+            "clustering", "low_degree_reduction", default=True
+        ),
+        target_count=config_provider("clustering", "target_count"),
         length_factor=config_provider("lines", "length_factor"),
         topological_boundaries=config_provider(
             "model_topology", "topological_boundaries"
@@ -413,27 +410,24 @@ rule simplify_network:
         state_boundaries=RESOURCES + "Geospatial/state_boundaries.geojson",
         reeds_memberships="repo_data/ReEDS_Constraints/membership.csv",
     output:
-        network=RESOURCES + "{demand_level}Dmd/elec.nc",
-        busmap=RESOURCES + "{demand_level}Dmd/busmap.csv",
-        regions_onshore=RESOURCES
-        + "{demand_level}Dmd/Geospatial/regions_onshore_elec.geojson",
-        regions_offshore=RESOURCES
-        + "{demand_level}Dmd/Geospatial/regions_offshore_elec.geojson",
-        network_map_after_transformers=RESOURCES
-        + "{demand_level}Dmd/elec_after_transformers_topology.png",
-        network_map_after_substations=RESOURCES
-        + "{demand_level}Dmd/elec_after_substations_topology.png",
-        network_map_after_low_degree=RESOURCES
-        + "{demand_level}Dmd/elec_after_low_degree_topology.png",
-        network_map_after_electrical_distance=RESOURCES
-        + "{demand_level}Dmd/elec_after_electrical_distance_topology.png",
-        network_map=RESOURCES
-        + "{demand_level}Dmd/elec_topology.png",
+        network=CASE_RESOURCES + "elec.nc",
+        busmap=CASE_RESOURCES + "busmap.csv",
+        regions_onshore=CASE_RESOURCES
+        + "Geospatial/regions_onshore_elec.geojson",
+        regions_offshore=CASE_RESOURCES
+        + "Geospatial/regions_offshore_elec.geojson",
+        network_map_after_transformers=CASE_RESOURCES
+        + "elec_after_transformers_topology.png",
+        network_map_after_substations=CASE_RESOURCES
+        + "elec_after_substations_topology.png",
+        network_map_after_low_degree=CASE_RESOURCES
+        + "elec_after_low_degree_topology.png",
+        network_map=CASE_RESOURCES + "elec_topology.png",
     log:
-        LOGS + "{demand_level}Dmd/simplify_network/elec.log",
+        CASE_LOGS + "simplify_network/elec.log",
     threads: 1
     resources:
-        mem_mb=lambda wildcards, input, attempt: (input_size_bytes(input) // 100000) * attempt * 2,
+        mem_mb=lambda wildcards, input, attempt: (input_size_bytes(input) // 40000) * attempt * 2,
         walltime=config_provider("walltime", "simplify_network", default="01:30:00"),
     script:
         "../scripts/simplify_network.py"
@@ -502,19 +496,16 @@ rule add_extra_components:
 
 
 rule build_region_temperature:
-    wildcard_constraints:
-        demand_level="Low|Mid|High",
     params:
-        interconnect=get_interconnect(),
+        interconnect=get_interconnect,
         cutout_dir="cutouts/" + CDIR.rstrip("/") if CDIR else "cutouts",
     input:
         unpack(representative_snapshots_input),
         network=clustered_network_path,
     output:
-        region_temperature=RESOURCES
-        + "{demand_level}Dmd/region_temperature.csv",
+        region_temperature=CASE_RESOURCES + "region_temperature.csv",
     log:
-        LOGS + "{demand_level}Dmd/build_region_temperature/region_temperature.log",
+        CASE_LOGS + "build_region_temperature/region_temperature.log",
     threads: 4
     resources:
         mem_mb=8000,

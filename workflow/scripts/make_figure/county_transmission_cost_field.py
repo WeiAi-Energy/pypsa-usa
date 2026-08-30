@@ -41,9 +41,7 @@ COUNTY_SHAPES_PATH = Path(
 STATE_SHAPES_PATH = Path(
     r"D:\Research\sssc_project\pypsa-usa\workflow\resources\shared\Geospatial\state_boundaries.geojson"
 )
-OUT_PATH = Path(
-    r"D:\Research\sssc_project\pypsa-usa\workflow\results\test_tr\figure\county_transmission_cost_field.png"
-)
+OUT_PATH = Path(__file__).resolve().parent / "county_transmission_cost_field.png"
 
 # plot_network_maps.py conventions
 TITLE_SIZE = 16

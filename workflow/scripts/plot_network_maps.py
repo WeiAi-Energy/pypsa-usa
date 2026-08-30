@@ -27,15 +27,13 @@ import pandas as pd
 import pypsa
 from postprocess_io import load_postprocess_network
 import seaborn as sns
-from _helpers import configure_logging, set_case_config
+from _helpers import configure_logging, get_complete_bidirectional_link_pairs, set_case_config
 from add_electricity import sanitize_carriers
 from cartopy import crs as ccrs
 from matplotlib.legend import Legend
 from matplotlib.lines import Line2D
 from matplotlib.patches import Ellipse, FancyBboxPatch, Patch
-from summary import get_demand_base
 from visualization_carriers import (
-    build_visualization_carriers,
     build_visualization_palette,
     get_visualization_label,
 )
@@ -1105,41 +1103,6 @@ def add_capacity_map_legends(
         )
 
 
-def add_demand_map_legends(
-    ax: plt.Axes,
-    n: pypsa.Network,
-    bus_values: pd.Series,
-    bus_scale: float,
-    line_values: pd.Series,
-    link_values: pd.Series,
-    line_scale: float,
-) -> None:
-    carrier_frame = build_visualization_carriers(n.carriers)
-    bus_colors = carrier_frame.color.fillna("#000000")
-    nice_names = carrier_frame.index.to_series().reindex(carrier_frame.index)
-    _add_technology_block(
-        ax,
-        bus_colors,
-        nice_names,
-        get_adaptive_legend_values(CAPACITY_CIRCLE_LEGEND_VALUES_MW, _get_max_series_value(bus_values)),
-        bus_scale,
-        panel_title="Technology",
-    )
-    transmission_values = get_adaptive_legend_values(
-        TRANSMISSION_CAPACITY_LEGEND_VALUES_MW,
-        max(_get_max_series_value(line_values), _get_max_series_value(link_values)),
-    )
-    transmission_handles = _build_transmission_capacity_handles(n, line_scale, transmission_values)
-    transmission_handles.extend(_build_transmission_type_handles(n, not n.links.empty and n.links.carrier.eq("DC").any()))
-    _add_legend_block(
-        ax,
-        transmission_handles,
-        title="Transmission",
-        anchor=(BOTTOM_LEGEND_LEFT_X, BOTTOM_LEGEND_ANCHOR_Y),
-        loc="lower left",
-    )
-
-
 def plot_line_x_sssc_markers(
     ax: plt.Axes,
     n: pypsa.Network,
@@ -1389,6 +1352,19 @@ def build_reeds_zone_capacity_network(
     zone_link_values = pd.Series(dtype=float)
     if not n.links.empty and not link_values.empty:
         links = n.links.reindex(link_values.index)
+
+        # A complete `_fwd`/`_rev` pair models one physical DC corridor as two
+        # directional Links with equal capacity (see
+        # `opts.bidirectional_link.add_bidirectional_link_constraints`).
+        # Zone aggregation only cares about the corridor's undirected
+        # zone-pair, so keep just the `_fwd` half here -- otherwise summing
+        # both directions into the same zone-pair label would double the
+        # corridor's plotted/legend capacity.
+        dc_links = links[links["carrier"] == "DC"]
+        rev_halves = [pair["rev"] for pair in get_complete_bidirectional_link_pairs(dc_links).values()]
+        if rev_halves:
+            links = links.drop(index=rev_halves)
+
         link_pairs = _zone_pair_labels(zone_map, links["bus0"], links["bus1"])
         if not link_pairs.empty:
             aligned_links = link_values.reindex(link_pairs.index).fillna(0.0)
@@ -1514,79 +1490,6 @@ def plot_capacity_map(
         ax.set_title(title, fontsize=TITLE_SIZE, pad=20)
 
     return fig, ax
-
-
-def plot_demand_map(
-    n: pypsa.Network,
-    regions: gpd.GeoDataFrame,
-    carriers: list[str],
-    save: str,
-    interconnect: str | None = None,
-    **wildcards,
-) -> None:
-    """Plots map of network nodal demand."""
-    # get data
-
-    bus_values = get_demand_base(n).mul(1e-3)
-    line_values = get_line_plot_values(n, "s_nom")
-    link_values = get_transmission_link_values(n, "p_nom")
-
-    # plot data
-    title = create_title("Network Demand")
-    bus_scale = get_bus_scale(interconnect) if interconnect else 1
-    line_scale = get_line_scale(interconnect) if interconnect else 1
-
-    fig, ax = plt.subplots(
-        figsize=MAP_FIGSIZE,
-        subplot_kw={"projection": ccrs.EqualEarth(n.buses.x.mean())},
-    )
-    fig.subplots_adjust(
-        left=MAP_LAYOUT_LEFT_MARGIN,
-        right=MAP_LAYOUT_RIGHT_MARGIN,
-        bottom=MAP_LAYOUT_BOTTOM_MARGIN,
-        top=MAP_LAYOUT_TOP_MARGIN,
-    )
-    map_boundaries = get_map_boundaries(regions, shrink=True)
-    line_width = line_values / line_scale
-    link_width = link_values / line_scale
-    line_colors = get_carrier_color(n, "AC", "teal")
-    link_colors = get_transmission_link_colors(n)
-
-    fig.patch.set_facecolor("white")
-    ax.set_facecolor("white")
-    draw_model_region_background(ax, regions, n=n)
-
-    with plt.rc_context({"patch.linewidth": 0.1}):
-        n.plot(
-            bus_sizes=bus_values / bus_scale,
-            # bus_colors=None,
-            bus_alpha=CAPACITY_MAP_BUS_ALPHA,
-            line_widths=line_width,
-            link_widths=0 if link_width.empty else link_width,
-            line_colors=line_colors,
-            link_colors=link_colors,
-            ax=ax,
-            margin=0.05,
-            boundaries=map_boundaries,
-            color_geomap=False,
-            branch_components=get_plot_branch_components(n),
-        )
-
-    add_demand_map_legends(
-        ax=ax,
-        n=n,
-        bus_values=bus_values,
-        bus_scale=bus_scale,
-        line_values=line_values,
-        link_values=link_values,
-        line_scale=line_scale,
-    )
-    if not title:
-        ax.set_title("Total Annual Demand (MW)", fontsize=TITLE_SIZE, pad=20)
-    else:
-        ax.set_title(title, fontsize=TITLE_SIZE, pad=20)
-    fig.savefig(save, dpi=600, bbox_inches='tight')
-    plt.close()
 
 
 def plot_base_capacity_map(
@@ -1869,12 +1772,4 @@ if __name__ == "__main__":
             **plot_wildcards,
             save=snakemake.output[f"capacity_map_new_{output_suffix}.png"],
         )
-    plot_demand_map(
-        n,
-        onshore_regions,
-        carriers,
-        snakemake.output["demand_map.pdf"],
-        interconnect=interconnect,
-        **plot_wildcards,
-    )
     # plot_lmp_map(n, snakemake.output["lmp_map.pdf"], **snakemake.wildcards)

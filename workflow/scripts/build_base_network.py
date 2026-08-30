@@ -86,7 +86,6 @@ def impute_cross_substation_line_ratings(
     interconnection and nominal-voltage class.
     """
     branches = branches.copy()
-    branches["rating_imputed"] = False
     bus_attrs = buses[["sub_id", "v_nom"]].copy()
     bus_attrs.index = bus_attrs.index.astype(str)
 
@@ -143,7 +142,6 @@ def impute_cross_substation_line_ratings(
         raise ValueError(f"Cannot impute rateA for cross-substation lines: {missing}")
 
     branches.loc[imputed.index, "rateA"] = imputed
-    branches.loc[imputed.index, "rating_imputed"] = True
     logger.info(
         "Imputed rateA for %s cross-substation Breakthrough lines using rated-line medians.",
         len(imputed),
@@ -165,13 +163,13 @@ def impute_remaining_branch_ratings(
     any capacity-normalised metric (flow / s_nom) is dominated by it.
 
     Each remaining branch instead receives the median ``rateA`` of rated branches of
-    the same device type, interconnection and nominal-voltage class. ``rating_imputed``
-    records the provenance so downstream code can tell a measured rating from a
-    filled one.
+    the same device type, interconnection and nominal-voltage class. How many were
+    filled, and of which device types, goes to the log rather than onto a per-branch
+    column: a provenance flag on a branch does not survive aggregation usefully --
+    a quarter of branches are imputed, so ``any`` over a merged corridor saturates
+    to true and says nothing.
     """
     branches = branches.copy()
-    if "rating_imputed" not in branches.columns:
-        branches["rating_imputed"] = False
 
     bus_v_nom = buses["v_nom"].copy()
     bus_v_nom.index = bus_v_nom.index.astype(str)
@@ -222,7 +220,6 @@ def impute_remaining_branch_ratings(
         )
 
     branches.loc[filled.index, "rateA"] = filled
-    branches.loc[filled.index, "rating_imputed"] = True
     logger.info(
         "Imputed rateA for %s remaining unrated branch(es) (%s) using rated-branch medians; "
         "the 0.01 MVA sentinel is no longer emitted.",
@@ -264,7 +261,6 @@ def add_branches_from_file(n: pypsa.Network, fn_branches: str) -> pypsa.Network:
             type="",
             carrier="AC",
             underwater_fraction=0.0,
-            rating_imputed=tech_branches.rating_imputed,
         )
     return n
 

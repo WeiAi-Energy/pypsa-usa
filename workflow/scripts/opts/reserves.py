@@ -56,9 +56,12 @@ PyPSA's own nodal balance.
 Requirement granularity
 -----------------------
 One row per region and snapshot. Overlapping regions each get their own row and all
-of them bind. ``erm: {all: X}`` is shorthand for "apply X to every NERC region": a
+of them bind. ``erm: {all: X}`` is shorthand for "apply X to every ReEDS zone": a
 single nationwide row would have no boundary, so its flow term would vanish and the
-requirement would collapse into a nationwide capacity sum.
+requirement would collapse into a nationwide capacity sum. A NERC-region key such as
+``erm: {PJM: X}`` is expanded the same way, into one row per ReEDS zone PJM contains,
+each requiring its own demand plus margin off its own boundary flow rather than
+pooling capacity across zones that intra-region transmission may not actually reach.
 
 Note the flip side of aggregating: within a region the requirement is one sum, so
 intra-regional transmission earns no adequacy value -- a region containing both a
@@ -518,39 +521,72 @@ def define_erm_regional_requirements(n, sns, regions, buses):
         return
 
 
-def _expand_all_to_nerc_regions(n, erm_dict, buses):
+def _expand_all_to_reeds_zones(n, erm_dict, buses):
     """
-    Turn an ``all`` entry into one entry per NERC region.
+    Turn an ``all`` entry, and any NERC-region entry, into one entry per ReEDS zone.
 
-    A single nationwide region has no boundary, so its flow term would vanish and the
-    requirement would collapse into a nationwide capacity sum. ``all: X`` therefore
-    means "apply X to every NERC region", which is what forces inter-regional support
-    to travel over the base-state power flow. Explicit region keys win over ``all``.
+    A region spanning several ReEDS zones has no boundary *between* those zones, so a
+    single row over the whole region earns no adequacy value for the transmission
+    between them (see the module docstring). ``all: X`` therefore means "apply X to
+    every ReEDS zone", and a NERC-region key such as ``PJM: X`` means "apply X to
+    every ReEDS zone PJM contains" -- both force each zone to individually cover its
+    own demand plus reserve margin using its own boundary flow, rather than pooling
+    capacity across zones that isn't reachable without binding transmission.
+
+    Precedence where the same zone is reachable more than one way: an explicit
+    ReEDS-zone key always wins, a NERC-region key wins over ``all``, and ``all`` fills
+    in whatever is left. Any other key (state, country, interconnect, a bare bus name)
+    is passed through unchanged.
     """
-    if "all" not in erm_dict:
+    if "reeds_zone" not in n.buses.columns:
+        if "all" in erm_dict:
+            logger.warning(
+                "ERM 'all' cannot be expanded: buses carry no 'reeds_zone' column. "
+                "Keeping 'all' as a single nationwide region.",
+            )
         return erm_dict
 
-    if "nerc_reg" not in n.buses.columns:
-        logger.warning(
-            "ERM 'all' cannot be expanded: buses carry no 'nerc_reg' column. "
-            "Keeping 'all' as a single nationwide region.",
-        )
+    zone_labels = n.buses.reeds_zone.reindex(buses).dropna().astype(str)
+    reeds_zones = set(zone_labels[zone_labels != ""].unique())
+    if not reeds_zones:
+        if "all" in erm_dict:
+            logger.warning(
+                "ERM 'all' cannot be expanded: no ReEDS zones on the electricity buses. "
+                "Keeping 'all' as a single nationwide region.",
+            )
         return erm_dict
 
-    labels = n.buses.nerc_reg.reindex(buses).dropna().astype(str)
-    nerc_regions = pd.Index(labels[labels != ""].unique()).sort_values()
-    if nerc_regions.empty:
-        logger.warning(
-            "ERM 'all' cannot be expanded: no NERC regions on the electricity buses. "
-            "Keeping 'all' as a single nationwide region.",
-        )
-        return erm_dict
+    zones_by_nerc_region = {}
+    if "nerc_reg" in n.buses.columns:
+        pairs = n.buses.loc[buses, ["reeds_zone", "nerc_reg"]].dropna().astype(str)
+        pairs = pairs[(pairs.reeds_zone != "") & (pairs.nerc_reg != "")]
+        zones_by_nerc_region = pairs.groupby("nerc_reg")["reeds_zone"].apply(set).to_dict()
 
-    expanded = {k: v for k, v in erm_dict.items() if k != "all"}
-    for region in nerc_regions:
-        expanded.setdefault(region, erm_dict["all"])
+    expanded = {}
 
-    logger.info(f"ERM 'all' expanded to {len(nerc_regions)} NERC regions: {', '.join(nerc_regions)}")
+    # Lowest precedence: "all" fills every zone.
+    if "all" in erm_dict:
+        for zone in reeds_zones:
+            expanded[zone] = erm_dict["all"]
+
+    # Medium precedence: a NERC-region key fills the zones it contains.
+    for key, value in erm_dict.items():
+        if key == "all" or key in reeds_zones:
+            continue
+        for zone in zones_by_nerc_region.get(key, ()):
+            expanded[zone] = value
+
+    # Highest precedence: an explicit ReEDS-zone key always wins.
+    for key, value in erm_dict.items():
+        if key in reeds_zones:
+            expanded[key] = value
+
+    # Anything else (state, country, interconnect, a bare bus name) passes through.
+    for key, value in erm_dict.items():
+        if key == "all" or key in reeds_zones or key in zones_by_nerc_region:
+            continue
+        expanded.setdefault(key, value)
+
     return expanded
 
 
@@ -598,7 +634,7 @@ def add_ERM_constraints(
     elif config is not None and config.get("electricity", {}).get("erm"):
         erm_dict = config["electricity"]["erm"]
     else:
-        logger.info("No ERM configuration provided. Using default 0.15 for every NERC region.")
+        logger.info("No ERM configuration provided. Using default 0.15 for every ReEDS zone.")
         erm_dict = default_erm
 
     buses = _erm_buses(n)
@@ -607,7 +643,7 @@ def add_ERM_constraints(
         return
 
     snapshots = _named_snapshots(n, snapshots)
-    erm_dict = _expand_all_to_nerc_regions(n, erm_dict, buses)
+    erm_dict = _expand_all_to_reeds_zones(n, erm_dict, buses)
 
     regions = {}
     for region_name, erm_value in erm_dict.items():

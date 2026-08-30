@@ -268,7 +268,7 @@ if __name__ == "__main__":
     # Subsea costs: Purvins et al. (2018): https://doi.org/10.1016/j.jclepro.2018.03.095
     # FOM assumed at 1% of capex per year for all transmission assets
     TRANSMISSION_FOM_PCT = 0.01
-    hvdc_inverter_pair_capex_per_kw = 311.19  # https://docs.nlr.gov/docs/fy21osti/78195.pdf
+    hvdc_inverter_pair_capex_per_kw = 416  # MTEP24
 
     # AC line and DC line capex are no longer national scalars: they are resolved per
     # line from voltage class and route region in `add_electricity`, off the ReEDS

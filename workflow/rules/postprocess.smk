@@ -57,18 +57,6 @@ rule plot_statistics:
         plotting=config_provider("plotting"),
         retirement=config_provider("electricity", "retirement", default="technical"),
     output:
-        **{
-            fig: result_figure_path("emissions", figure=fig)
-            for fig in FIGURES_EMISSIONS
-        },
-        **{
-            fig: result_figure_path("production", figure=fig)
-            for fig in FIGURES_PRODUCTION
-        },
-        **{
-            fig: result_figure_path("system", figure=fig)
-            for fig in FIGURES_SYSTEM
-        },
         statistics_summary=result_figure_path("statistics", figure="statistics.csv"),
         statistics_dissaggregated=result_figure_path(
             "statistics",
@@ -84,6 +72,10 @@ rule plot_statistics:
         global_constraints=result_figure_path(
             "statistics",
             figure="global_constraints.csv",
+        ),
+        sssc_capacity_by_nerc=result_figure_path(
+            "statistics",
+            figure="sssc_capacity_by_nerc.csv",
         ),
     log:
         CASE_LOGS + "plot_figures/plot_statistics.log",

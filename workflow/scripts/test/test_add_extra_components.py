@@ -106,6 +106,47 @@ def test_attach_flexible_electrolysis_skips_buses_without_an_h2ptcreg_region():
     assert set(n.buses.index[n.buses.carrier == "H2"]) == {"Texas" + FLEXIBLE_ELECTROLYSIS_BUS_SUFFIX}
 
 
+def test_attach_flexible_electrolysis_nation_uses_a_single_accounting_bus():
+    n = network_with_ac_buses()
+
+    attach_flexible_electrolysis(
+        n,
+        {"enable": True, "accounting_region": "nation"},
+        str(COSTS),
+    )
+
+    national_bus = "nation" + FLEXIBLE_ELECTROLYSIS_BUS_SUFFIX
+    assert set(n.buses.index[n.buses.carrier == "H2"]) == {national_bus}
+    links = n.links[n.links.carrier == "electrolysis"]
+    assert set(links.bus0) == {"ac_1", "ac_2"}
+    assert set(links.bus1) == {national_bus}
+
+
+def test_attach_flexible_electrolysis_nation_still_skips_buses_without_an_h2ptcreg_region():
+    n = network_with_ac_buses()
+    n.buses.loc["ac_2", "h2ptcreg"] = np.nan
+
+    attach_flexible_electrolysis(
+        n,
+        {"enable": True, "accounting_region": "nation"},
+        str(COSTS),
+    )
+
+    links = n.links[n.links.carrier == "electrolysis"]
+    assert set(links.bus0) == {"ac_1"}
+
+
+def test_attach_flexible_electrolysis_rejects_unknown_accounting_region():
+    n = network_with_ac_buses()
+
+    with pytest.raises(ValueError, match="accounting_region"):
+        attach_flexible_electrolysis(
+            n,
+            {"enable": True, "accounting_region": "state"},
+            str(COSTS),
+        )
+
+
 def test_nuclear_new_build_buses_are_restricted_to_existing_nuclear_sites():
     n = network_with_ac_buses()
     n.add("Generator", "existing nuclear", bus="ac_2", carrier="nuclear", p_nom=100.0)

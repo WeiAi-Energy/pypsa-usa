@@ -80,8 +80,8 @@ def test_run_optimize_passes_extra_functionality_into_iterative_solver():
             "track_iterations": True,
             "min_iterations": 2,
             "max_iterations": 3,
-            "relaxation_factor": 1.25,
-            "method": "trust_region",
+            "scheme": "slp",
+            "trust_region": True,
         },
         extra_functionality=fake_extra_functionality,
     )
@@ -90,8 +90,8 @@ def test_run_optimize_passes_extra_functionality_into_iterative_solver():
     assert captured["track_iterations"] is True
     assert captured["min_iterations"] == 2
     assert captured["max_iterations"] == 3
-    assert captured["relaxation_factor"] == 1.25
-    assert captured["method"] == "trust_region"
+    assert captured["scheme"] == "slp"
+    assert captured["trust_region"] is True
 
 
 def test_add_electrolysis_constraint_splits_hydrogen_target_across_h2ptcreg_regions():
@@ -196,6 +196,113 @@ def test_add_electrolysis_constraint_splits_hydrogen_target_across_h2ptcreg_regi
             assert capacity_constraint.vars.to_numpy().tolist() == [expected_capacity_var]
 
     assert sum(expected_rhs.values()) == pytest.approx(1512.0)
+
+
+def _national_electrolysis_network(accounting_bus):
+    """Single-period network whose electrolysis links share one accounting bus."""
+    hours = pd.date_range("2030-01-01 00:00", "2030-01-01 02:00", freq="h")
+    snapshots = pd.MultiIndex.from_tuples(
+        [(2030, ts) for ts in hours],
+        names=["period", "timestep"],
+    )
+
+    n = pypsa.Network()
+    n.set_snapshots(snapshots)
+    n.set_investment_periods(periods=[2030])
+
+    n.add("Carrier", "AC")
+    n.add("Carrier", "gen")
+    n.add("Carrier", "load")
+    n.add("Carrier", "H2")
+    n.add("Carrier", "electrolysis")
+    n.add("Bus", "b", carrier="AC")
+    n.add("Bus", "b2", carrier="AC")
+    n.add("Bus", accounting_bus, carrier="H2")
+    n.add("Generator", "g", bus="b", carrier="gen", p_nom=1e6, marginal_cost=1.0)
+    n.add("Load", "l", bus="b", carrier="load", p_set=pd.Series(0.0, index=snapshots))
+    for ac_bus in ("b", "b2"):
+        n.add(
+            "Link",
+            f"{ac_bus} flexible electrolysis",
+            bus0=ac_bus,
+            bus1=accounting_bus,
+            carrier="electrolysis",
+            p_nom=0.0,
+            p_nom_extendable=True,
+            efficiency=0.0,
+        )
+    n.snapshot_weightings.loc[:, "generators"] = 2920.0
+    n.optimize.create_model(multi_investment_periods=True)
+    return n, snapshots, hours
+
+
+def test_add_electrolysis_constraint_pools_hydrogen_target_nationally():
+    n, snapshots, hours = _national_electrolysis_network(
+        "nation flexible electrolysis H2",
+    )
+
+    add_electrolysis_hydrogen_target_constraint(
+        n,
+        snapshots,
+        {
+            "flexible_electrolysis": {
+                "enable": True,
+                "annual_hydrogen_twh": 1512,
+                "accounting_region": "nation",
+            },
+        },
+        str(SECTOR_COSTS),
+        str(HYDROGEN_DEMAND_SHARE),
+    )
+
+    # A single constraint over every electrolysis link, for the full national total.
+    assert not any(
+        name.startswith("FlexibleElectrolysis-annual_hydrogen-")
+        and not name.startswith("FlexibleElectrolysis-annual_hydrogen-nation")
+        for name in n.model.constraints
+    )
+    constraint = n.model.constraints["FlexibleElectrolysis-annual_hydrogen-nation-2030"]
+    assert constraint.rhs.item() == pytest.approx(1512.0)
+    assert constraint.sign.item() == "="
+
+    efficiency = 1.0 / 1.351
+    expected_coeff = 2920.0 * efficiency / 1e6
+    assert constraint.coeffs.to_numpy().tolist() == pytest.approx([expected_coeff] * 6)
+    expected_vars = (
+        n.model.variables["Link-p"]
+        .labels.sel(
+            snapshot=[(2030, ts) for ts in hours],
+            Link=["b flexible electrolysis", "b2 flexible electrolysis"],
+        )
+        .values.reshape(-1)
+    )
+    assert sorted(constraint.vars.to_numpy().tolist()) == sorted(expected_vars.tolist())
+
+    # Both links contribute to the one capacity-adequacy constraint.
+    capacity = n.model.constraints["FlexibleElectrolysis-annual_capacity_energy-nation-2030"]
+    assert capacity.rhs.item() == pytest.approx(1512.0)
+    assert len(capacity.vars.to_numpy().reshape(-1)) == 2
+
+
+def test_add_electrolysis_constraint_rejects_accounting_region_network_mismatch():
+    n, snapshots, _ = _national_electrolysis_network(
+        "Texas flexible electrolysis H2",
+    )
+
+    with pytest.raises(ValueError, match="accounting_region"):
+        add_electrolysis_hydrogen_target_constraint(
+            n,
+            snapshots,
+            {
+                "flexible_electrolysis": {
+                    "enable": True,
+                    "annual_hydrogen_twh": 1512,
+                    "accounting_region": "nation",
+                },
+            },
+            str(SECTOR_COSTS),
+            str(HYDROGEN_DEMAND_SHARE),
+        )
 
 
 def test_electrolysis_representative_blocks_use_bounded_master_budgets():

@@ -129,6 +129,22 @@ def prepare_network(n, solve_opts=None):
     return n
 
 
+def flexible_electrolysis_accounting_region(flex_config):
+    """Return the validated hydrogen balance accounting level.
+
+    Mirrors ``add_extra_components.flexible_electrolysis_accounting_region``:
+    ``h2ptcreg`` balances hydrogen production per 45V hydrogen PTC region,
+    ``nation`` balances it once over the whole modelled system.
+    """
+    accounting_region = flex_config.get("accounting_region", "h2ptcreg")
+    if accounting_region not in ("h2ptcreg", "nation"):
+        raise ValueError(
+            "flexible_electrolysis 'accounting_region' must be 'h2ptcreg' or 'nation'; "
+            f"got {accounting_region!r}.",
+        )
+    return accounting_region
+
+
 def h2ptcreg_hydrogen_shares(hydrogen_share_path):
     """Return each h2ptcreg region's share of national annual hydrogen demand.
 
@@ -214,7 +230,13 @@ def add_electrolysis_hydrogen_target_constraint(
     sector_costs_path,
     hydrogen_share_path,
 ):
-    """Fix annual electrolyzer H2 output per h2ptcreg region in every period.
+    """Fix annual electrolyzer H2 output per accounting region in every period.
+
+    The accounting region follows ``flexible_electrolysis: accounting_region``.
+    With ``h2ptcreg`` the configured national total is split across the 45V
+    hydrogen PTC regions by their share of national hydrogen demand. With
+    ``nation`` a single constraint requires the whole electrolyzer fleet to
+    deliver the sum of those regional productions, i.e. the configured total.
 
     In representative-period models, a non-negative master budget is introduced
     for each region and representative block. The budgets sum to the annual target
@@ -232,6 +254,8 @@ def add_electrolysis_hydrogen_target_constraint(
     flex_config = config.get("flexible_electrolysis", {})
     if not flex_config.get("enable", False):
         return
+
+    accounting_region = flexible_electrolysis_accounting_region(flex_config)
 
     flexible_links = n.links.index[
         (n.links.carrier == "electrolysis")
@@ -266,30 +290,46 @@ def add_electrolysis_hydrogen_target_constraint(
         )
     efficiency = 1.0 / electricity_input
 
-    # Each link feeds the accounting H2 bus of the h2ptcreg region it sits in, so
-    # the region name is recoverable from bus1 (see add_extra_components.py).
+    # Each link feeds the accounting H2 bus of the region it sits in, so the
+    # region name is recoverable from bus1 (see add_extra_components.py).
     link_regions = n.links.loc[flexible_links, "bus1"].str.removesuffix(
         FLEXIBLE_ELECTROLYSIS_BUS_SUFFIX,
     )
-
-    region_shares = h2ptcreg_hydrogen_shares(hydrogen_share_path)
     modelled_regions = pd.Index(sorted(link_regions.unique()))
-    unknown = modelled_regions.difference(region_shares.index)
-    if len(unknown):
+
+    # The accounting buses are built in add_extra_components; a network built at a
+    # different accounting level than the one configured here would silently get
+    # the wrong targets.
+    is_national_network = list(modelled_regions) == ["nation"]
+    if (accounting_region == "nation") != is_national_network:
         raise ValueError(
-            f"No hydrogen demand share for h2ptcreg region(s) {list(unknown)} in {hydrogen_share_path}.",
+            f"flexible_electrolysis 'accounting_region' is {accounting_region!r}, but the network's "
+            f"electrolysis accounting bus(es) are {list(modelled_regions)}. Rebuild the network from "
+            "add_extra_components after changing accounting_region.",
         )
 
-    # Renormalise over the modelled regions so the configured total is still met
-    # when the network covers only part of the country (e.g. a single interconnect).
-    region_shares = region_shares.reindex(modelled_regions)
-    share_sum = float(region_shares.sum())
-    if share_sum <= 0.0:
-        logger.warning(
-            "Flexible electrolysis constraint skipped: modelled regions have zero hydrogen demand share.",
-        )
-        return
-    region_targets = region_shares / share_sum * total_target_twh
+    if accounting_region == "nation":
+        # All links share one accounting bus, so the fleet total equals the sum of
+        # the regional hydrogen productions, i.e. the configured national total.
+        region_targets = pd.Series({"nation": total_target_twh})
+    else:
+        region_shares = h2ptcreg_hydrogen_shares(hydrogen_share_path)
+        unknown = modelled_regions.difference(region_shares.index)
+        if len(unknown):
+            raise ValueError(
+                f"No hydrogen demand share for h2ptcreg region(s) {list(unknown)} in {hydrogen_share_path}.",
+            )
+
+        # Renormalise over the modelled regions so the configured total is still met
+        # when the network covers only part of the country (e.g. a single interconnect).
+        region_shares = region_shares.reindex(modelled_regions)
+        share_sum = float(region_shares.sum())
+        if share_sum <= 0.0:
+            logger.warning(
+                "Flexible electrolysis constraint skipped: modelled regions have zero hydrogen demand share.",
+            )
+            return
+        region_targets = region_shares / share_sum * total_target_twh
 
     link_p = n.model["Link-p"]
     weights = n.snapshot_weightings.generators.reindex(snapshots).fillna(0.0).astype(float)
@@ -428,8 +468,9 @@ def add_electrolysis_hydrogen_target_constraint(
             )
 
     logger.info(
-        "Applied per-h2ptcreg annual hydrogen targets (%.1f TWh total) across %d "
+        "Applied per-%s annual hydrogen targets (%.1f TWh total) across %d "
         "region(s), with %d representative-block budget variable(s): %s.",
+        accounting_region,
         total_target_twh,
         len(region_targets),
         n_block_budgets,
@@ -619,10 +660,8 @@ def _run_standard_optimize(n, rolling_horizon, skip_iterations, cf_solving, **kw
         kwargs["track_iterations"] = cf_solving.get("track_iterations", False)
         kwargs["min_iterations"] = int(cf_solving.get("min_iterations", 4))
         kwargs["max_iterations"] = int(cf_solving.get("max_iterations", 6))
-        kwargs["method"] = cf_solving.get("method", "fixed_point")
-        kwargs["sensitivity_tolerance"] = float(
-            cf_solving.get("sensitivity_tolerance", 1e-6),
-        )
+        kwargs["scheme"] = cf_solving.get("scheme", "slp")
+        kwargs["trust_region"] = cf_solving.get("trust_region", True)
         status, condition = n.optimize.optimize_transmission_expansion_iteratively(
             **kwargs,
         )
@@ -794,7 +833,7 @@ if __name__ == "__main__":
             "solve_network",
             case="test_tr",
             ll="v1.3",
-            opts="ERM-6h",
+            opts="RPS-TCT-ERM-6h",
             planning_horizons="2050",
         )
     configure_logging(snakemake)
