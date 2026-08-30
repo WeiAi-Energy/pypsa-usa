@@ -87,6 +87,11 @@ def build_monthly_cutout(path, month: pd.Period, hours: pd.DatetimeIndex, bounds
     if not path.endswith(".nc"):
         raise ValueError(f"Cutout path must be a .nc file, got {path}.")
 
+    # The cutout is a cached side-product, not a declared rule output, so Snakemake
+    # does not create its directory. atlite writes via mkstemp(dir=...) and fails
+    # with FileNotFoundError if it is missing.
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
     def open_cutout() -> atlite.Cutout:
         return atlite.Cutout(
             path,
