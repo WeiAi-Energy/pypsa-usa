@@ -163,9 +163,7 @@ def test_add_electrolysis_constraint_splits_hydrogen_target_across_h2ptcreg_regi
     expected_rhs = (modelled / modelled.sum() * 1512.0).to_dict()
 
     link_p = n.model.variables["Link-p"].labels
-    link_p_nom = n.model.variables["Link-p_nom"].labels
     expected_coeff = 2920.0 * efficiency / 1e6
-    expected_capacity_coeff = 3 * expected_coeff
     region_links = {
         "Texas": "b flexible electrolysis",
         "California": "b2 flexible electrolysis",
@@ -183,17 +181,6 @@ def test_add_electrolysis_constraint_splits_hydrogen_target_across_h2ptcreg_regi
             assert constraint.sign.item() == "="
             assert constraint.coeffs.to_numpy().tolist() == pytest.approx([expected_coeff] * 3)
             assert constraint.vars.to_numpy().tolist() == expected_vars.tolist()
-
-            capacity_constraint = n.model.constraints[
-                f"FlexibleElectrolysis-annual_capacity_energy-{region}-{period}"
-            ]
-            expected_capacity_var = link_p_nom.sel({"Link-ext": link}).item()
-            assert capacity_constraint.rhs.item() == pytest.approx(expected_rhs[region])
-            assert capacity_constraint.sign.item() == ">="
-            assert capacity_constraint.coeffs.to_numpy().tolist() == pytest.approx(
-                [expected_capacity_coeff],
-            )
-            assert capacity_constraint.vars.to_numpy().tolist() == [expected_capacity_var]
 
     assert sum(expected_rhs.values()) == pytest.approx(1512.0)
 
@@ -278,10 +265,9 @@ def test_add_electrolysis_constraint_pools_hydrogen_target_nationally():
     )
     assert sorted(constraint.vars.to_numpy().tolist()) == sorted(expected_vars.tolist())
 
-    # Both links contribute to the one capacity-adequacy constraint.
-    capacity = n.model.constraints["FlexibleElectrolysis-annual_capacity_energy-nation-2030"]
-    assert capacity.rhs.item() == pytest.approx(1512.0)
-    assert len(capacity.vars.to_numpy().reshape(-1)) == 2
+    # Capacity adequacy follows from Link-p <= p_nom, so no separate
+    # capacity-energy constraint is built.
+    assert not [name for name in n.model.constraints if "capacity_energy" in name]
 
 
 def test_add_electrolysis_constraint_rejects_accounting_region_network_mismatch():
@@ -305,7 +291,7 @@ def test_add_electrolysis_constraint_rejects_accounting_region_network_mismatch(
         )
 
 
-def test_electrolysis_representative_blocks_use_bounded_master_budgets():
+def test_electrolysis_representative_periods_use_single_annual_equality():
     hours = pd.date_range("2030-01-01 00:00", periods=4, freq="h")
     snapshots = pd.MultiIndex.from_product(
         [[2030], hours],
@@ -355,52 +341,19 @@ def test_electrolysis_representative_blocks_use_bounded_master_budgets():
         str(HYDROGEN_DEMAND_SHARE),
     )
 
+    # Representative periods must not introduce any per-block auxiliary
+    # variables or constraints; the target stays a single annual equality.
+    assert not [name for name in n.model.variables if "hydrogen_budget" in name]
+    assert not [name for name in n.model.constraints if "-block_" in name]
+
     efficiency = 1.0 / 1.351
-    p_nom_label = n.model["Link-p_nom"].labels.sel(
-        {"Link-ext": "b flexible electrolysis"},
-    ).item()
-    budget_labels = []
-    for block in range(2):
-        budget_name = (
-            f"FlexibleElectrolysis-hydrogen_budget-Texas-2030-{block}"
-        )
-        budget_label = n.model[budget_name].labels.item()
-        budget_labels.append(budget_label)
-
-        local = n.model.constraints[
-            f"FlexibleElectrolysis-block_hydrogen-Texas-2030-{block}"
-        ]
-        local_terms = dict(
-            zip(
-                local.vars.to_numpy().reshape(-1),
-                local.coeffs.to_numpy().reshape(-1),
-            ),
-        )
-        assert local_terms[budget_label] == pytest.approx(-1.0)
-        assert sum(value > 0.0 for value in local_terms.values()) == 2
-
-        capacity = n.model.constraints[
-            f"FlexibleElectrolysis-block_capacity-Texas-2030-{block}"
-        ]
-        capacity_terms = dict(
-            zip(
-                capacity.vars.to_numpy().reshape(-1),
-                capacity.coeffs.to_numpy().reshape(-1),
-            ),
-        )
-        assert capacity_terms[budget_label] == pytest.approx(1.0)
-        assert capacity_terms[p_nom_label] == pytest.approx(
-            -(2 * 2190.0 * efficiency / 1e6),
-        )
-        assert capacity.rhs.item() == pytest.approx(0.0)
-
     annual = n.model.constraints[
         "FlexibleElectrolysis-annual_hydrogen-Texas-2030"
     ]
-    assert set(annual.vars.to_numpy().reshape(-1)) == set(budget_labels)
-    assert annual.coeffs.to_numpy().reshape(-1).tolist() == pytest.approx(
-        [1.0, 1.0],
-    )
+    coeffs = annual.coeffs.to_numpy().reshape(-1)
+    link_p_labels = set(n.model["Link-p"].labels.to_numpy().reshape(-1).tolist())
+    assert set(annual.vars.to_numpy().reshape(-1)) == link_p_labels
+    assert coeffs.tolist() == pytest.approx([2190.0 * efficiency / 1e6] * 4)
     assert annual.rhs.item() == pytest.approx(target_twh)
 
 

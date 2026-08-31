@@ -1,6 +1,7 @@
 """Adds extra extendable components to the clustered and simplified network."""
 
 import logging
+from collections.abc import Iterable
 
 import geopandas as gpd
 import numpy as np
@@ -43,6 +44,16 @@ NUCLEAR_SITING_BASE_CARRIERS = {"coal", "CCGT", "OCGT", "nuclear"}
 # drop_coal_generators and its call site in __main__.
 COAL_BASE_CARRIER = "coal"
 
+# Base carriers that never get a new-build option, whatever
+# electricity.extendable_carriers lists. The two get there differently:
+#   - `coal` has no new-build option because the whole carrier leaves the network
+#     (drop_coal_generators); it is configured only to seed the siting sets above.
+#   - `OCGT` keeps its existing fleet -- those units still dispatch, still count
+#     towards the new-nuclear footprint and still define the gas pool new
+#     CCGT/CCGT-CCS is sited on -- but no new open-cycle capacity may be built.
+# Matching is on the base carrier, so "OCGT-95CCS" is excluded along with "OCGT".
+NO_NEW_BUILD_BASE_CARRIERS = {"coal", "OCGT"}
+
 # Carriers with one generator per bus already attached by attach_wind_and_solar
 # in add_electricity.py (real atlite resource p_nom_max + capacity-factor
 # profile, using the same unified cost table). Their new-build capacity is
@@ -71,9 +82,11 @@ def carrier_new_build_buses(
       rather than being buildable at every AC bus. If no such bus exists,
       nuclear is simply unbuildable (no fallback to all AC buses, which
       would void the restriction).
-    - OCGT/CCGT/CCGT-CCS share one pool: the union of buses with existing
+    - CCGT/CCGT-CCS share one pool: the union of buses with existing
       OCGT or CCGT capacity, since gas new-build is about existing gas
-      infrastructure rather than a siting resource.
+      infrastructure rather than a siting resource. (OCGT itself is never a
+      new-build carrier -- see NO_NEW_BUILD_BASE_CARRIERS -- but its existing
+      fleet stays in the network and its buses still define that pool.)
     - Every other carrier (coal, hydrogen_ct, ...) is
       restricted to buses that already have that carrier -- or, for a
       "-CCS" variant, its base carrier -- installed, since that's where the
@@ -524,6 +537,10 @@ def drop_coal_generators(n: pypsa.Network) -> None:
     been computed, no coal capacity should remain: this must therefore be called
     after ``carrier_new_build_buses`` and before any coal generator could reach
     the optimisation.
+
+    Note the contrast with OCGT, the other carrier in
+    ``NO_NEW_BUILD_BASE_CARRIERS``: OCGT loses only its new-build option, its
+    existing fleet stays in the network.
     """
     coal_i = n.generators.index[n.generators.carrier.str.split("-").str[0] == COAL_BASE_CARRIER]
     if coal_i.empty:
@@ -537,6 +554,25 @@ def drop_coal_generators(n: pypsa.Network) -> None:
         gens.p_nom.fillna(0).sum(),
     )
     n.mremove("Generator", coal_i)
+
+
+def new_build_carriers(extendable_carriers: Iterable[str]) -> list[str]:
+    """
+    Filter ``electricity.extendable_carriers["Generator"]`` down to the carriers this script attaches new-build generators for.
+
+    Dropped here:
+
+    - ``RESOURCE_PROFILE_CARRIERS`` (wind/solar), which already have a single
+      resource-capped extendable generator per bus from add_electricity.py --
+      adding a second, uncapped one would ignore the real resource limit.
+    - ``NO_NEW_BUILD_BASE_CARRIERS`` (coal, OCGT), matched on the base carrier so
+      the ``-CCS`` variants go with them.
+    """
+    return sorted(
+        c
+        for c in set(extendable_carriers)
+        if c not in RESOURCE_PROFILE_CARRIERS and c.split("-")[0] not in NO_NEW_BUILD_BASE_CARRIERS
+    )
 
 
 def remove_negligible_potential_generators(n: pypsa.Network, threshold: float = 1.0) -> None:
@@ -1113,7 +1149,7 @@ if __name__ == "__main__":
     # attach_existing_renewable_capacities), so there's nothing to freeze here.
 
     # Bus eligibility for new-build capacity: nuclear at every AC bus;
-    # OCGT/CCGT/CCGT-CCS on the union of existing gas buses; everything
+    # CCGT/CCGT-CCS on the union of existing gas buses; everything
     # else restricted to buses that already have that carrier installed (see
     # carrier_new_build_buses).
     all_ac_buses_i = n.buses.index[n.buses.carrier == "AC"]
@@ -1125,20 +1161,18 @@ if __name__ == "__main__":
     # attach_existing_renewable_capacities (add_electricity.py) already give them a
     # single extendable generator per bus -- existing capacity as p_nom/p_nom_min,
     # resource potential as p_nom_max, new-build cost -- so there's nothing to add here.
-    # Coal is excluded as well: it is configured only to seed the new-nuclear siting
-    # set, so no new coal is ever built (and the existing fleet is dropped below).
-    new_carriers = sorted(
-        c
-        for c in set(elec_config["extendable_carriers"].get("Generator", []))
-        if c not in RESOURCE_PROFILE_CARRIERS and c.split("-")[0] != COAL_BASE_CARRIER
-    )
+    # Coal and OCGT are excluded as well (NO_NEW_BUILD_BASE_CARRIERS): no new capacity
+    # is built for either. Coal additionally leaves the network entirely below; the
+    # existing OCGT fleet stays and keeps dispatching.
+    new_carriers = new_build_carriers(elec_config["extendable_carriers"].get("Generator", []))
     new_generator_carrier_buses = {
         carrier: carrier_new_build_buses(n, carrier, all_ac_buses_i, gas_union_buses_i) for carrier in new_carriers
     }
 
     # The new-build bus sets above are the last consumer of the existing coal fleet,
     # so coal leaves the network here -- before any generator is attached for the
-    # investment periods and well before prepare_network/solve_network see it.
+    # investment periods and well before prepare_network/solve_network see it. The
+    # existing OCGT fleet is deliberately kept; it only loses its new-build option.
     drop_coal_generators(n)
 
     for investment_year in n.investment_periods:

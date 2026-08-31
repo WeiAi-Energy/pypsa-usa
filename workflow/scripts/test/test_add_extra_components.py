@@ -8,10 +8,12 @@ import pytest
 from _helpers import calculate_annuity
 from add_extra_components import (
     FLEXIBLE_ELECTROLYSIS_BUS_SUFFIX,
+    NEW_GAS_COST_CARRIERS,
     attach_flexible_electrolysis,
     attach_tes_storageunits,
     carrier_new_build_buses,
     drop_coal_generators,
+    new_build_carriers,
 )
 from regional_cost import (
     SectorCosts,
@@ -197,15 +199,56 @@ def test_drop_coal_generators_removes_coal_and_its_ccs_variants_only():
     n = network_with_ac_buses()
     n.add("Generator", "existing coal", bus="ac_1", carrier="coal", p_nom=100.0)
     n.add("Generator", "existing coal ccs", bus="ac_1", carrier="coal-95CCS", p_nom=50.0)
+    n.add("Generator", "existing ocgt", bus="ac_2", carrier="OCGT", p_nom=75.0)
     n.add("Generator", "existing ccgt", bus="ac_2", carrier="CCGT", p_nom=200.0)
 
     drop_coal_generators(n)
 
-    assert n.generators.index.tolist() == ["existing ccgt"]
+    # The existing OCGT fleet is kept -- OCGT only loses its new-build option.
+    assert n.generators.index.tolist() == ["existing ocgt", "existing ccgt"]
 
     # Idempotent: a second call on a coal-free network is a no-op.
     drop_coal_generators(n)
-    assert n.generators.index.tolist() == ["existing ccgt"]
+    assert n.generators.index.tolist() == ["existing ocgt", "existing ccgt"]
+
+
+def test_new_build_carriers_excludes_coal_ocgt_and_resource_profile_carriers():
+    carriers = [
+        "solar",
+        "onwind",
+        "offwind_floating",
+        "coal",
+        "coal-95CCS",
+        "OCGT",
+        "OCGT-95CCS",
+        "CCGT",
+        "CCGT-95CCS",
+        "nuclear",
+        "hydrogen_ct",
+    ]
+
+    assert new_build_carriers(carriers) == ["CCGT", "CCGT-95CCS", "hydrogen_ct", "nuclear"]
+
+
+def test_existing_ocgt_still_seeds_gas_and_nuclear_siting():
+    """No new OCGT is built, but the existing fleet still defines where new capacity may go."""
+    n = network_with_ac_buses()
+    n.add("Generator", "existing ocgt", bus="ac_1", carrier="OCGT", p_nom=75.0)
+    n.add("Generator", "existing solar", bus="ac_3", carrier="solar", p_nom=10.0)
+
+    gas_union_buses_i = pd.Index(n.generators.loc[n.generators.carrier.isin(NEW_GAS_COST_CARRIERS), "bus"].unique())
+    all_ac_buses_i = n.buses.index[n.buses.carrier == "AC"]
+
+    assert gas_union_buses_i.tolist() == ["ac_1"]
+    # New CCGT is sited on the existing OCGT bus ...
+    assert carrier_new_build_buses(n, "CCGT", all_ac_buses_i, gas_union_buses_i).tolist() == ["ac_1"]
+    # ... and so is new nuclear.
+    assert carrier_new_build_buses(n, "nuclear", all_ac_buses_i, gas_union_buses_i).tolist() == ["ac_1"]
+
+    # The fleet survives drop_coal_generators; only its new-build option is gone.
+    drop_coal_generators(n)
+    assert "existing ocgt" in n.generators.index
+    assert "OCGT" not in new_build_carriers(["OCGT", "CCGT"])
 
 
 def test_flexible_electrolysis_rejects_nonpositive_electricity_input(tmp_path):

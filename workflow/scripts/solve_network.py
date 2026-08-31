@@ -44,10 +44,6 @@ from opts.policy import (
     add_technology_capacity_target_constraints,
 )
 from opts.representative_periods import (
-    _get_period_hours,
-    _get_representative_blocks,
-    _get_representative_period_metadata,
-    _to_multiindex_snapshots,
     add_representative_period_storage_constraints,
 )
 from opts.reserves import (
@@ -163,47 +159,6 @@ def h2ptcreg_hydrogen_shares(hydrogen_share_path):
     return shares.groupby("h2ptcreg")["share"].sum()
 
 
-def _electrolysis_representative_blocks(n, snapshots, config):
-    """Return exact representative-period blocks, validating full coverage."""
-    rep_config = (
-        config.get("clustering", {})
-        .get("temporal", {})
-        .get("representative_periods", {})
-    )
-    if not rep_config.get("enable", False):
-        return {}
-
-    snapshot_index = _to_multiindex_snapshots(snapshots)
-    if snapshot_index is None or snapshot_index.nlevels < 2:
-        logger.warning(
-            "Representative periods are enabled, but electrolysis snapshots are "
-            "not a MultiIndex; using the annual hydrogen formulation.",
-        )
-        return {}
-
-    blocks = _get_representative_blocks(
-        snapshot_index,
-        _get_period_hours(rep_config),
-        _get_representative_period_metadata(n),
-    )
-    period_level = "period" if "period" in snapshot_index.names else 0
-    for period in snapshot_index.get_level_values(period_level).unique():
-        period_snapshots = snapshot_index[
-            snapshot_index.get_level_values(period_level) == period
-        ]
-        covered = [
-            snapshot
-            for block in blocks.get(period, [])
-            for snapshot in block["snapshots"]
-        ]
-        if covered != list(period_snapshots):
-            raise ValueError(
-                "Representative-period blocks do not cover every electrolysis "
-                f"snapshot in investment period {period}.",
-            )
-    return blocks
-
-
 def _electrolysis_capacity_terms(n, links):
     """Return fixed MW and the extendable-capacity expression for active links."""
     attributes = n.links.loc[links]
@@ -238,13 +193,6 @@ def add_electrolysis_hydrogen_target_constraint(
     ``nation`` a single constraint requires the whole electrolyzer fleet to
     deliver the sum of those regional productions, i.e. the configured total.
 
-    In representative-period models, a non-negative master budget is introduced
-    for each region and representative block. The budgets sum to the annual target
-    and each is bounded by active electrolyzer capacity times its represented
-    hours. This is equivalent to the annual energy equality, but gives Benders
-    subproblems a physically attainable local target instead of an unbounded free
-    cross-period allocation.
-
     The electrolysis links carry ``efficiency = 0`` in the network so that the H2
     accounting buses balance trivially. Hydrogen output is derived from link
     electricity withdrawal ``p0`` and the conversion efficiency implied by
@@ -278,7 +226,7 @@ def add_electrolysis_hydrogen_target_constraint(
             "Flexible electrolysis is enabled but no simple_sector_costs.csv path was provided "
             "to the hydrogen target constraint.",
         )
-    total_target_twh = float(flex_config.get("annual_hydrogen_twh", 1512.0))
+    total_target_twh = float(flex_config.get("annual_hydrogen_twh", 1612.0))
     electricity_input = SectorCosts(sector_costs_path).value(
         "h2 electrolysis",
         "electricity-input",
@@ -333,18 +281,11 @@ def add_electrolysis_hydrogen_target_constraint(
 
     link_p = n.model["Link-p"]
     weights = n.snapshot_weightings.generators.reindex(snapshots).fillna(0.0).astype(float)
-    representative_blocks = _electrolysis_representative_blocks(
-        n,
-        snapshots,
-        config,
-    )
-
     if isinstance(snapshots, pd.MultiIndex):
         periods = list(snapshots.get_level_values(0).unique())
     else:
         periods = [None]
 
-    n_block_budgets = 0
     for period in periods:
         if period is None:
             period_snapshots = snapshots
@@ -378,13 +319,17 @@ def add_electrolysis_hydrogen_target_constraint(
                     f"No active flexible electrolysis link for {region} in period {period}.",
                 )
 
+            # Sufficient capacity is already implied by the annual equality
+            # together with the per-snapshot Link-p <= p_nom limits, so no
+            # capacity-energy constraint is added. Non-extendable regions are
+            # checked up front to report a clear error rather than an
+            # infeasible LP.
             fixed_capacity, extendable_capacity = _electrolysis_capacity_terms(
                 n,
                 region_links,
             )
-            annual_energy_per_mw = period_hours * efficiency / 1e6
-            fixed_annual_twh = fixed_capacity * annual_energy_per_mw
             if extendable_capacity is None:
+                fixed_annual_twh = fixed_capacity * period_hours * efficiency / 1e6
                 tolerance = 1e-9 * max(1.0, float(target_twh))
                 if fixed_annual_twh + tolerance < float(target_twh):
                     raise ValueError(
@@ -392,88 +337,24 @@ def add_electrolysis_hydrogen_target_constraint(
                         f"can produce at most {fixed_annual_twh:.6g} TWh, below "
                         f"the {float(target_twh):.6g} TWh target.",
                     )
-            else:
-                n.model.add_constraints(
-                    extendable_capacity * annual_energy_per_mw
-                    >= float(target_twh) - fixed_annual_twh,
-                    name=f"FlexibleElectrolysis-annual_capacity_energy-{region}{label}",
-                )
 
-            period_blocks = representative_blocks.get(period, [])
-            if not period_blocks:
-                hydrogen_output_twh = (
-                    link_p.loc[period_snapshots, region_links]
-                    .mul(period_weights)
-                    .mul(efficiency / 1e6)
-                    .sum()
-                )
-                n.model.add_constraints(
-                    hydrogen_output_twh == float(target_twh),
-                    name=f"FlexibleElectrolysis-annual_hydrogen-{region}{label}",
-                )
-                continue
-
-            budgets = []
-            for block_index, block in enumerate(period_blocks):
-                block_snapshots = block["snapshots"]
-                block_weights = period_weights.loc[block_snapshots]
-                block_hours = float(block_weights.sum())
-                if block_hours <= 0.0:
-                    raise ValueError(
-                        f"Representative electrolysis block {block_index} in {period} "
-                        "has zero generator weight.",
-                    )
-
-                budget = n.model.add_variables(
-                    lower=0.0,
-                    upper=float(target_twh),
-                    name=(
-                        "FlexibleElectrolysis-hydrogen_budget-"
-                        f"{region}{label}-{block_index}"
-                    ),
-                )
-                budgets.append(budget)
-                n_block_budgets += 1
-
-                block_output_twh = (
-                    link_p.loc[block_snapshots, region_links]
-                    .mul(block_weights)
-                    .mul(efficiency / 1e6)
-                    .sum()
-                )
-                n.model.add_constraints(
-                    block_output_twh == budget,
-                    name=(
-                        "FlexibleElectrolysis-block_hydrogen-"
-                        f"{region}{label}-{block_index}"
-                    ),
-                )
-
-                block_energy_per_mw = block_hours * efficiency / 1e6
-                capacity_lhs = budget
-                if extendable_capacity is not None:
-                    capacity_lhs = capacity_lhs - extendable_capacity * block_energy_per_mw
-                n.model.add_constraints(
-                    capacity_lhs <= fixed_capacity * block_energy_per_mw,
-                    name=(
-                        "FlexibleElectrolysis-block_capacity-"
-                        f"{region}{label}-{block_index}"
-                    ),
-                )
-
-            annual_budget = sum(budgets[1:], budgets[0])
+            hydrogen_output_twh = (
+                link_p.loc[period_snapshots, region_links]
+                .mul(period_weights)
+                .mul(efficiency / 1e6)
+                .sum()
+            )
             n.model.add_constraints(
-                annual_budget == float(target_twh),
+                hydrogen_output_twh == float(target_twh),
                 name=f"FlexibleElectrolysis-annual_hydrogen-{region}{label}",
             )
 
     logger.info(
         "Applied per-%s annual hydrogen targets (%.1f TWh total) across %d "
-        "region(s), with %d representative-block budget variable(s): %s.",
+        "region(s): %s.",
         accounting_region,
         total_target_twh,
         len(region_targets),
-        n_block_budgets,
         ", ".join(f"{r} {t:.1f} TWh" for r, t in region_targets.items()),
     )
 
