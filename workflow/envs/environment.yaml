@@ -56,7 +56,7 @@ dependencies:
 - pip:
   - git+https://github.com/WeiAi-Energy/PyPSA-SSSC.git@main
   - tsam>=1.1.0
-  - gurobipy==11.0.3
+  - gurobipy==12.0.1
   - highspy
   - duckdb==0.10.0
   - flake8

@@ -871,3 +871,142 @@ def test_multi_period_erm_activity_masking(multi_period_reserve_network):
     assert np.allclose(actual_rhs, expected_rhs, atol=1e-6), (
         "The CA_Z1 requirement should be built on the masked firm capacity"
     )
+
+
+def _energy_backed_erm_network(stores_weighting, representative_metadata=None):
+    """
+    One battery and one TES discharge link, built for the energy-backing rows.
+
+    ``stores_weighting`` is written into every snapshot weighting so the two hour
+    conventions -- the weighting and the physical hour between two timestamps --
+    give different coefficients and cannot be confused for one another.
+    """
+    hours = pd.date_range("2030-01-01 00:00", periods=4, freq="h")
+    snapshots = pd.MultiIndex.from_tuples([(2030, ts) for ts in hours], names=["period", "timestep"])
+
+    n = pypsa.Network()
+    n.set_snapshots(snapshots)
+    n.set_investment_periods(periods=[2030])
+    n.snapshot_weightings.loc[:, :] = float(stores_weighting)
+
+    for carrier in ["AC", "tes", "battery", "gen", "load"]:
+        n.add("Carrier", carrier, co2_emissions=0.0)
+
+    n.add("Bus", "z1", carrier="AC")
+    n.add("Bus", "z1 tes_2030", carrier="tes")
+    n.buses.loc[:, "country"] = "US"
+    n.buses.loc[:, "interconnect"] = "west"
+    n.buses.loc[:, "region"] = "west"
+    n.buses.loc[:, "nerc_reg"] = "NERC1"
+    n.buses.loc[:, "reeds_state"] = "CA"
+    n.buses.loc[:, "reeds_zone"] = "CA_Z1"
+
+    n.add("Load", "l", bus="z1", carrier="load", p_set=pd.Series(0.0, index=snapshots))
+    n.add("Generator", "g", bus="z1", carrier="gen", p_nom=100, marginal_cost=1.0, p_max_pu=1.0)
+    n.add(
+        "StorageUnit",
+        "z1 battery_2030",
+        bus="z1",
+        carrier="battery",
+        p_nom=100,
+        max_hours=4,
+        efficiency_store=0.9,
+        efficiency_dispatch=0.8,
+        build_year=2030,
+        lifetime=30,
+    )
+    n.add(
+        "Store",
+        "z1 tes store_2030",
+        bus="z1 tes_2030",
+        carrier="tes",
+        e_nom=200,
+        e_initial=100,
+        e_cyclic=False,
+        e_cyclic_per_period=False,
+        standing_loss=0.0,
+        build_year=2030,
+        lifetime=30,
+    )
+    n.add(
+        "Link",
+        "z1 tes discharge_2030",
+        bus0="z1 tes_2030",
+        bus1="z1",
+        carrier="tes",
+        p_nom=100,
+        efficiency=0.524,
+        build_year=2030,
+        lifetime=30,
+    )
+
+    if representative_metadata is not None:
+        n.meta = {"representative_periods_plot_metadata": representative_metadata}
+
+    n.optimize.create_model(multi_investment_periods=True)
+    add_ERM_constraints(n, snapshots, regional_erm_data={"all": 0.15})
+    return n, snapshots
+
+
+def _row_coefficients(constraint, **selection):
+    """Coefficients of one constraint row, keyed by variable label."""
+    labels = constraint.vars.sel(selection).values.flat
+    coeffs = constraint.coeffs.sel(selection).values.flat
+    return {int(label): float(coeff) for label, coeff in zip(labels, coeffs) if label != -1}
+
+
+def _energy_backing_hours(n, snapshot):
+    """Hours the two energy-backing rows charge one snapshot of reserve discharge with."""
+    soc_row = _row_coefficients(
+        n.model.constraints["StorageUnit-p_dispatch-soc-upper_ERM"],
+        snapshot=snapshot,
+        StorageUnit="z1 battery_2030",
+    )
+    store_row = _row_coefficients(
+        n.model.constraints["Link-p-store-upper_ERM"],
+        snapshot=snapshot,
+        Link="z1 tes discharge_2030",
+    )
+
+    battery_reserve = _label(n, "StorageUnit-p_dispatch_ERM", snapshot=snapshot, StorageUnit="z1 battery_2030")
+    soc = _label(n, "StorageUnit-state_of_charge", snapshot=snapshot, StorageUnit="z1 battery_2030")
+    link_reserve = _label(n, "Link-p_ERM", snapshot=snapshot, Link="z1 tes discharge_2030")
+    store_e = _label(n, "Store-e", snapshot=snapshot, Store="z1 tes store_2030")
+
+    assert soc_row[soc] == pytest.approx(-1.0)
+    assert store_row[store_e] == pytest.approx(-1.0)
+
+    # eh / efficiency_dispatch on the storage unit, plain eh on the discharge link.
+    return soc_row[battery_reserve] * 0.8, store_row[link_reserve]
+
+
+def test_erm_energy_backing_uses_snapshot_weightings_without_representative_periods():
+    """Chronologically, the weighting is the timestep length, exactly as PyPSA uses it."""
+    n, snapshots = _energy_backed_erm_network(stores_weighting=5.0)
+
+    storage_unit_hours, store_link_hours = _energy_backing_hours(n, snapshots[0])
+    assert storage_unit_hours == pytest.approx(5.0)
+    assert store_link_hours == pytest.approx(5.0)
+
+
+def test_erm_energy_backing_uses_physical_hours_under_representative_periods():
+    """
+    With representative periods the weighting is a cluster count, not a duration.
+
+    Charging the reserve discharge with it would demand the device hold a whole
+    cluster's worth of energy for one hour of reserve, which is the bug this locks
+    down: the backing has to be one physical hour.
+    """
+    metadata = {
+        "2030": {
+            "periods": [
+                {"period_id": 0, "kind": "representative", "steps": 2},
+                {"period_id": 1, "kind": "extreme", "steps": 2},
+            ],
+        },
+    }
+    n, snapshots = _energy_backed_erm_network(stores_weighting=5.0, representative_metadata=metadata)
+
+    storage_unit_hours, store_link_hours = _energy_backing_hours(n, snapshots[0])
+    assert storage_unit_hours == pytest.approx(1.0)
+    assert store_link_hours == pytest.approx(1.0)

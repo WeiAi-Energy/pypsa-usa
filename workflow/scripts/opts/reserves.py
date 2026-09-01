@@ -40,7 +40,9 @@ A discharger -- a ``StorageUnit``, or a ``Link`` that discharges a ``Store`` suc
 TES -- gets one reserve-state variable capped two ways: by its rating against the
 shared nominal capacity variable, and by the energy the *base-state* dispatch leaves
 in the device at that snapshot. The second cap is what makes the contribution
-energy-backed rather than a pure capacity credit.
+energy-backed rather than a pure capacity credit. It converts power to energy over
+one *physical* timestep (``storage_elapsed_hours``), which is the snapshot weighting
+only while the snapshots run chronologically.
 
 Cross-boundary flow
 -------------------
@@ -86,6 +88,7 @@ import logging
 import numpy as np
 import pandas as pd
 from opts._helpers import get_region_buses
+from opts.representative_periods import storage_elapsed_hours
 from pypsa.descriptors import (
     expand_series,
     get_activity_mask,
@@ -242,7 +245,7 @@ def _define_erm_discharge_rating(n, sns, c, attr, assets_i):
     )
 
 
-def define_erm_storage_unit_capacity(n, sns):
+def define_erm_storage_unit_capacity(n, sns, config=None):
     """
     Bound reserve-state storage discharge by the rating and the base-state SOC.
 
@@ -250,6 +253,12 @@ def define_erm_storage_unit_capacity(n, sns):
     Discharging at the reserve level for one snapshot must not draw more energy than
     the state of charge holds at that snapshot, which is what makes the contribution
     energy-backed rather than a pure capacity credit.
+
+    "For one snapshot" is a physical duration, so the hours come from
+    ``storage_elapsed_hours`` rather than from ``snapshot_weightings.stores``: under
+    representative periods the weighting is a cluster count, and using it here would
+    demand the state of charge back a whole cluster's worth of discharge and strip
+    storage of most of its adequacy contribution.
     """
     c = "StorageUnit"
     assets = n.df(c)
@@ -260,7 +269,7 @@ def define_erm_storage_unit_capacity(n, sns):
     _add_erm_variable(n, sns, c, "p_dispatch", lower=0)
     _define_erm_discharge_rating(n, sns, c, "p_dispatch", assets.index)
 
-    eh = expand_series(n.snapshot_weightings.stores[sns], assets.index)
+    eh = expand_series(storage_elapsed_hours(n, sns, config), assets.index)
     eff_dispatch = get_as_dense(n, c, "efficiency_dispatch", sns)
     m.add_constraints(
         DataArray(eh / eff_dispatch) * m[f"{c}-p_dispatch_ERM"] - m[f"{c}-state_of_charge"],
@@ -271,12 +280,14 @@ def define_erm_storage_unit_capacity(n, sns):
     )
 
 
-def define_erm_store_link_capacity(n, sns, links_i):
+def define_erm_store_link_capacity(n, sns, links_i, config=None):
     """
     Cap the reserve flow of storage discharge links by the connected store energy.
 
     The variable is denominated on ``bus0`` like ``Link-p``; the nodal balance
-    applies the link efficiency when injecting at ``bus1``.
+    applies the link efficiency when injecting at ``bus1``. The hours backing one
+    snapshot of discharge are physical, for the reason given in
+    ``define_erm_storage_unit_capacity``.
     """
     m = n.model
     c = "Link"
@@ -288,7 +299,7 @@ def define_erm_store_link_capacity(n, sns, links_i):
 
     reserve = m[f"{c}-p_ERM"].sel({c: links_i})
     eh = DataArray(
-        expand_series(n.snapshot_weightings.stores[sns], links_i).to_numpy(),
+        expand_series(storage_elapsed_hours(n, sns, config), links_i).to_numpy(),
         coords=reserve.coords,
         dims=reserve.dims,
     )
@@ -310,7 +321,7 @@ def define_erm_store_link_capacity(n, sns, links_i):
     )
 
 
-def define_erm_discharge_variables(n, sns):
+def define_erm_discharge_variables(n, sns, config=None):
     """
     Create the reserve state: the discharge potential of every storage device.
 
@@ -318,7 +329,7 @@ def define_erm_discharge_variables(n, sns):
     ``p_nom``, and the cross-boundary term reads the base-state flows.
     """
     if not n.storage_units.empty:
-        define_erm_storage_unit_capacity(n, sns)
+        define_erm_storage_unit_capacity(n, sns, config)
 
     if n.links.empty:
         return
@@ -329,7 +340,7 @@ def define_erm_discharge_variables(n, sns):
 
     _add_erm_variable(n, sns, "Link", "p", index=discharge_i, lower=0)
     _define_erm_discharge_rating(n, sns, "Link", "p", discharge_i)
-    define_erm_store_link_capacity(n, sns, discharge_i)
+    define_erm_store_link_capacity(n, sns, discharge_i, config)
 
 
 def _erm_electric_link_i(n, buses):
@@ -700,7 +711,11 @@ def add_ERM_constraints(
         Snapshots the requirement is written on.
     config : dict, optional
         Configuration dictionary containing ``electricity.erm``. Required if
-        ``regional_erm_data`` is not provided.
+        ``regional_erm_data`` is not provided. Also read for
+        ``clustering.temporal.representative_periods``, which decides whether the
+        hours backing a storage discharge come from the snapshot weightings or from
+        the physical timestep; without it the network's own representative-period
+        metadata decides.
     snakemake : snakemake object, optional
         Not used, kept for API compatibility.
     regional_erm_data : dict, optional
@@ -750,7 +765,7 @@ def add_ERM_constraints(
 
     logger.info("Added %d ERM constraints.", len(regions))
 
-    define_erm_discharge_variables(n, snapshots)
+    define_erm_discharge_variables(n, snapshots, config)
     define_erm_regional_requirements(n, snapshots, regions, buses)
 
 

@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pandas as pd
 import pypsa
 import pytest
@@ -163,7 +164,6 @@ def test_add_electrolysis_constraint_splits_hydrogen_target_across_h2ptcreg_regi
     expected_rhs = (modelled / modelled.sum() * 1512.0).to_dict()
 
     link_p = n.model.variables["Link-p"].labels
-    expected_coeff = 2920.0 * efficiency / 1e6
     region_links = {
         "Texas": "b flexible electrolysis",
         "California": "b2 flexible electrolysis",
@@ -171,16 +171,35 @@ def test_add_electrolysis_constraint_splits_hydrogen_target_across_h2ptcreg_regi
 
     for period, hours in ((2030, hours_2030), (2040, hours_2040)):
         for region, link in region_links.items():
-            constraint = n.model.constraints[f"FlexibleElectrolysis-annual_hydrogen-{region}-{period}"]
+            rate_labels = (
+                n.model.variables[f"FlexibleElectrolysis-h2_rate-{region}-{period}"]
+                .labels.to_numpy()
+                .reshape(-1)
+            )
             expected_vars = link_p.sel(
                 snapshot=[(period, ts) for ts in hours],
                 Link=[link],
             ).values.reshape(-1)
 
-            assert constraint.rhs.item() == pytest.approx(expected_rhs[region])
+            # The fleet is aggregated per snapshot, one row per snapshot, so the
+            # annual row never carries a term per link and snapshot.
+            definition = n.model.constraints[
+                f"FlexibleElectrolysis-h2_rate-{region}-{period}-definition"
+            ]
+            assert set(np.asarray(definition.sign).ravel().tolist()) == {"="}
+            assert np.asarray(definition.rhs).ravel().tolist() == pytest.approx([0.0] * 3)
+            assert np.asarray(definition.coeffs).ravel().tolist() == pytest.approx(
+                [1.0, -efficiency] * 3,
+            )
+            assert np.asarray(definition.vars).ravel().tolist() == [
+                label for pair in zip(rate_labels, expected_vars) for label in pair
+            ]
+
+            constraint = n.model.constraints[f"FlexibleElectrolysis-annual_hydrogen-{region}-{period}"]
+            assert constraint.rhs.item() == pytest.approx(expected_rhs[region] * 1e3)
             assert constraint.sign.item() == "="
-            assert constraint.coeffs.to_numpy().tolist() == pytest.approx([expected_coeff] * 3)
-            assert constraint.vars.to_numpy().tolist() == expected_vars.tolist()
+            assert constraint.coeffs.to_numpy().tolist() == pytest.approx([2920.0 / 1e3] * 3)
+            assert constraint.vars.to_numpy().tolist() == rate_labels.tolist()
 
     assert sum(expected_rhs.values()) == pytest.approx(1512.0)
 
@@ -249,12 +268,22 @@ def test_add_electrolysis_constraint_pools_hydrogen_target_nationally():
         for name in n.model.constraints
     )
     constraint = n.model.constraints["FlexibleElectrolysis-annual_hydrogen-nation-2030"]
-    assert constraint.rhs.item() == pytest.approx(1512.0)
+    assert constraint.rhs.item() == pytest.approx(1512.0 * 1e3)
     assert constraint.sign.item() == "="
 
     efficiency = 1.0 / 1.351
-    expected_coeff = 2920.0 * efficiency / 1e6
-    assert constraint.coeffs.to_numpy().tolist() == pytest.approx([expected_coeff] * 6)
+    rate_labels = (
+        n.model.variables["FlexibleElectrolysis-h2_rate-nation-2030"]
+        .labels.to_numpy()
+        .reshape(-1)
+    )
+
+    # The annual row sums the per-snapshot aggregate, one term per snapshot.
+    assert constraint.coeffs.to_numpy().tolist() == pytest.approx([2920.0 / 1e3] * 3)
+    assert constraint.vars.to_numpy().tolist() == rate_labels.tolist()
+
+    # The whole fleet enters through the aggregation rows instead.
+    definition = n.model.constraints["FlexibleElectrolysis-h2_rate-nation-2030-definition"]
     expected_vars = (
         n.model.variables["Link-p"]
         .labels.sel(
@@ -263,7 +292,13 @@ def test_add_electrolysis_constraint_pools_hydrogen_target_nationally():
         )
         .values.reshape(-1)
     )
-    assert sorted(constraint.vars.to_numpy().tolist()) == sorted(expected_vars.tolist())
+    assert np.asarray(definition.rhs).ravel().tolist() == pytest.approx([0.0] * 3)
+    assert np.asarray(definition.coeffs).ravel().tolist() == pytest.approx(
+        [1.0, -efficiency, -efficiency] * 3,
+    )
+    assert sorted(np.asarray(definition.vars).ravel().tolist()) == sorted(
+        rate_labels.tolist() + expected_vars.tolist(),
+    )
 
     # Capacity adequacy follows from Link-p <= p_nom, so no separate
     # capacity-energy constraint is built.
@@ -350,11 +385,24 @@ def test_electrolysis_representative_periods_use_single_annual_equality():
     annual = n.model.constraints[
         "FlexibleElectrolysis-annual_hydrogen-Texas-2030"
     ]
-    coeffs = annual.coeffs.to_numpy().reshape(-1)
-    link_p_labels = set(n.model["Link-p"].labels.to_numpy().reshape(-1).tolist())
-    assert set(annual.vars.to_numpy().reshape(-1)) == link_p_labels
-    assert coeffs.tolist() == pytest.approx([2190.0 * efficiency / 1e6] * 4)
-    assert annual.rhs.item() == pytest.approx(target_twh)
+    rate_labels = (
+        n.model.variables["FlexibleElectrolysis-h2_rate-Texas-2030"]
+        .labels.to_numpy()
+        .reshape(-1)
+    )
+    assert annual.vars.to_numpy().reshape(-1).tolist() == rate_labels.tolist()
+    assert annual.coeffs.to_numpy().reshape(-1).tolist() == pytest.approx([2190.0 / 1e3] * 4)
+    assert annual.rhs.item() == pytest.approx(target_twh * 1e3)
+
+    # The links reach the target only through the per-snapshot aggregation rows.
+    definition = n.model.constraints["FlexibleElectrolysis-h2_rate-Texas-2030-definition"]
+    link_p_labels = n.model["Link-p"].labels.to_numpy().reshape(-1)
+    assert np.asarray(definition.coeffs).ravel().tolist() == pytest.approx(
+        [1.0, -efficiency] * 4,
+    )
+    assert np.asarray(definition.vars).ravel().tolist() == [
+        label for pair in zip(rate_labels, link_p_labels) for label in pair
+    ]
 
 
 def _line_x_network():
@@ -434,3 +482,132 @@ def test_line_x_sssc_line_capacity_constraint_respects_ratio_and_is_optional():
     disabled.optimize.create_model()
     solve_network_module.add_line_x_sssc_line_capacity_constraint(disabled, disabled.snapshots, _line_x_config(ratio=None))
     assert not [name for name in disabled.model.constraints if "line_capacity" in name]
+
+
+def _sssc_upper(n):
+    variable = n.model.variables["LineX-sssc_nom"]
+    return variable.upper.to_series()
+
+
+def test_line_x_sssc_bound_follows_the_implied_per_branch_cap():
+    n = _line_x_network()
+    n.optimize.create_model()
+    assert _sssc_upper(n).tolist() == [1e6, 1e6]
+
+    solve_network_module.tighten_line_x_sssc_bound(n, n.snapshots, _line_x_config(ratio=0.5))
+
+    # the extendable branch is bounded by its own s_nom_max, the fixed one by its
+    # rating, both times through the configured share
+    assert _sssc_upper(n)["ab"] == pytest.approx(200.0)
+    assert _sssc_upper(n)["bc"] == pytest.approx(40.0)
+
+
+def test_line_x_sssc_bound_also_respects_the_system_total():
+    n = _line_x_network()
+    n.optimize.create_model()
+
+    config = _line_x_config(ratio=0.5)
+    config["lines"]["convert_lines_to_line_x"]["sssc_tot_max"] = 30.0
+    solve_network_module.tighten_line_x_sssc_bound(n, n.snapshots, config)
+
+    # no single branch can exceed the budget shared by all of them
+    assert _sssc_upper(n).tolist() == pytest.approx([30.0, 30.0])
+
+
+def test_line_x_sssc_bound_survives_a_disabled_per_branch_share():
+    """The two caps are independent: dropping the share keeps the system total."""
+    n = _line_x_network()
+    n.optimize.create_model()
+
+    config = _line_x_config(ratio=None)
+    config["lines"]["convert_lines_to_line_x"]["sssc_tot_max"] = 30.0
+    solve_network_module.add_line_x_sssc_line_capacity_constraint(n, n.snapshots, config)
+    # the per-branch rows are gone with the share
+    assert not [name for name in n.model.constraints if "line_capacity" in name]
+
+    solve_network_module.tighten_line_x_sssc_bound(n, n.snapshots, config)
+    assert _sssc_upper(n).tolist() == pytest.approx([30.0, 30.0])
+
+
+def test_line_x_sssc_bound_is_a_no_op_without_either_cap():
+    n = _line_x_network()
+    n.optimize.create_model()
+
+    solve_network_module.tighten_line_x_sssc_bound(n, n.snapshots, _line_x_config(ratio=None))
+
+    assert _sssc_upper(n).tolist() == [1e6, 1e6]
+
+
+def test_line_x_sssc_bound_never_loosens_an_existing_one():
+    n = _line_x_network()
+    n.line_xs.loc["ab", "sssc_nom_max"] = 5.0
+    n.optimize.create_model()
+
+    solve_network_module.tighten_line_x_sssc_bound(n, n.snapshots, _line_x_config(ratio=1.0))
+
+    assert _sssc_upper(n)["ab"] == pytest.approx(5.0)
+    assert _sssc_upper(n)["bc"] == pytest.approx(80.0)
+
+
+def test_line_x_sssc_bound_leaves_the_optimum_untouched(monkeypatch):
+    """The tightened bound is implied by the rows, so it may not move the solution."""
+
+    def solve(tighten):
+        n = _line_x_network()
+        if not tighten:
+            monkeypatch.setattr(
+                solve_network_module, "tighten_line_x_sssc_bound", lambda *a, **k: None
+            )
+
+        def extra(network, sns):
+            solve_network_module.add_line_x_sssc_line_capacity_constraint(
+                network, sns, _line_x_config(ratio=0.5)
+            )
+            solve_network_module.tighten_line_x_sssc_bound(
+                network, sns, _line_x_config(ratio=0.5)
+            )
+
+        n.optimize(solver_name="highs", extra_functionality=extra)
+        return n.line_xs.sssc_nom_opt.tolist(), float(n.objective)
+
+    tightened = solve(True)
+    # the patch is undone by the fixture at the end of the test
+    loose = solve(False)
+
+    assert tightened[0] == pytest.approx(loose[0])
+    assert tightened[1] == pytest.approx(loose[1])
+
+
+def test_iterative_optimize_kwargs_forwards_only_what_is_configured():
+    """An unset key has to keep PyPSA's own default rather than become None."""
+    assert solve_network_module._iterative_optimize_kwargs({}) == {}
+    assert solve_network_module._iterative_optimize_kwargs({"proximal": None}) == {}
+
+    # the remaining step control stays at PyPSA's defaults and is not forwarded
+    forwarded = solve_network_module._iterative_optimize_kwargs(
+        {"proximal": "off", "cost_threshold": 1.0e-4, "max_iterations": 20},
+    )
+    assert forwarded == {"proximal": "off"}
+
+
+def test_run_standard_optimize_passes_the_proximal_norm_through(monkeypatch):
+    captured = {}
+
+    class FakeOptimize:
+        def optimize_transmission_expansion_iteratively(self, **kwargs):
+            captured.update(kwargs)
+            return "ok", "optimal"
+
+    network = SimpleNamespace(optimize=FakeOptimize())
+    cf_solving = {"scheme": "slp", "trust_region": True, "proximal": "l2"}
+
+    status, condition = solve_network_module._run_standard_optimize(
+        network, rolling_horizon=False, skip_iterations=False, cf_solving=cf_solving
+    )
+
+    assert (status, condition) == ("ok", "optimal")
+    assert captured["trust_region"] is True
+    assert captured["proximal"] == "l2"
+    # the convergence criterion is PyPSA's, not something this repo sets
+    assert "cost_threshold" not in captured
+    assert "cost_window" not in captured

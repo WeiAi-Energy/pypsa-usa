@@ -28,6 +28,7 @@ import logging
 import numpy as np
 import pandas as pd
 import pypsa
+import xarray as xr
 import yaml
 from pypsa.optimization.common import reindex
 from _helpers import (
@@ -197,7 +198,15 @@ def add_electrolysis_hydrogen_target_constraint(
     accounting buses balance trivially. Hydrogen output is derived from link
     electricity withdrawal ``p0`` and the conversion efficiency implied by
     ``h2 electrolysis`` / ``electricity-input`` in
-    ``simple_sector_costs.csv``. Energy rows are expressed in TWh for scaling.
+    ``simple_sector_costs.csv``.
+
+    The target is written as two rows per region and period rather than one. A
+    per-snapshot variable ``h2_rate`` carries the region's instantaneous H2 output
+    in MW_H2 and is pinned to the fleet's electricity withdrawal; the annual row
+    then sums that one variable over the snapshots. This keeps the annual row
+    sparse and both rows well scaled -- the aggregation row sits on the efficiency,
+    the annual row on the snapshot weightings divided by ``1e3``, since the target
+    is configured in TWh but accounted in GWh.
     """
     flex_config = config.get("flexible_electrolysis", {})
     if not flex_config.get("enable", False):
@@ -338,14 +347,31 @@ def add_electrolysis_hydrogen_target_constraint(
                         f"the {float(target_twh):.6g} TWh target.",
                     )
 
-            hydrogen_output_twh = (
-                link_p.loc[period_snapshots, region_links]
-                .mul(period_weights)
-                .mul(efficiency / 1e6)
-                .sum()
+            # Aggregate the fleet per snapshot before summing over the year. Written
+            # directly, the annual row carries one term per link and snapshot -- 144k
+            # non-zeros for a nationwide fleet -- and a row that dense ties every
+            # Link-p column into one row of the barrier's normal equations. The
+            # aggregation is exact (associativity of the sum), so ``rate`` adds no
+            # degree of freedom: it is the region's instantaneous H2 output in MW_H2,
+            # pinned by its own equality.
+            #
+            # Slicing a snapshot MultiIndex drops its name, which linopy needs to
+            # key the dimension off and match the Link-p snapshot axis.
+            rate_coords = period_snapshots.copy()
+            rate_coords.name = "snapshot"
+            rate = n.model.add_variables(
+                lower=0.0,
+                coords=[rate_coords],
+                name=f"FlexibleElectrolysis-h2_rate-{region}{label}",
             )
             n.model.add_constraints(
-                hydrogen_output_twh == float(target_twh),
+                rate - link_p.loc[period_snapshots, region_links].mul(efficiency).sum("Link"),
+                "=",
+                0.0,
+                name=f"FlexibleElectrolysis-h2_rate-{region}{label}-definition",
+            )
+            n.model.add_constraints(
+                rate.mul(period_weights / 1e3).sum() == float(target_twh) * 1e3,
                 name=f"FlexibleElectrolysis-annual_hydrogen-{region}{label}",
             )
 
@@ -420,6 +446,37 @@ def _get_line_x_sssc_nom_max_pu(config):
     return float(raw_ratio)
 
 
+def _line_x_sssc_index_split(n, context):
+    """
+    Split the SSSC-extendable branches by whether their line capacity is a variable.
+
+    Returns ``(sssc, sssc_ext_i, ext_i, fix_i)``, or ``None`` when there is no SSSC
+    investment variable to work with. ``ext_i`` are the branches whose cap follows
+    the optimized ``s_nom`` variable, ``fix_i`` those that keep a constant rating.
+    """
+    line_xs = getattr(n, "line_xs", pd.DataFrame())
+    if line_xs.empty:
+        return None
+
+    sssc = _get_line_x_sssc_variable(n.model)
+    if sssc is None:
+        logger.warning("%s skipped: SSSC investment variable is unavailable.", context)
+        return None
+
+    sssc_dim = sssc.dims[0]
+    sssc_ext_i = pd.Index(sssc.indexes[sssc_dim], name="LineX")
+    if sssc_ext_i.empty:
+        return None
+
+    s_nom_var = n.model.variables["LineX-s_nom"] if "LineX-s_nom" in list(n.model.variables) else None
+    if s_nom_var is None:
+        ext_i = sssc_ext_i[:0]
+    else:
+        ext_i = sssc_ext_i.intersection(pd.Index(s_nom_var.indexes[s_nom_var.dims[0]])).rename("LineX")
+    fix_i = sssc_ext_i.difference(ext_i).rename("LineX")
+    return sssc, sssc_ext_i, ext_i, fix_i
+
+
 def add_line_x_sssc_line_capacity_constraint(n, snapshots, config):
     """
     Cap each LineX SSSC rating at the capacity of its own line.
@@ -432,26 +489,13 @@ def add_line_x_sssc_line_capacity_constraint(n, snapshots, config):
     if not np.isfinite(ratio):
         return
 
-    line_xs = getattr(n, "line_xs", pd.DataFrame())
-    if line_xs.empty:
+    split = _line_x_sssc_index_split(n, "LineX SSSC line capacity constraint")
+    if split is None:
         return
-
-    sssc = _get_line_x_sssc_variable(n.model)
-    if sssc is None:
-        logger.warning("LineX SSSC line capacity constraint skipped: SSSC investment variable is unavailable.")
-        return
-
+    sssc, sssc_ext_i, ext_i, fix_i = split
+    line_xs = n.line_xs
+    s_nom_var = n.model.variables["LineX-s_nom"] if not ext_i.empty else None
     sssc_dim = sssc.dims[0]
-    sssc_ext_i = pd.Index(sssc.indexes[sssc_dim], name="LineX")
-    if sssc_ext_i.empty:
-        return
-
-    s_nom_var = n.model.variables["LineX-s_nom"] if "LineX-s_nom" in list(n.model.variables) else None
-    if s_nom_var is None:
-        ext_i = sssc_ext_i[:0]
-    else:
-        ext_i = sssc_ext_i.intersection(pd.Index(s_nom_var.indexes[s_nom_var.dims[0]])).rename("LineX")
-    fix_i = sssc_ext_i.difference(ext_i).rename("LineX")
 
     if not ext_i.empty:
         lhs = reindex(sssc, sssc_dim, ext_i) - ratio * reindex(s_nom_var, s_nom_var.dims[0], ext_i)
@@ -466,6 +510,71 @@ def add_line_x_sssc_line_capacity_constraint(n, snapshots, config):
         ratio,
         len(sssc_ext_i),
         len(ext_i),
+    )
+
+
+def tighten_line_x_sssc_bound(n, snapshots, config):
+    """
+    Pull the ``sssc_nom`` upper bound down to what the constraints already imply.
+
+    The bound comes from ``sssc_nom_max``, which ``prepare_network`` only clips at
+    the line capacity cap, so every candidate is boxed at 10 GW while no candidate
+    can exceed ``sssc_nom_max_pu * s_nom_max`` per branch nor ``sssc_tot_max`` over
+    all of them together. On test_tr_4_3GVAsssc that leaves 8457 columns with a box
+    3.3x wider than any feasible value, which is what the barrier scales and picks
+    its starting point from. Every bound set here is implied by a constraint that is
+    in the model anyway, so no feasible point is removed.
+
+    The two caps are independent: dropping ``sssc_nom_max_pu`` must not take the
+    ``sssc_tot_max`` bound with it, so this is its own step rather than a tail of
+    ``add_line_x_sssc_line_capacity_constraint``.
+    """
+    ratio = _get_line_x_sssc_nom_max_pu(config)
+    total_max = _get_line_x_sssc_total_max(config)
+    if not np.isfinite(ratio) and not np.isfinite(total_max):
+        return
+
+    split = _line_x_sssc_index_split(n, "LineX SSSC bound tightening")
+    if split is None:
+        return
+    sssc, sssc_ext_i, ext_i, fix_i = split
+
+    line_xs = n.line_xs
+    s_nom_max = line_xs.s_nom_max.reindex(sssc_ext_i).astype(float)
+    s_nom = line_xs.s_nom.reindex(sssc_ext_i).astype(float)
+    # against the extendable capacity the cap follows s_nom_max, otherwise the
+    # branch keeps its fixed rating
+    reference = pd.Series(np.inf, index=sssc_ext_i, dtype=float)
+    if not ext_i.empty:
+        reference.loc[ext_i] = s_nom_max.loc[ext_i]
+    if not fix_i.empty:
+        reference.loc[fix_i] = s_nom.loc[fix_i]
+
+    implied = pd.Series(np.inf, index=sssc_ext_i, dtype=float)
+    if np.isfinite(ratio):
+        implied = ratio * reference
+    if np.isfinite(total_max):
+        # sssc_nom >= 0, so no single branch can exceed the total either
+        implied = implied.clip(upper=total_max)
+
+    current = sssc.upper.to_series().reindex(sssc_ext_i).astype(float)
+    tightened = np.minimum(current, implied)
+    changed = int((tightened < current).sum())
+    if not changed:
+        return
+
+    sssc.upper = xr.DataArray(
+        tightened.to_numpy(),
+        coords=sssc.upper.coords,
+        dims=sssc.upper.dims,
+    )
+    logger.info(
+        "Tightened the sssc_nom upper bound on %d of %d branches to at most %.4g MW "
+        "(was up to %.4g MW).",
+        changed,
+        len(sssc_ext_i),
+        float(tightened.max()),
+        float(current.max()),
     )
 
 
@@ -526,6 +635,28 @@ def extra_functionality(n, snapshots):
         add_post_2032_gas_average_power_limit(n)
     add_line_x_sssc_total_max_constraint(n, snapshots, config)
     add_line_x_sssc_line_capacity_constraint(n, snapshots, config)
+    tighten_line_x_sssc_bound(n, snapshots, config)
+
+
+# ``solving: options: proximal`` was accepted by the configuration but never
+# reached PyPSA, so the norm of the proximal term could not be changed at all -
+# it only ever ran at PyPSA's own default. Every other step-control argument of
+# ``optimize_transmission_expansion_iteratively`` is deliberately left at that
+# default and is not exposed here.
+ITERATIVE_OPTIMIZE_OPTIONS = ("proximal",)
+
+
+def _iterative_optimize_kwargs(cf_solving):
+    """Collect the step-control options the configuration actually sets.
+
+    An unset key is left out rather than passed as ``None``, so it keeps PyPSA's
+    own default instead of overriding it.
+    """
+    return {
+        name: cf_solving[name]
+        for name in ITERATIVE_OPTIMIZE_OPTIONS
+        if cf_solving.get(name) is not None
+    }
 
 
 def _run_standard_optimize(n, rolling_horizon, skip_iterations, cf_solving, **kwargs):
@@ -543,6 +674,7 @@ def _run_standard_optimize(n, rolling_horizon, skip_iterations, cf_solving, **kw
         kwargs["max_iterations"] = int(cf_solving.get("max_iterations", 6))
         kwargs["scheme"] = cf_solving.get("scheme", "slp")
         kwargs["trust_region"] = cf_solving.get("trust_region", True)
+        kwargs.update(_iterative_optimize_kwargs(cf_solving))
         status, condition = n.optimize.optimize_transmission_expansion_iteratively(
             **kwargs,
         )

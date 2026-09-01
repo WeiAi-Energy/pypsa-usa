@@ -10,6 +10,7 @@ import logging
 import os
 import sys
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -254,6 +255,125 @@ def test_add_rps_constraints_clustered(clustered_policy_network, rps_config):
     # Check that constraints were added
     assert any("rps_limit" in c for c in n.model.constraints), "No RPS limit constraints were added"
     assert any("ces_limit" in c for c in n.model.constraints), "No CES limit constraints were added"
+
+
+def _portfolio_snakemake(tmp_path, rps_rows, ces_rows, planning_horizons):
+    """Mock snakemake serving RPS/CES fractions written to ``tmp_path``."""
+    paths = {}
+    for name, rows in (("rps", rps_rows), ("ces", ces_rows)):
+        path = tmp_path / f"{name}_fraction.csv"
+        pd.DataFrame(rows, columns=["st", "t", "rps_all"]).to_csv(path, index=False)
+        paths[name] = str(path)
+
+    return type(
+        "MockSnakemake",
+        (object,),
+        {
+            "input": type("obj", (object,), {"rps_reeds": paths["rps"], "ces_reeds": paths["ces"]}),
+            "params": type("obj", (object,), {"planning_horizons": planning_horizons}),
+        },
+    )()
+
+
+def _full_standard_model(policy_network, tmp_path, ces_pct, rps_pct=0.3, horizons=(2030,)):
+    """Build the model and apply RPS/CES with a CA CES at ``ces_pct``."""
+    from opts.policy import add_RPS_constraints
+
+    n = policy_network
+    snakemake = _portfolio_snakemake(
+        tmp_path,
+        rps_rows=[["CA", h, rps_pct] for h in horizons] + [["TX", h, 0.4] for h in horizons],
+        ces_rows=[["CA", h, ces_pct] for h in horizons] + [["TX", h, 0.5] for h in horizons],
+        planning_horizons=list(horizons),
+    )
+    n.optimize.create_model(multi_investment_periods=True)
+    add_RPS_constraints(n, {}, snakemake=snakemake)
+    return n
+
+
+def test_full_portfolio_standard_fixes_non_eligible_dispatch(policy_network, tmp_path):
+    """A 100% CES fixes the state's non-eligible dispatch at zero instead of a share row."""
+    n = _full_standard_model(policy_network, tmp_path, ces_pct=1.0)
+
+    names = set(n.model.constraints)
+    assert "PortfolioStandard-CA_2030_ces_limit" not in names
+    constraint = n.model.constraints["PortfolioStandard-CA_2030_ces_zero_dispatch"]
+
+    # z1 is the only CA bus; its gas and coal units are not CES eligible.
+    blocked = ["coal1", "gas1"]
+    expected = (
+        n.model["Generator-p"].labels.sel(period=2030, Generator=blocked).values.reshape(-1)
+    )
+    assert sorted(constraint.vars.to_numpy().reshape(-1).tolist()) == sorted(expected.tolist())
+    assert set(constraint.coeffs.to_numpy().reshape(-1).tolist()) == {1.0}
+    assert set(np.asarray(constraint.rhs).ravel().tolist()) == {0.0}
+    assert set(np.asarray(constraint.sign).ravel().tolist()) == {"="}
+
+    # Partial standards elsewhere are untouched.
+    assert "PortfolioStandard-CA_2030_rps_limit" in names
+    assert "PortfolioStandard-TX_2030_ces_limit" in names
+
+
+def test_full_portfolio_standard_keeps_capacity_for_adequacy(policy_network, tmp_path):
+    """Only dispatch is fixed: the units and their p_nom stay, so ERM still sees them."""
+    n = _full_standard_model(policy_network, tmp_path, ces_pct=1.0)
+
+    # Both units survive with their rating intact, which is what the ERM requirement
+    # reads (it is written on p_max_pu * p_nom, not on p).
+    for name in ("gas1", "coal1"):
+        assert name in n.generators.index
+        assert n.generators.at[name, "p_nom"] > 0
+        assert n.generators_t.p_max_pu.get(name, pd.Series([1.0])).max() > 0
+    # coal1 is extendable, so it also keeps its capacity variable.
+    assert "coal1" in n.model["Generator-p_nom"].indexes["Generator-ext"]
+
+
+def test_full_portfolio_standard_spares_load_shedding(policy_network, tmp_path):
+    """Load shedding is unserved energy, not generation, so it is not fixed to zero."""
+    n = policy_network
+    n.add("Generator", "z1 load", bus="z1", carrier="load", p_nom=1e4, marginal_cost=1e5)
+    n = _full_standard_model(n, tmp_path, ces_pct=1.0)
+
+    shedding = n.model["Generator-p"].labels.sel(period=2030, Generator=["z1 load"]).values.reshape(-1)
+    constraint = n.model.constraints["PortfolioStandard-CA_2030_ces_zero_dispatch"]
+    assert set(constraint.vars.to_numpy().reshape(-1)).isdisjoint(shedding.tolist())
+
+
+def test_near_full_portfolio_standard_is_rounded_up(policy_network, tmp_path, caplog):
+    """ReEDS' 0.999144 crosses the threshold, is enforced as full, and says so."""
+    with caplog.at_level(logging.WARNING):
+        n = _full_standard_model(policy_network, tmp_path, ces_pct=0.999144)
+
+    assert "PortfolioStandard-CA_2030_ces_zero_dispatch" in set(n.model.constraints)
+    assert any("rounded up to a full standard" in record.getMessage() for record in caplog.records)
+
+
+def test_portfolio_standard_below_threshold_stays_a_share_row(policy_network, tmp_path):
+    """Just below the threshold the standard remains an ordinary share constraint."""
+    n = _full_standard_model(policy_network, tmp_path, ces_pct=0.9989)
+
+    names = set(n.model.constraints)
+    assert "PortfolioStandard-CA_2030_ces_limit" in names
+    assert "PortfolioStandard-CA_2030_ces_zero_dispatch" not in names
+
+
+def test_full_portfolio_standard_is_scoped_to_its_own_period(policy_network, tmp_path):
+    """A standard that only reaches 100% later must not zero dispatch in earlier periods."""
+    from opts.policy import add_RPS_constraints
+
+    n = policy_network
+    snakemake = _portfolio_snakemake(
+        tmp_path,
+        rps_rows=[["CA", 2030, 0.3]],
+        ces_rows=[["CA", 2030, 0.5]],
+        planning_horizons=[2030],
+    )
+    n.optimize.create_model(multi_investment_periods=True)
+    add_RPS_constraints(n, {}, snakemake=snakemake)
+
+    names = set(n.model.constraints)
+    assert "PortfolioStandard-CA_2030_ces_zero_dispatch" not in names
+    assert "PortfolioStandard-CA_2030_ces_limit" in names
 
 
 def test_add_technology_capacity_target_constraints(policy_network, tct_config):

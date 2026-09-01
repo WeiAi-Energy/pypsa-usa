@@ -2,7 +2,6 @@
 
 import logging
 
-import linopy
 import numpy as np
 import pandas as pd
 from pypsa.descriptors import get_activity_mask
@@ -24,6 +23,52 @@ def _get_period_hours(rep_cfg):
     if days <= 0:
         raise ValueError("representative_periods.period_length must be positive.")
     return days * 24.0
+
+
+def representative_periods_config(config):
+    """Return the ``clustering.temporal.representative_periods`` config block."""
+    return (config or {}).get("clustering", {}).get("temporal", {}).get("representative_periods", {}) or {}
+
+
+def representative_periods_active(n, config=None):
+    """
+    Whether ``n``'s snapshots are representative periods rather than a chronological series.
+
+    The config is authoritative where a caller has it; the metadata
+    ``prepare_network`` writes onto the network is the fallback for callers that
+    do not carry one.
+    """
+    if representative_periods_config(config).get("enable", False):
+        return True
+    return bool(_get_representative_period_metadata(n))
+
+
+def storage_elapsed_hours(n, sns, config=None):
+    """
+    Hours of storage flow one snapshot stands for.
+
+    ``snapshot_weightings.stores`` measures a timestep only while the snapshots are
+    a chronological series -- which is why PyPSA's own storage balance uses it. With
+    representative periods the weighting becomes the number of source periods a block
+    represents (order 1-12 for a 14-day block), and the physical spacing of the
+    synthetic timestamps is the only thing left that measures a timestep. Every
+    energy-against-power relation -- the storage balance here, and the ERM's energy
+    backing of a reserve discharge -- has to be written in these hours, never in the
+    weighting, or a block's storage looks ``weight`` times bigger or smaller than it is.
+    """
+    if not representative_periods_active(n, config):
+        return n.snapshot_weightings.stores[sns]
+
+    snapshot_index = _to_multiindex_snapshots(sns)
+    if snapshot_index is None or snapshot_index.nlevels < 2:
+        logger.warning(
+            "Representative periods are active, but the snapshots are not a MultiIndex. "
+            "Falling back to snapshot_weightings.stores for the elapsed hours.",
+        )
+        return n.snapshot_weightings.stores[sns]
+
+    elapsed = _get_physical_elapsed_hours(snapshot_index)
+    return pd.Series(elapsed.to_numpy(), index=sns)
 
 
 def _get_representative_period_metadata(n):
@@ -236,14 +281,6 @@ def _build_block_cyclic_previous_state(var, active, snapshots, blocks):
     return previous, include_previous
 
 
-def _select_component_axis(obj, component_names):
-    """Select component coordinates regardless of whether the axis is called `name` or the component class."""
-    component_dim = next((dim for dim in getattr(obj, "dims", ()) if dim != "snapshot"), None)
-    if component_dim is None:
-        return obj
-    return obj.sel({component_dim: pd.Index(component_names)})
-
-
 def _define_representative_period_storage_unit_constraints(n, sns, blocks, elapsed_hours):
     m = n.model
     c = "StorageUnit"
@@ -282,22 +319,20 @@ def _define_representative_period_storage_unit_constraints(n, sns, blocks, elaps
     return int(active.sum().item())
 
 
-def _define_representative_period_store_constraints(n, sns, blocks, elapsed_hours, store_names=None):
+def _define_representative_period_store_constraints(n, sns, blocks, elapsed_hours):
     m = n.model
     c = "Store"
     assets = n.df(c)
-    if store_names is not None:
-        assets = assets.loc[pd.Index(store_names).intersection(assets.index)]
 
     if assets.empty:
         return 0
 
-    active = _select_component_axis(DataArray(get_activity_mask(n, c, sns)), assets.index)
+    active = DataArray(get_activity_mask(n, c, sns))
     eh = expand_series(elapsed_hours.loc[sns], assets.index)
-    eff_stand = (1 - get_as_dense(n, c, "standing_loss", sns)[assets.index]).pow(eh)
+    eff_stand = (1 - get_as_dense(n, c, "standing_loss", sns)).pow(eh)
 
-    e = _select_component_axis(m[f"{c}-e"], assets.index)
-    p = _select_component_axis(m[f"{c}-p"], assets.index)
+    e = m[f"{c}-e"]
+    p = m[f"{c}-p"]
 
     previous_e, include_previous_e = _build_block_cyclic_previous_state(
         e,
@@ -312,59 +347,9 @@ def _define_representative_period_store_constraints(n, sns, blocks, elapsed_hour
     return int(active.sum().item())
 
 
-def _define_default_store_constraints(n, sns, store_names):
-    """Re-add PyPSA default store balance constraints for selected stores."""
-    m = n.model
-    c = "Store"
-    assets = n.df(c).loc[pd.Index(store_names).intersection(n.df(c).index)]
-
-    if assets.empty:
-        return 0
-
-    active = _select_component_axis(DataArray(get_activity_mask(n, c, sns)), assets.index)
-    eh = expand_series(n.snapshot_weightings.stores[sns], assets.index)
-    eff_stand = (1 - get_as_dense(n, c, "standing_loss", sns)[assets.index]).pow(eh)
-
-    e = _select_component_axis(m[f"{c}-e"], assets.index)
-    p = _select_component_axis(m[f"{c}-p"], assets.index)
-
-    lhs = [(-1, e), (-eh, p)]
-
-    noncyclic_b = ~assets.e_cyclic.to_xarray()
-    include_previous_e = (active.cumsum("snapshot") != 1).where(noncyclic_b, True)
-    previous_e = e.where(active).ffill("snapshot").roll(snapshot=1).ffill("snapshot").where(include_previous_e)
-
-    e_init = assets.e_initial.to_xarray()
-
-    if isinstance(sns, pd.MultiIndex):
-        periods = e.coords["period"]
-        per_period = assets.e_cyclic_per_period.to_xarray() | assets.e_initial_per_period.to_xarray()
-
-        ps = sns.unique("period")
-        sl = slice(None)
-        previous_e_pp_list = [e.data.sel(snapshot=(period, sl)).roll(snapshot=1) for period in ps]
-        previous_e_pp = concat(previous_e_pp_list, dim="snapshot")
-
-        include_previous_e_pp = active & (periods == periods.shift(snapshot=1))
-        include_previous_e_pp = include_previous_e_pp.where(noncyclic_b, True)
-        previous_e_pp = previous_e_pp.where(include_previous_e_pp.values, linopy.variables.FILL_VALUE)
-
-        previous_e = previous_e.where(~per_period, previous_e_pp)
-        include_previous_e = include_previous_e_pp.where(per_period, include_previous_e)
-
-    lhs += [(eff_stand, previous_e)]
-    rhs = -e_init.where(~include_previous_e, 0)
-    m.add_constraints(lhs, "=", rhs, name=f"{c}-energy_balance-default", mask=active)
-    return int(active.sum().item())
-
-
 def add_representative_period_storage_constraints(n, config, snapshots):
     """Rebuild storage balance constraints with PyPSA-style cyclic logic per block."""
-    rep_cfg = (
-        config.get("clustering", {})
-        .get("temporal", {})
-        .get("representative_periods", {})
-    )
+    rep_cfg = representative_periods_config(config)
     if not rep_cfg.get("enable", False):
         return
 
@@ -388,7 +373,7 @@ def add_representative_period_storage_constraints(n, config, snapshots):
     if not blocks:
         logger.warning("No representative-period blocks detected. Skipping storage cyclic constraints.")
         return
-    elapsed_hours = _get_physical_elapsed_hours(snapshot_index)
+    elapsed_hours = storage_elapsed_hours(n, snapshot_index, config)
 
     for investment_period, block_entries in blocks.items():
         unique_steps = sorted({int(entry["steps"]) for entry in block_entries})
@@ -402,11 +387,7 @@ def add_representative_period_storage_constraints(n, config, snapshots):
 
     constraint_names = [
         name
-        for name in (
-            "StorageUnit-energy_balance",
-            "Store-energy_balance",
-            "Store-energy_balance-default",
-        )
+        for name in ("StorageUnit-energy_balance", "Store-energy_balance")
         if name in n.model.constraints
     ]
     if constraint_names:
@@ -418,31 +399,14 @@ def add_representative_period_storage_constraints(n, config, snapshots):
         blocks,
         elapsed_hours,
     )
-    exempt_stores = pd.Index([])
-    if not n.stores.empty and "exclude_representative_periods" in n.stores.columns:
-        exempt_stores = n.stores.index[n.stores["exclude_representative_periods"].fillna(False).astype(bool)]
-    representative_stores = n.stores.index.difference(exempt_stores)
-
-    store_constraints = 0
-    if len(representative_stores):
-        store_constraints = _define_representative_period_store_constraints(
-            n,
-            snapshot_index,
-            blocks,
-            elapsed_hours,
-            representative_stores,
-        )
-
-    default_store_constraints = 0
-    if len(exempt_stores):
-        default_store_constraints = _define_default_store_constraints(
-            n,
-            snapshot_index,
-            exempt_stores,
-        )
+    store_constraints = _define_representative_period_store_constraints(
+        n,
+        snapshot_index,
+        blocks,
+        elapsed_hours,
+    )
     logger.info(
-        "Rebuilt representative-period energy balances: StorageUnit=%s, Store=%s, StoreDefault=%s.",
+        "Rebuilt representative-period energy balances: StorageUnit=%s, Store=%s.",
         su_constraints,
         store_constraints,
-        default_store_constraints,
     )

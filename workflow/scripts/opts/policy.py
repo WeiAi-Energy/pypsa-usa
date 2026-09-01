@@ -25,6 +25,21 @@ RPS_CARRIERS = [
 ]
 CES_CARRIERS = [*RPS_CARRIERS, "nuclear", "SMR", "hydrogen_ct", "CCGT-95CCS", "CCGT-99CCS", "Coal-95CCS"]
 RPS_DENOMINATOR_EXCLUDED_CARRIERS = {"load"}
+# A standard at or above this share is enforced as a *full* standard: the state's
+# non-eligible dispatch is fixed at zero instead of being tied to a share row. This
+# deliberately rounds a near-100% standard (ReEDS has e.g. 0.999144) up to 100%, which
+# makes the policy marginally stricter -- the state loses the last <0.1% of generation
+# it could otherwise have served from non-eligible carriers.
+#
+# The numerical reason is that a share row at pct ~ 1 squeezes every non-eligible
+# generator into a sliver of width (1 - pct) that presolve cannot fix away, leaving the
+# interior-point method without an interior to work in. Fixing the dispatch instead
+# gives presolve singleton rows it removes outright.
+#
+# Only the dispatch is fixed: p_nom stays in the model, so the unit keeps contributing
+# to the ERM adequacy requirement (which is written on p_max_pu * p_nom, not on p).
+# That matches a clean-*energy* standard, which bars generation rather than capacity.
+FULL_PORTFOLIO_STANDARD_MIN_PCT = 0.999
 
 
 def read_technology_capacity_targets(config):
@@ -284,6 +299,20 @@ def _collapse_portfolio_standards(n: pypsa.Network, planning_horizons: list[int]
     ]
 
 
+def read_portfolio_standards(n, snakemake):
+    """Collapsed RPS and CES rows, restricted to the states and horizons in ``n``."""
+    empty = pd.DataFrame(columns=["region", "planning_horizon", "carrier", "pct"])
+    rps_reeds = _process_reeds_data(snakemake.input.rps_reeds, RPS_CARRIERS, value_col="pct")
+    ces_reeds = _process_reeds_data(snakemake.input.ces_reeds, CES_CARRIERS, value_col="pct")
+    return _collapse_portfolio_standards(
+        n,
+        snakemake.params.planning_horizons,
+        empty,
+        rps_reeds,
+        ces_reeds,
+    )
+
+
 def add_RPS_constraints(n, config, snakemake=None):
     """
     Add Renewable Portfolio Standards (RPS) constraints to the network.
@@ -312,31 +341,8 @@ def add_RPS_constraints(n, config, snakemake=None):
     # Get model horizon
     model_horizon = get_model_horizon(n.model)
     snapshot_weightings = n.snapshot_weightings.loc[n.snapshots].generators
-    rps_scaling_days = 365.0
 
-    # Initialize empty portfolio_standards instead of reading CSV
-    portfolio_standards = pd.DataFrame(columns=["region", "planning_horizon", "carrier", "pct"])
-
-    # Process RPS and CES REEDS data
-    rps_reeds = _process_reeds_data(
-        snakemake.input.rps_reeds,
-        RPS_CARRIERS,
-        value_col="pct",
-    )
-    ces_reeds = _process_reeds_data(
-        snakemake.input.ces_reeds,
-        CES_CARRIERS,
-        value_col="pct",
-    )
-
-    # Concatenate all portfolio standards
-    portfolio_standards = _collapse_portfolio_standards(
-        n,
-        snakemake.params.planning_horizons,
-        portfolio_standards,
-        rps_reeds,
-        ces_reeds,
-    )
+    portfolio_standards = read_portfolio_standards(n, snakemake)
 
     # Iterate through constraints and add RPS constraints to the model, one per
     # reeds_state -- no pooling across states via REC trading zones.
@@ -366,6 +372,57 @@ def add_RPS_constraints(n, config, snakemake=None):
             )
             continue
 
+        pct = zone_constraints["pct"].iloc[0]
+        policy_kind = "rps" if set(carriers) == set(RPS_CARRIERS) else "ces"
+
+        if pct >= FULL_PORTFOLIO_STANDARD_MIN_PCT:
+            # A full standard is "no non-eligible generation at all". Written as a
+            # share row that is sum(non-eligible) <= 0 -- an equality in disguise that
+            # the barrier can only reach from outside its own interior. Fixing the
+            # dispatch directly says the same thing in rows presolve can eliminate,
+            # and unlike deleting the units it leaves p_nom (and with it the ERM
+            # adequacy contribution) in the model.
+            blocked = region_gens_policy.index.difference(region_gens_eligible.index)
+            if pct < 1.0:
+                logger.warning(
+                    "Portfolio standard for %s in %s is %.6g, rounded up to a full "
+                    "standard (threshold %.6g): non-eligible dispatch is fixed at zero "
+                    "rather than at %.4g%% of the state's generation.",
+                    state,
+                    planning_horizon,
+                    pct,
+                    FULL_PORTFOLIO_STANDARD_MIN_PCT,
+                    100.0 * (1.0 - pct),
+                )
+            if blocked.empty:
+                logger.info(
+                    "Portfolio standard for %s in %s is %.6g and the state has no "
+                    "non-eligible generator; nothing to constrain.",
+                    state,
+                    planning_horizon,
+                    pct,
+                )
+                continue
+
+            n.model.add_constraints(
+                n.model["Generator-p"].sel(period=planning_horizon, Generator=blocked),
+                "=",
+                0.0,
+                name=f"PortfolioStandard-{state}_{planning_horizon}_{policy_kind}_zero_dispatch",
+            )
+            logger.info(
+                "Full portfolio standard in %s (%s, pct=%.6g): fixed the dispatch of %d "
+                "non-eligible generator(s) at zero (%s). Their capacity still counts "
+                "towards adequacy.",
+                state,
+                planning_horizon,
+                pct,
+                len(blocked),
+                ", ".join(sorted(n.generators.carrier.reindex(blocked).unique())),
+            )
+            added += 1
+            continue
+
         period_weights = snapshot_weightings.loc[planning_horizon]
 
         # Eligible generation
@@ -382,12 +439,14 @@ def add_RPS_constraints(n, config, snakemake=None):
             Generator=region_gens_policy.index,
         )
         p_total = p_total.mul(period_weights)
-        pct = zone_constraints["pct"].iloc[0]
         required_from_generation = pct * p_total.sum()
 
-        lhs = p_eligible.sum() / rps_scaling_days - required_from_generation / rps_scaling_days
-        rhs = 0 / rps_scaling_days
-        policy_kind = "rps" if set(carriers) == set(RPS_CARRIERS) else "ces"
+        # The row is homogeneous, so any positive row scaling is a no-op for the
+        # solution and only moves the coefficients around. Left unscaled they sit
+        # on the snapshot weightings themselves rather than three orders of
+        # magnitude below the rest of the matrix.
+        lhs = p_eligible.sum() - required_from_generation
+        rhs = 0
 
         n.model.add_constraints(
             lhs >= rhs,
