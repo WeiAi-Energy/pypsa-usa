@@ -673,7 +673,6 @@ def _run_standard_optimize(n, rolling_horizon, skip_iterations, cf_solving, **kw
         kwargs["min_iterations"] = int(cf_solving.get("min_iterations", 4))
         kwargs["max_iterations"] = int(cf_solving.get("max_iterations", 6))
         kwargs["scheme"] = cf_solving.get("scheme", "slp")
-        kwargs["trust_region"] = cf_solving.get("trust_region", True)
         kwargs.update(_iterative_optimize_kwargs(cf_solving))
         status, condition = n.optimize.optimize_transmission_expansion_iteratively(
             **kwargs,
