@@ -80,6 +80,7 @@ rule retrieve_zenodo_databundles:
         ),
         expand(DATA + "{file}", file=pypsa_usa_datafiles),
     resources:
+        walltime="01:00:00",
         mem_mb=5000,
     log:
         "logs/retrieve/retrieve_databundles.log",
@@ -95,6 +96,7 @@ rule retrieve_eer_demand_data:
     output:
         DATA + "eer/{eer_file}.h5",
     resources:
+        walltime="01:00:00",
         mem_mb=5000,
     log:
         "logs/retrieve/retrieve_eer_{eer_file}.log",
@@ -111,6 +113,7 @@ rule retrieve_reeds_vre_file:
     output:
         DATA + "ReEDS_VRE/{reeds_vre_tech}/{reeds_vre_file}",
     resources:
+        walltime="01:00:00",
         mem_mb=5000,
     log:
         LOGS + "retrieve_reeds_vre/{reeds_vre_tech}/{reeds_vre_file}.log",

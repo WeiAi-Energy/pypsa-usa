@@ -37,8 +37,8 @@ rule solve_network:
             config_provider("solving", "solver", "options")(wildcards)
         ].get("threads", 4)
     resources:
-        walltime=config_provider("walltime", "solve_network"),
-        mem_mb=28000,
+        walltime=config_provider("solving", "walltime", default="24:00:00"),
+        mem_mb=config_provider("solving", "mem", default=28000),
     conda:
         "../envs/environment.yaml"
     script:

@@ -36,6 +36,8 @@ STATISTICS_TABLES = [
 
 # --------------------------- Workflow constraints --------------------------- #
 localrules:
+    all,
+    data_model,
     dag,
     clean,
 
