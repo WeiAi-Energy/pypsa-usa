@@ -686,6 +686,215 @@ def merge_parallel_lines(
     return pd.concat([remaining, add_df]), len(merge_groups)
 
 
+#: Length below which the two substations a Line joins are treated as one site.
+#: Substation aggregation leaves a few pairs metres apart -- 16 Lines under 100 m
+#: on the 41k-bus network, the shortest at 8.3 m -- which are electrically one
+#: bus (``x_pu`` down to 1.1e-6) yet reach the LP as a near-zero-impedance branch
+#: and set the smallest coefficient of the whole matrix (8e-06) through the
+#: transmission-volume limit, whose row is written on ``length``. Far below any
+#: real corridor, so nothing merged here is a transmission decision; raising it
+#: turns this into topology reduction, which the two passes below already do.
+SHORT_BRANCH_LENGTH_KM = 0.1
+
+
+def contract_short_branches(
+    n: pypsa.Network,
+    max_length_km: float = SHORT_BRANCH_LENGTH_KM,
+) -> tuple[pypsa.Network, pd.Series]:
+    """Contract every Line shorter than ``max_length_km``, merging its two buses.
+
+    Edge *contraction*, not the series elimination
+    :func:`reduce_low_degree_buses_and_merge_parallel_lines` performs: the two
+    endpoints become one bus and the branch disappears, rather than a mid-point
+    being eliminated and its two branches spliced into one corridor. Neither
+    pass subsumes the other -- most sub-100 m Lines on the 41k network have an
+    endpoint of degree three or more (up to nine), which the degree-1/2 rule
+    never reaches, while a degree-two bus between two 300 km Lines is a corridor
+    to splice, not two sites to merge.
+
+    The survivor *is* one of the two buses, so the absorbed one hands its
+    contents over whole rather than Kron-split: :data:`EXTENSIVE_BUS_ATTRS` add,
+    one-port assets and Links move across unchanged. It is the group's largest
+    ``Pd`` (ties by sort order), which keeps a real substation's coordinates
+    instead of inventing a centroid.
+
+    A Line is contracted only when both endpoints share a
+    :data:`PROTECTED_ZONE_COLUMN`, for the reason given on that constant. Groups
+    are therefore zone-homogeneous and their survivor stays put, so no zone can
+    be emptied.
+
+    Short Lines can share endpoints, so they contract as connected groups rather
+    than one at a time (at 2 km on the 41k network, 3522 Lines span 3417 groups).
+    Any Line left joining two members of one group becomes a self-loop and is
+    dropped, and contraction routinely doubles up a bus pair, so
+    :func:`merge_parallel_lines` runs afterwards -- not optional bookkeeping:
+    with ``low_degree_reduction`` disabled it is the pipeline's only parallel
+    merge, and an unmerged pair reaches the LP as an extra Kirchhoff cycle.
+
+    Returns the network and a busmap over the *pre-contraction* bus index, for
+    the caller to compose with the later passes' maps.
+    """
+    busmap = identity_busmap(n)
+    if n.lines.empty:
+        return n, busmap
+
+    length = pd.to_numeric(n.lines.length, errors="coerce")
+    short_i = n.lines.index[length.notna() & (length < max_length_km)]
+    shortest_before = float(length.min()) if length.notna().any() else float("nan")
+
+    zones = bus_zone_labels(n)
+    blocked_by_zone = 0
+    if zones is None:
+        logger.warning(
+            "Buses carry no '%s' column; short-branch contraction runs without the "
+            "zone-crossing guard and may move demand between zones.",
+            PROTECTED_ZONE_COLUMN,
+        )
+    elif not short_i.empty:
+        endpoints = n.lines.loc[short_i, ["bus0", "bus1"]]
+        crossing = zones.reindex(endpoints.bus0).to_numpy() != zones.reindex(endpoints.bus1).to_numpy()
+        blocked_by_zone = int(crossing.sum())
+        short_i = short_i[~crossing]
+
+    if short_i.empty:
+        logger.info(
+            "No Line shorter than %s km to contract (%s blocked by the '%s' guard); "
+            "shortest Line is %.4g km.",
+            max_length_km,
+            blocked_by_zone,
+            PROTECTED_ZONE_COLUMN,
+            shortest_before,
+        )
+        return n, busmap
+
+    # Union-find over the selected endpoints: a chain of short Lines collapses to
+    # one bus, not to pairwise merges whose outcome depends on the visit order.
+    leader: dict = {}
+
+    def find(bus):
+        root = bus
+        while leader.get(root, root) != root:
+            root = leader[root]
+        while leader.get(bus, bus) != root:
+            leader[bus], bus = root, leader[bus]
+        return root
+
+    for bus0, bus1 in n.lines.loc[short_i, ["bus0", "bus1"]].itertuples(index=False, name=None):
+        root0, root1 = find(bus0), find(bus1)
+        if root0 != root1:
+            leader[root1] = root0
+
+    touched = pd.Index(n.lines.loc[short_i, "bus0"]).union(n.lines.loc[short_i, "bus1"])
+    members: dict = {}
+    for bus in touched:
+        members.setdefault(find(bus), []).append(bus)
+
+    demand = (
+        pd.to_numeric(n.buses["Pd"], errors="coerce").fillna(0.0).to_dict()
+        if "Pd" in n.buses.columns
+        else {}
+    )
+    relocation: dict = {}
+    merged_groups = 0
+    for group in members.values():
+        if len(group) < 2:
+            continue
+        keep = min(group, key=lambda bus: (-demand.get(bus, 0.0), bus))
+        relocation.update({bus: keep for bus in group if bus != keep})
+        merged_groups += 1
+
+    if not relocation:
+        return n, busmap
+
+    absorbed = pd.Series(relocation, name="keep")
+    for col in EXTENSIVE_BUS_ATTRS:
+        if col not in n.buses.columns:
+            continue
+        values = pd.to_numeric(n.buses[col], errors="coerce").fillna(0.0)
+        addition = values.reindex(absorbed.index).groupby(absorbed.to_numpy()).sum()
+        n.buses[col] = values + addition.reindex(n.buses.index).fillna(0.0)
+
+    # One target holding the whole share, so nothing is cloned or scaled.
+    moved_generators = split_one_port_components(
+        n,
+        {bus: [(keep, 1.0)] for bus, keep in relocation.items()},
+    )
+
+    # Bulk-replace n.lines rather than use pypsa's per-row API, for the reason
+    # given in `reduce_low_degree_buses_and_merge_parallel_lines`.
+    lines = n.lines.copy()
+    lines["bus0"] = lines["bus0"].map(lambda bus: relocation.get(bus, bus))
+    lines["bus1"] = lines["bus1"].map(lambda bus: relocation.get(bus, bus))
+    collapsed_i = lines.index[lines.bus0 == lines.bus1]
+    lines = lines.drop(index=collapsed_i)
+
+    capacity_cols = [col for col in ("s_nom", "s_nom_min", "s_nom_max") if col in lines.columns]
+    parallel_groups: list = []
+    lines, parallel_merged = merge_parallel_lines(lines, capacity_cols, parallel_groups)
+    n.lines = lines
+
+    link_endpoints_relocated = 0
+    if not n.links.empty:
+        moved_links = (set(n.links.bus0) | set(n.links.bus1)) & set(relocation)
+        if moved_links:
+            n.links["bus0"] = n.links["bus0"].map(lambda bus: relocation.get(bus, bus))
+            n.links["bus1"] = n.links["bus1"].map(lambda bus: relocation.get(bus, bus))
+            link_endpoints_relocated = len(moved_links)
+
+            self_loop_links = n.links.index[n.links.bus0 == n.links.bus1]
+            if len(self_loop_links):
+                logger.warning(
+                    "%s Links collapsed onto a single bus by short-branch contraction; dropping.",
+                    len(self_loop_links),
+                )
+                n.mremove("Link", self_loop_links)
+
+    n.mremove("Bus", list(relocation))
+    busmap = busmap.map(lambda bus: relocation.get(bus, bus))
+    merge_colocated_generators(n, moved_generators)
+
+    remaining_length = pd.to_numeric(n.lines.length, errors="coerce")
+    shortest_after = float(remaining_length.min()) if remaining_length.notna().any() else float("nan")
+    logger.info(
+        "Contracted %s Lines shorter than %s km across %s merged substation groups: "
+        "%s buses absorbed, %s further Lines collapsed to self-loops, %s parallel-line "
+        "groups merged, %s Link endpoints relocated. Shortest Line %.4g -> %.4g km.",
+        len(short_i),
+        max_length_km,
+        merged_groups,
+        len(relocation),
+        len(collapsed_i) - len(short_i),
+        parallel_merged,
+        link_endpoints_relocated,
+        shortest_before,
+        shortest_after,
+    )
+    if parallel_merged and "s_nom" in capacity_cols:
+        bundles: list = []
+        weights: list = []
+        for group in parallel_groups:
+            finite = np.isfinite(group["x_s_nom"])
+            if finite.sum() > 1:
+                bundles.append(group["x_s_nom"][finite])
+                weights.append(group["s_nom"][finite])
+        parallel = merge_heterogeneity(bundles, weights)
+        logger.info(
+            "Contraction parallel x*s_nom heterogeneity = %.4f over %s merged bundles "
+            "spanning %s branches. Per-bundle contribution: %s.",
+            parallel.ratio,
+            parallel.groups,
+            parallel.members,
+            summarize_distribution(parallel.coefficients_of_variation, "%.4f"),
+        )
+    if zones is not None:
+        logger.info(
+            "Zone-crossing guard on '%s': %s short Lines left uncontracted.",
+            PROTECTED_ZONE_COLUMN,
+            blocked_by_zone,
+        )
+    return n, busmap
+
+
 def reduce_low_degree_buses_and_merge_parallel_lines(n: pypsa.Network) -> tuple[pypsa.Network, pd.Series]:
     """
     Iteratively eliminate every bus of degree 1 or 2 and merge parallel Lines.
@@ -1866,6 +2075,14 @@ if __name__ == "__main__":
         topology_line_width_reference,
     )
 
+    # After the plot above, so that image still shows the substation network as
+    # aggregation left it. Unconditional: both reductions below are optional, so
+    # this is the only step that always clears the metre-scale branches. It runs
+    # before them -- the low-degree pass cannot reach a short Line between two
+    # degree-3 buses, and running last would reduce across cluster boundaries the
+    # target-count pass had just drawn (see the note at the end of this block).
+    n, contraction_busmap = contract_short_branches(n)
+
     if low_degree_reduction:
         n, reduction_busmap = reduce_low_degree_buses_and_merge_parallel_lines(n)
     else:
@@ -1932,16 +2149,16 @@ if __name__ == "__main__":
         topology_line_width_reference,
     )
 
-    # The Voronoi regions are keyed by substations.  Compose both maps -- the
-    # low-degree pass and the target-count clustering -- before dissolving them
-    # into final regions and bus labels.
-    busmaps = (reduction_busmap, target_busmap)
+    # The Voronoi regions are keyed by substations.  Compose all three maps -- the
+    # short-branch contraction, the low-degree pass and the target-count
+    # clustering -- before dissolving them into final regions and bus labels.
+    busmaps = (contraction_busmap, reduction_busmap, target_busmap)
     cluster_regions(busmaps, snakemake.input, snakemake.output)
 
     # Anything still keyed by the raw substation ids -- the regions above, and
     # supply curves that `add_electricity` joins on `sub_id` -- needs to know
-    # which surviving bus now stands for each one. The bus index at this point
-    # *is* the substation id, so composing the maps gives exactly that.
+    # which surviving bus now stands for each one. The first map's index is the
+    # full substation id set, so composing the maps gives exactly that.
     composed = reduce(lambda left, right: left.map(right), busmaps[1:], busmaps[0])
     composed.rename_axis("sub_id").rename("bus_id").to_csv(snakemake.output.busmap)
 

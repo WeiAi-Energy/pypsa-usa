@@ -10,10 +10,12 @@ import pytest
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from simplify_network import (
     EARTH_RADIUS_KM,
+    SHORT_BRANCH_LENGTH_KM,
     _earth_centered_km,
     _effective_reactance_embedding,
     busmap_by_target_bus_count,
     clustering_from_busmap,
+    contract_short_branches,
     identity_busmap,
     merge_parallel_lines,
     reduce_low_degree_buses_and_merge_parallel_lines,
@@ -465,3 +467,173 @@ def test_identity_busmap_composes_as_a_neutral_element():
     neutral = identity_busmap(clustered)
     composed = reduce(lambda left, right: left.map(right), [neutral], stage)
     pd.testing.assert_series_equal(composed, stage, check_names=False)
+
+
+def _network_with_lines(edges, buses, zones=None):
+    """Build a Line-only network from ``(bus0, bus1, length_km, x)`` tuples."""
+    n = pypsa.Network()
+    n.set_snapshots(pd.date_range("2030-01-01", periods=2, freq="h"))
+    for bus in buses:
+        n.add("Bus", bus)
+    n.lines = pd.DataFrame(
+        {
+            "bus0": [edge[0] for edge in edges],
+            "bus1": [edge[1] for edge in edges],
+            "length": [float(edge[2]) for edge in edges],
+            "x": [float(edge[3]) for edge in edges],
+            "r": 0.1,
+            "s_nom": 100.0,
+            "s_nom_min": 0.0,
+            "s_nom_max": 200.0,
+            "capital_cost": [10.0 * edge[2] for edge in edges],
+            "type": "",
+            "carrier": "AC",
+        },
+        index=[f"line_{i}" for i in range(len(edges))],
+    )
+    n.buses["Pd"] = 0.0
+    if zones is not None:
+        n.buses["reeds_zone"] = pd.Series(zones)
+    return n
+
+
+def _short_tie_in_a_k4(zones=None):
+    """A metre-scale tie inside a K4 core, so both endpoints have degree three."""
+    edges = [
+        ("a", "b", 0.05, 0.001),
+        ("a", "c", 40.0, 0.4),
+        ("a", "d", 30.0, 0.3),
+        ("b", "c", 35.0, 0.35),
+        ("b", "d", 45.0, 0.45),
+        ("c", "d", 50.0, 0.5),
+    ]
+    return _network_with_lines(edges, ("a", "b", "c", "d"), zones)
+
+
+def test_short_branch_contraction_merges_the_two_substations():
+    """The tie disappears, its buses become one, and demand weight adds."""
+    n = _network_with_lines(
+        [("a", "b", 0.05, 0.001), ("a", "c", 40.0, 0.4), ("b", "d", 30.0, 0.3), ("c", "d", 50.0, 0.5)],
+        ("a", "b", "c", "d"),
+    )
+    n.buses.loc["a", "Pd"] = 30.0
+    n.buses.loc["b", "Pd"] = 70.0
+
+    n, busmap = contract_short_branches(n)
+
+    # The larger demand weight keeps its own site, so "b" survives and "a" folds in.
+    assert set(n.buses.index) == {"b", "c", "d"}
+    assert busmap["a"] == "b"
+    assert busmap["c"] == "c"
+    assert n.buses.at["b", "Pd"] == pytest.approx(100.0)
+    # The contracted branch is gone and the two it used to separate now meet at "b".
+    assert len(n.lines) == 3
+    assert 0.05 not in set(n.lines.length)
+    assert set(zip(n.lines.bus0, n.lines.bus1)) == {("b", "c"), ("b", "d"), ("c", "d")}
+
+
+def test_short_branch_contraction_reaches_endpoints_the_low_degree_pass_cannot():
+    """A short tie between two degree-three buses: a no-op for the degree-1/2
+    rule at any length, which is why this is a separate pass."""
+    untouched, low_degree_busmap = reduce_low_degree_buses_and_merge_parallel_lines(_short_tie_in_a_k4())
+    assert len(untouched.buses) == 4
+    assert untouched.lines.length.min() == pytest.approx(0.05)
+    assert (low_degree_busmap == low_degree_busmap.index).all()
+
+    contracted, busmap = contract_short_branches(_short_tie_in_a_k4())
+    assert len(contracted.buses) == 3
+    assert contracted.lines.length.min() > SHORT_BRANCH_LENGTH_KM
+    assert busmap["b"] == "a"
+
+
+def test_short_branch_contraction_merges_the_parallel_lines_it_creates():
+    """Collapsing a-b in a K4 doubles up a-c/b-c and a-d/b-d; with
+    ``low_degree_reduction`` off nothing else would merge them."""
+    n, _ = contract_short_branches(_short_tie_in_a_k4())
+
+    pairs = [tuple(sorted(pair)) for pair in zip(n.lines.bus0, n.lines.bus1)]
+    assert len(pairs) == len(set(pairs)) == 3
+    assert (n.lines.bus0 != n.lines.bus1).all()
+    # Two identical-x parallel branches merge to their summed rating.
+    merged = n.lines[(n.lines.bus0 == "a") | (n.lines.bus1 == "a")]
+    assert (merged.s_nom > 100.0).all()
+
+
+def test_short_branch_contraction_collapses_a_chain_of_short_lines_at_once():
+    """Short Lines sharing endpoints form one group, not a chain of pair merges."""
+    n = _network_with_lines(
+        [
+            ("a", "b", 0.02, 0.001),
+            ("b", "c", 0.03, 0.001),
+            ("a", "d", 40.0, 0.4),
+            ("c", "e", 30.0, 0.3),
+            ("d", "e", 50.0, 0.5),
+        ],
+        ("a", "b", "c", "d", "e"),
+    )
+    n.buses.loc["b", "Pd"] = 5.0
+
+    n, busmap = contract_short_branches(n)
+
+    assert len(n.buses) == 3
+    assert busmap["a"] == busmap["b"] == busmap["c"] == "b"
+    assert n.buses.at["b", "Pd"] == pytest.approx(5.0)
+    assert len(n.lines) == 3
+
+
+def test_short_branch_contraction_refuses_to_cross_the_protected_zone():
+    """A tie between two zones stays, so no zone loses load or generation."""
+    n = _short_tie_in_a_k4(zones={"a": "west", "b": "east", "c": "east", "d": "east"})
+
+    n, busmap = contract_short_branches(n)
+
+    assert len(n.buses) == 4
+    assert len(n.lines) == 6
+    assert n.lines.length.min() == pytest.approx(0.05)
+    assert (busmap == busmap.index).all()
+
+
+def test_short_branch_contraction_is_a_no_op_without_short_lines():
+    """Every real corridor is far above the threshold; the pass must not fire."""
+    n = _network_with_lines(
+        [("a", "b", 12.0, 0.1), ("b", "c", 40.0, 0.4), ("a", "c", 50.0, 0.5)],
+        ("a", "b", "c"),
+    )
+
+    reduced, busmap = contract_short_branches(n)
+
+    assert len(reduced.buses) == 3
+    assert len(reduced.lines) == 3
+    assert (busmap == busmap.index).all()
+
+
+def test_short_branch_contraction_moves_one_port_assets_and_links_wholesale():
+    """Merging two sites moves their assets across intact, not Kron-split."""
+    n = _network_with_lines(
+        [("a", "b", 0.05, 0.001), ("a", "c", 40.0, 0.4), ("b", "d", 30.0, 0.3), ("c", "d", 50.0, 0.5)],
+        ("a", "b", "c", "d"),
+    )
+    n.buses.loc["b", "Pd"] = 70.0
+    n.add("Generator", "wind_a", bus="a", carrier="onwind", p_nom=250.0, p_nom_max=250.0)
+    n.add("Load", "load_a", bus="a", p_set=40.0)
+    n.add("Bus", "dc")
+    n.add("Link", "dc_a", bus0="a", bus1="dc", p_nom=500.0)
+
+    n, _ = contract_short_branches(n)
+
+    assert n.generators.at["wind_a", "bus"] == "b"
+    assert n.generators.at["wind_a", "p_nom"] == pytest.approx(250.0)
+    assert n.loads.at["load_a", "bus"] == "b"
+    assert n.loads.at["load_a", "p_set"] == pytest.approx(40.0)
+    assert n.links.at["dc_a", "bus0"] == "b"
+
+
+def test_short_branch_contraction_busmap_feeds_the_standard_clustering_wrapper():
+    """The busmap has to be a valid stage map over the pre-contraction index."""
+    original = _short_tie_in_a_k4()
+    _, busmap = contract_short_branches(_short_tie_in_a_k4())
+
+    assert list(busmap.index) == list(original.buses.index)
+    assert set(busmap) <= set(original.buses.index)
+    clustered = clustering_from_busmap(original, busmap, line_length_factor=1.0).network
+    assert len(clustered.buses) == 3
