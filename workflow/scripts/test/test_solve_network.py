@@ -82,7 +82,7 @@ def test_run_optimize_passes_extra_functionality_into_iterative_solver():
             "min_iterations": 2,
             "max_iterations": 3,
             "scheme": "slp",
-            "trust_region": True,
+            "proximal": True,
         },
         extra_functionality=fake_extra_functionality,
     )
@@ -92,7 +92,7 @@ def test_run_optimize_passes_extra_functionality_into_iterative_solver():
     assert captured["min_iterations"] == 2
     assert captured["max_iterations"] == 3
     assert captured["scheme"] == "slp"
-    assert captured["trust_region"] is True
+    assert captured["proximal"] is True
 
 
 def test_add_electrolysis_constraint_splits_hydrogen_target_across_h2ptcreg_regions():
@@ -583,14 +583,28 @@ def test_iterative_optimize_kwargs_forwards_only_what_is_configured():
     assert solve_network_module._iterative_optimize_kwargs({}) == {}
     assert solve_network_module._iterative_optimize_kwargs({"proximal": None}) == {}
 
-    # the remaining step control stays at PyPSA's defaults and is not forwarded
+    # Only whether to damp at all is this repo's choice. The weight, the rule
+    # that moves it and the convergence test are calibrated inside PyPSA
+    # against these very cases, so a value set here would override a tuned
+    # default with an untuned one. ``max_iterations`` is not in this set
+    # either - ``_run_standard_optimize`` passes it separately.
     forwarded = solve_network_module._iterative_optimize_kwargs(
-        {"proximal": "off", "cost_threshold": 1.0e-4, "max_iterations": 20},
+        {
+            "proximal": True,
+            "proximal_weight": 0.1,
+            "proximal_ceiling": 8,
+            "progress_target": 0.5,
+            "cost_threshold": 1.0e-4,
+            "max_iterations": 20,
+        },
     )
-    assert forwarded == {"proximal": "off"}
+    assert forwarded == {"proximal": True}
+    assert solve_network_module._iterative_optimize_kwargs({"proximal": False}) == {
+        "proximal": False
+    }
 
 
-def test_run_standard_optimize_passes_the_proximal_norm_through(monkeypatch):
+def test_run_standard_optimize_passes_the_proximal_switch_through(monkeypatch):
     captured = {}
 
     class FakeOptimize:
@@ -599,15 +613,16 @@ def test_run_standard_optimize_passes_the_proximal_norm_through(monkeypatch):
             return "ok", "optimal"
 
     network = SimpleNamespace(optimize=FakeOptimize())
-    cf_solving = {"scheme": "slp", "trust_region": True, "proximal": "l2"}
+    cf_solving = {"scheme": "slp", "proximal": True, "proximal_weight": 0.1}
 
     status, condition = solve_network_module._run_standard_optimize(
         network, rolling_horizon=False, skip_iterations=False, cf_solving=cf_solving
     )
 
     assert (status, condition) == ("ok", "optimal")
-    assert captured["trust_region"] is True
-    assert captured["proximal"] == "l2"
-    # the convergence criterion is PyPSA's, not something this repo sets
+    assert captured["proximal"] is True
+    # the step control and the convergence criterion are PyPSA's, not
+    # something this repo sets
+    assert "proximal_weight" not in captured
     assert "cost_threshold" not in captured
     assert "cost_window" not in captured

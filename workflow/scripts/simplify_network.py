@@ -76,7 +76,7 @@ MAX_TRAFO_CHAIN_DEPTH = 16
 #: reduction and the target-count clustering therefore refuse to cross it, which
 #: also guarantees every zone keeps at least one bus. Networks built on a
 #: boundary that drops the column (``state``) simply lose the guard.
-PROTECTED_ZONE_COLUMN = "reeds_zone"
+PROTECTED_ZONE_COLUMN = "trans_reg"
 
 #: Label standing in for a bus whose :data:`PROTECTED_ZONE_COLUMN` is missing.
 #: Such buses group together rather than each becoming its own zone, so absent
@@ -1384,8 +1384,8 @@ def busmap_by_target_bus_count(
 
     No cluster spans two :data:`PROTECTED_ZONE_COLUMN` zones: the zone boundary
     is cut alongside ``topological_boundary``, so every zone keeps at least one
-    bus and no load or generation moves between zones. With the default
-    ``reeds_zone`` boundary the two cuts are the same one.
+    bus and no load or generation moves between zones. With a ``trans_reg``
+    topological boundary the two cuts are the same one.
 
     ``n_clusters`` is the count this pass produces, and the last reduction the
     pipeline applies -- it is the bus count of the exported network.
@@ -1433,12 +1433,13 @@ def busmap_by_target_bus_count(
             pd.Series(buses.index.astype(str), index=buses.index).radd("__missing__"),
         )
 
-    # Cut the ReEDS zone boundary as well as the configured one, so no cluster
+    # Cut the trans_reg boundary as well as the configured one, so no cluster
     # spans two zones and every zone keeps at least one bus. This is free when
-    # the two coincide -- `reeds_zone` is the default topological boundary -- and
-    # it is the only thing holding the line when the configured boundary is the
-    # coarser `state`. A cluster straddling zones would pool load and generation
-    # across the buckets the downstream ReEDS constraints are written against.
+    # the two coincide -- when `trans_reg` is itself the configured topological
+    # boundary -- and it is the only thing holding the line for finer configured
+    # boundaries such as `reeds_zone`, `county`, or `state`. A cluster straddling
+    # zones would pool load and generation across the buckets the downstream
+    # ReEDS constraints are written against.
     zones = bus_zone_labels(n)
     if zones is None:
         logger.warning(

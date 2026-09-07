@@ -533,19 +533,19 @@ def test_erm_skips_reversible_internal_link(meshed_reserve_network, caplog):
     assert "reversible link" in caplog.text
 
 
-def test_erm_all_expands_to_every_reeds_zone(reserve_margin_network, caplog):
-    """``all`` is shorthand for every ReEDS zone, not one nationwide row."""
+def test_erm_all_expands_to_every_transmission_group(reserve_margin_network, caplog):
+    """``all`` is shorthand for every transmission group, not one nationwide row."""
     n = reserve_margin_network.copy()
     n.optimize.create_model(multi_investment_periods=True)
 
     with caplog.at_level("INFO"):
         add_ERM_constraints(n, n.snapshots, regional_erm_data={"all": 0.15})
 
-    assert {erm_requirement_name("CA_Z1"), erm_requirement_name("TX_Z1")} <= set(n.model.constraints)
+    assert {erm_requirement_name("CA_G1"), erm_requirement_name("TX_G1")} <= set(n.model.constraints)
     assert any("Added 2 ERM constraints" in record.message for record in caplog.records)
 
     # A nationwide row would have no boundary at all, so the branches would drop out.
-    row = _requirement_row(n, "CA_Z1", n.snapshots[0])
+    row = _requirement_row(n, "CA_G1", n.snapshots[0])
     assert _label(n, "Line-s", snapshot=n.snapshots[0], Line="line1") in row
 
 
@@ -553,73 +553,73 @@ def test_erm_explicit_region_overrides_all(reserve_margin_network):
     """An explicit region key wins over the value inherited from ``all``."""
     n = reserve_margin_network.copy()
     n.optimize.create_model(multi_investment_periods=True)
-    add_ERM_constraints(n, n.snapshots, regional_erm_data={"all": 0.15, "CA_Z1": 0.40})
+    add_ERM_constraints(n, n.snapshots, regional_erm_data={"all": 0.15, "CA_G1": 0.40})
 
     buses = n.buses.index[n.buses.carrier == "AC"]
     demand = _bus_demand(n, buses)
 
-    for region, erm_value in [("CA_Z1", 0.40), ("TX_Z1", 0.15)]:
+    for region, erm_value in [("CA_G1", 0.40), ("TX_G1", 0.15)]:
         constraint = n.model.constraints[erm_requirement_name(region)]
-        members = buses[n.buses.reeds_zone[buses] == region]
+        members = buses[n.buses.trans_grp[buses] == region]
         firm = sum((_firm_capacity(n, bus, n.snapshots) for bus in members), pd.Series(0.0, index=n.snapshots))
         expected = demand[members].sum(axis=1) * (1 + erm_value) - firm
         assert np.allclose(constraint.rhs.to_pandas(), expected, atol=1e-6)
 
 
-def test_erm_nerc_region_expands_to_its_reeds_zones(reserve_margin_network, caplog):
-    """A NERC-region key expands into one row per ReEDS zone it contains, not one pooled row."""
+def test_erm_trans_region_expands_to_its_transmission_groups(reserve_margin_network, caplog):
+    """A transmission-region key expands into one row per group it contains, not one pooled row."""
     n = reserve_margin_network.copy()
-    # Split NERC2 (z2, z3) across two distinct ReEDS zones so the expansion has more
-    # than one zone to produce.
-    n.buses.loc["z3", "reeds_zone"] = "TX_Z2"
+    # Split EAST_REG (z2, z3) across two distinct transmission groups so the
+    # expansion has more than one group to produce.
+    n.buses.loc["z3", "trans_grp"] = "TX_G2"
     n.optimize.create_model(multi_investment_periods=True)
 
     with caplog.at_level("INFO"):
-        add_ERM_constraints(n, n.snapshots, regional_erm_data={"NERC2": 0.20})
+        add_ERM_constraints(n, n.snapshots, regional_erm_data={"EAST_REG": 0.20})
 
-    assert {erm_requirement_name("TX_Z1"), erm_requirement_name("TX_Z2")} <= set(n.model.constraints)
-    assert erm_requirement_name("NERC2") not in n.model.constraints
+    assert {erm_requirement_name("TX_G1"), erm_requirement_name("TX_G2")} <= set(n.model.constraints)
+    assert erm_requirement_name("EAST_REG") not in n.model.constraints
     assert any("Added 2 ERM constraints" in record.message for record in caplog.records)
 
     buses = n.buses.index[n.buses.carrier == "AC"]
     demand = _bus_demand(n, buses)
-    for region in ("TX_Z1", "TX_Z2"):
+    for region in ("TX_G1", "TX_G2"):
         constraint = n.model.constraints[erm_requirement_name(region)]
-        members = buses[n.buses.reeds_zone[buses] == region]
+        members = buses[n.buses.trans_grp[buses] == region]
         firm = sum((_firm_capacity(n, bus, n.snapshots) for bus in members), pd.Series(0.0, index=n.snapshots))
         expected = demand[members].sum(axis=1) * 1.20 - firm
         assert np.allclose(constraint.rhs.to_pandas(), expected, atol=1e-6), (
-            f"{region} should carry its NERC region's margin on its own demand, not the pooled region's"
+            f"{region} should carry its transmission region's margin on its own demand, not the pooled region's"
         )
 
 
-def test_erm_explicit_zone_overrides_nerc_region(reserve_margin_network):
-    """An explicit ReEDS-zone key wins over the value inherited from its NERC region."""
+def test_erm_explicit_group_overrides_trans_region(reserve_margin_network):
+    """An explicit transmission-group key wins over the value inherited from its transmission region."""
     n = reserve_margin_network.copy()
     n.optimize.create_model(multi_investment_periods=True)
-    add_ERM_constraints(n, n.snapshots, regional_erm_data={"NERC1": 0.15, "CA_Z1": 0.40})
+    add_ERM_constraints(n, n.snapshots, regional_erm_data={"WEST_REG": 0.15, "CA_G1": 0.40})
 
     buses = n.buses.index[n.buses.carrier == "AC"]
     demand = _bus_demand(n, buses)
-    constraint = n.model.constraints[erm_requirement_name("CA_Z1")]
-    members = buses[n.buses.reeds_zone[buses] == "CA_Z1"]
+    constraint = n.model.constraints[erm_requirement_name("CA_G1")]
+    members = buses[n.buses.trans_grp[buses] == "CA_G1"]
     firm = sum((_firm_capacity(n, bus, n.snapshots) for bus in members), pd.Series(0.0, index=n.snapshots))
     expected = demand[members].sum(axis=1) * 1.40 - firm
     assert np.allclose(constraint.rhs.to_pandas(), expected, atol=1e-6)
 
 
-def test_erm_nerc_region_overrides_all(reserve_margin_network):
-    """A NERC-region key wins over the value inherited from ``all``."""
+def test_erm_trans_region_overrides_all(reserve_margin_network):
+    """A transmission-region key wins over the value inherited from ``all``."""
     n = reserve_margin_network.copy()
     n.optimize.create_model(multi_investment_periods=True)
-    add_ERM_constraints(n, n.snapshots, regional_erm_data={"all": 0.15, "NERC1": 0.40})
+    add_ERM_constraints(n, n.snapshots, regional_erm_data={"all": 0.15, "WEST_REG": 0.40})
 
     buses = n.buses.index[n.buses.carrier == "AC"]
     demand = _bus_demand(n, buses)
 
-    for region, erm_value in [("CA_Z1", 0.40), ("TX_Z1", 0.15)]:
+    for region, erm_value in [("CA_G1", 0.40), ("TX_G1", 0.15)]:
         constraint = n.model.constraints[erm_requirement_name(region)]
-        members = buses[n.buses.reeds_zone[buses] == region]
+        members = buses[n.buses.trans_grp[buses] == region]
         firm = sum((_firm_capacity(n, bus, n.snapshots) for bus in members), pd.Series(0.0, index=n.snapshots))
         expected = demand[members].sum(axis=1) * (1 + erm_value) - firm
         assert np.allclose(constraint.rhs.to_pandas(), expected, atol=1e-6)
@@ -726,6 +726,7 @@ def test_tes_discharge_reserve_is_limited_by_connected_store_energy():
     n.buses.loc[:, "nerc_reg"] = "NERC1"
     n.buses.loc[:, "reeds_state"] = "CA"
     n.buses.loc[:, "reeds_zone"] = "CA_Z1"
+    n.buses.loc[:, "trans_grp"] = "CA_Z1"
 
     n.add("Load", "l", bus="z1", carrier="load", p_set=pd.Series(0.0, index=snapshots))
     n.add("Generator", "g", bus="z1", carrier="gen", p_nom=100, marginal_cost=1.0, p_max_pu=1.0)
@@ -803,10 +804,10 @@ def test_multi_period_erm_optimization(multi_period_reserve_network):
 
     # One requirement per region spanning both periods, not one per region per period
     erm_constraints = sorted(c for c in n.model.constraints if c.startswith(f"{ERM_REQUIREMENT}_"))
-    assert erm_constraints == sorted(erm_requirement_name(r) for r in ("CA_Z1", "TX_Z1")), (
+    assert erm_constraints == sorted(erm_requirement_name(r) for r in ("CA_G1", "TX_G1")), (
         f"Should have exactly one ERM requirement per region, found: {erm_constraints}"
     )
-    for region in ("CA_Z1", "TX_Z1"):
+    for region in ("CA_G1", "TX_G1"):
         requirement = n.model.constraints[erm_requirement_name(region)]
         assert set(requirement.coords["snapshot"].values) == set(n.snapshots), (
             "The requirement should span all investment periods"
@@ -845,9 +846,9 @@ def test_multi_period_erm_activity_masking(multi_period_reserve_network):
         extra_functionality=extra_functionality,
     )
     assert status == "ok" and condition == "optimal", f"Optimization failed: {status}/{condition}"
-    assert erm_requirement_name("CA_Z1") in n.model.constraints
+    assert erm_requirement_name("CA_G1") in n.model.constraints
 
-    # gas_retiring is fixed capacity at z1, so it rides on the CA_Z1 right-hand side.
+    # gas_retiring is fixed capacity at z1, so it rides on the CA_G1 right-hand side.
     # After retirement its 150 MW must drop out of that constant.
     firm = _firm_capacity(n, "z1", n.snapshots)
     unmasked = (
@@ -867,7 +868,7 @@ def test_multi_period_erm_activity_masking(multi_period_reserve_network):
     buses = n.buses.index[n.buses.carrier == "AC"]
     demand = _bus_demand(n, buses)
     expected_rhs = demand[["z1"]].sum(axis=1) * 1.15 - firm
-    actual_rhs = n.model.constraints[erm_requirement_name("CA_Z1")].rhs.to_pandas()
+    actual_rhs = n.model.constraints[erm_requirement_name("CA_G1")].rhs.to_pandas()
     assert np.allclose(actual_rhs, expected_rhs, atol=1e-6), (
         "The CA_Z1 requirement should be built on the masked firm capacity"
     )
@@ -900,6 +901,7 @@ def _energy_backed_erm_network(stores_weighting, representative_metadata=None):
     n.buses.loc[:, "nerc_reg"] = "NERC1"
     n.buses.loc[:, "reeds_state"] = "CA"
     n.buses.loc[:, "reeds_zone"] = "CA_Z1"
+    n.buses.loc[:, "trans_grp"] = "CA_Z1"
 
     n.add("Load", "l", bus="z1", carrier="load", p_set=pd.Series(0.0, index=snapshots))
     n.add("Generator", "g", bus="z1", carrier="gen", p_nom=100, marginal_cost=1.0, p_max_pu=1.0)

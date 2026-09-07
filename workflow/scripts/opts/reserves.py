@@ -70,12 +70,23 @@ efficiency; a reversible link is left out rather than counted with the wrong sig
 Requirement granularity
 -----------------------
 One row per region and snapshot. Overlapping regions each get their own row and all
-of them bind. ``erm: {all: X}`` is shorthand for "apply X to every ReEDS zone": a
-single nationwide row would have no boundary, so its flow term would vanish and the
-requirement would collapse into a nationwide capacity sum. A NERC-region key such as
-``erm: {PJM: X}`` is expanded the same way, into one row per ReEDS zone PJM contains,
-each requiring its own demand plus margin off its own boundary flow rather than
-pooling capacity across zones that intra-region transmission may not actually reach.
+of them bind. ``erm: {all: X}`` is shorthand for "apply X to every transmission group
+(``trans_grp``)": a single nationwide row would have no boundary, so its flow term
+would vanish and the requirement would collapse into a nationwide capacity sum. A
+transmission-region key (``trans_reg``), such as ``erm: {PJM: X}``, is expanded the
+same way, into one row per transmission group PJM contains, each requiring its own
+demand plus margin off its own boundary flow rather than pooling capacity across
+groups that intra-region transmission may not actually reach.
+
+Transmission group, rather than ReEDS zone, is the unit here because it is the
+granularity at which reserve margins are actually planned and enforced -- each
+ISO/RTO (and, for MISO and SPP, each of their sub-regions) carries its own
+requirement, not each individual ReEDS zone. A NERC-region key such as ``WECC_NW``
+does *not* expand this way: ``nerc_reg`` and ``trans_grp`` cross-cut each other -- a
+single NERC region's buses can fall into several transmission groups and vice versa --
+so there is no single unambiguous set of transmission groups to expand it into. A
+``nerc_reg`` key is instead passed through unchanged as one pooled row, the same as a
+state or interconnect key.
 
 Note the flip side of aggregating: within a region the requirement is one sum, so
 intra-regional transmission earns no adequacy value -- a region containing both a
@@ -616,69 +627,77 @@ def define_erm_regional_requirements(n, sns, regions, buses):
         return
 
 
-def _expand_all_to_reeds_zones(n, erm_dict, buses):
+def _expand_all_to_transmission_groups(n, erm_dict, buses):
     """
-    Turn an ``all`` entry, and any NERC-region entry, into one entry per ReEDS zone.
+    Turn an ``all`` entry, and any transmission-region entry, into one entry per
+    transmission group (``trans_grp``).
 
-    A region spanning several ReEDS zones has no boundary *between* those zones, so a
-    single row over the whole region earns no adequacy value for the transmission
-    between them (see the module docstring). ``all: X`` therefore means "apply X to
-    every ReEDS zone", and a NERC-region key such as ``PJM: X`` means "apply X to
-    every ReEDS zone PJM contains" -- both force each zone to individually cover its
-    own demand plus reserve margin using its own boundary flow, rather than pooling
-    capacity across zones that isn't reachable without binding transmission.
+    A region spanning several transmission groups has no boundary *between* those
+    groups, so a single row over the whole region earns no adequacy value for the
+    transmission between them (see the module docstring). ``all: X`` therefore means
+    "apply X to every transmission group", and a transmission-region key such as
+    ``PJM: X`` means "apply X to every transmission group PJM contains" -- both force
+    each group to individually cover its own demand plus reserve margin using its own
+    boundary flow, rather than pooling capacity across groups that isn't reachable
+    without binding transmission.
 
-    Precedence where the same zone is reachable more than one way: an explicit
-    ReEDS-zone key always wins, a NERC-region key wins over ``all``, and ``all`` fills
-    in whatever is left. Any other key (state, country, interconnect, a bare bus name)
-    is passed through unchanged.
+    A NERC-region key (``nerc_reg``, e.g. ``WECC_NW``) is deliberately *not* expanded
+    here: ``nerc_reg`` and ``trans_grp`` cross-cut each other, so a NERC region's buses
+    can spill across several transmission groups with no single unambiguous group to
+    credit them to. It is passed through unchanged as one pooled row instead.
+
+    Precedence where the same group is reachable more than one way: an explicit
+    transmission-group key always wins, a transmission-region key wins over ``all``,
+    and ``all`` fills in whatever is left. Any other key (NERC region, state, country,
+    interconnect, a bare bus name) is passed through unchanged.
     """
-    if "reeds_zone" not in n.buses.columns:
+    if "trans_grp" not in n.buses.columns:
         if "all" in erm_dict:
             logger.warning(
-                "ERM 'all' cannot be expanded: buses carry no 'reeds_zone' column. "
+                "ERM 'all' cannot be expanded: buses carry no 'trans_grp' column. "
                 "Keeping 'all' as a single nationwide region.",
             )
         return erm_dict
 
-    zone_labels = n.buses.reeds_zone.reindex(buses).dropna().astype(str)
-    reeds_zones = set(zone_labels[zone_labels != ""].unique())
-    if not reeds_zones:
+    group_labels = n.buses.trans_grp.reindex(buses).dropna().astype(str)
+    trans_groups = set(group_labels[group_labels != ""].unique())
+    if not trans_groups:
         if "all" in erm_dict:
             logger.warning(
-                "ERM 'all' cannot be expanded: no ReEDS zones on the electricity buses. "
-                "Keeping 'all' as a single nationwide region.",
+                "ERM 'all' cannot be expanded: no transmission groups on the "
+                "electricity buses. Keeping 'all' as a single nationwide region.",
             )
         return erm_dict
 
-    zones_by_nerc_region = {}
-    if "nerc_reg" in n.buses.columns:
-        pairs = n.buses.loc[buses, ["reeds_zone", "nerc_reg"]].dropna().astype(str)
-        pairs = pairs[(pairs.reeds_zone != "") & (pairs.nerc_reg != "")]
-        zones_by_nerc_region = pairs.groupby("nerc_reg")["reeds_zone"].apply(set).to_dict()
+    groups_by_trans_region = {}
+    if "trans_reg" in n.buses.columns:
+        pairs = n.buses.loc[buses, ["trans_grp", "trans_reg"]].dropna().astype(str)
+        pairs = pairs[(pairs.trans_grp != "") & (pairs.trans_reg != "")]
+        groups_by_trans_region = pairs.groupby("trans_reg")["trans_grp"].apply(set).to_dict()
 
     expanded = {}
 
-    # Lowest precedence: "all" fills every zone.
+    # Lowest precedence: "all" fills every transmission group.
     if "all" in erm_dict:
-        for zone in reeds_zones:
-            expanded[zone] = erm_dict["all"]
+        for group in trans_groups:
+            expanded[group] = erm_dict["all"]
 
-    # Medium precedence: a NERC-region key fills the zones it contains.
+    # Medium precedence: a transmission-region key fills the groups it contains.
     for key, value in erm_dict.items():
-        if key == "all" or key in reeds_zones:
+        if key == "all" or key in trans_groups:
             continue
-        for zone in zones_by_nerc_region.get(key, ()):
-            expanded[zone] = value
+        for group in groups_by_trans_region.get(key, ()):
+            expanded[group] = value
 
-    # Highest precedence: an explicit ReEDS-zone key always wins.
+    # Highest precedence: an explicit transmission-group key always wins.
     for key, value in erm_dict.items():
-        if key in reeds_zones:
+        if key in trans_groups:
             expanded[key] = value
 
-    # Anything else (state, country, interconnect, a bare bus name) passes through.
+    # Anything else (NERC region, state, country, interconnect, a bare bus name)
+    # passes through.
     for key, value in erm_dict.items():
-        if key == "all" or key in reeds_zones or key in zones_by_nerc_region:
+        if key == "all" or key in trans_groups or key in groups_by_trans_region:
             continue
         expanded.setdefault(key, value)
 
@@ -734,7 +753,7 @@ def add_ERM_constraints(
     elif config is not None and config.get("electricity", {}).get("erm"):
         erm_dict = config["electricity"]["erm"]
     else:
-        logger.info("No ERM configuration provided. Using default 0.15 for every ReEDS zone.")
+        logger.info("No ERM configuration provided. Using default 0.15 for every transmission group.")
         erm_dict = default_erm
 
     buses = _erm_buses(n)
@@ -743,7 +762,7 @@ def add_ERM_constraints(
         return
 
     snapshots = _named_snapshots(n, snapshots)
-    erm_dict = _expand_all_to_reeds_zones(n, erm_dict, buses)
+    erm_dict = _expand_all_to_transmission_groups(n, erm_dict, buses)
 
     regions = {}
     for region_name, erm_value in erm_dict.items():

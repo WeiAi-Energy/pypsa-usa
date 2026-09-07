@@ -638,6 +638,22 @@ def extra_functionality(n, snapshots):
     tighten_line_x_sssc_bound(n, snapshots, config)
 
 
+def _iterative_optimize_kwargs(cf_solving):
+    """Forward explicitly configured outer-loop choices to PyPSA.
+
+    Leaving an option unset is important: it lets the installed PyPSA version
+    retain its own calibrated default instead of this workflow replacing it by
+    ``None``. The step control and the convergence test are calibrated inside
+    PyPSA against this workflow's own cases, so they are deliberately not
+    repeated here - only whether to damp at all is a choice this repo makes.
+    """
+    return {
+        name: cf_solving[name]
+        for name in ("proximal",)
+        if cf_solving.get(name) is not None
+    }
+
+
 def _run_standard_optimize(n, rolling_horizon, skip_iterations, cf_solving, **kwargs):
     """Run the standard PyPSA optimization path."""
     if rolling_horizon:
@@ -652,6 +668,7 @@ def _run_standard_optimize(n, rolling_horizon, skip_iterations, cf_solving, **kw
         kwargs["min_iterations"] = int(cf_solving.get("min_iterations", 4))
         kwargs["max_iterations"] = int(cf_solving.get("max_iterations", 6))
         kwargs["scheme"] = cf_solving.get("scheme", "slp")
+        kwargs.update(_iterative_optimize_kwargs(cf_solving))
         status, condition = n.optimize.optimize_transmission_expansion_iteratively(
             **kwargs,
         )

@@ -77,6 +77,12 @@ def base_network():
     n.buses.loc["z1", "reeds_zone"] = "CA_Z1"
     n.buses.loc["z2", "reeds_zone"] = "TX_Z1"
     n.buses.loc["z3", "reeds_zone"] = "TX_Z1"
+    n.buses.loc["z1", "trans_grp"] = "CA_G1"
+    n.buses.loc["z2", "trans_grp"] = "TX_G1"
+    n.buses.loc["z3", "trans_grp"] = "TX_G1"
+    n.buses.loc["z1", "trans_reg"] = "WEST_REG"
+    n.buses.loc["z2", "trans_reg"] = "EAST_REG"
+    n.buses.loc["z3", "trans_reg"] = "EAST_REG"
 
     # Add versatile generators for different test scenarios
     # Wind generators
@@ -339,6 +345,12 @@ def multi_period_base_network():
     n.buses.loc["z1", "reeds_zone"] = "CA_Z1"
     n.buses.loc["z2", "reeds_zone"] = "TX_Z1"
     n.buses.loc["z3", "reeds_zone"] = "TX_Z1"
+    n.buses.loc["z1", "trans_grp"] = "CA_G1"
+    n.buses.loc["z2", "trans_grp"] = "TX_G1"
+    n.buses.loc["z3", "trans_grp"] = "TX_G1"
+    n.buses.loc["z1", "trans_reg"] = "WEST_REG"
+    n.buses.loc["z2", "trans_reg"] = "EAST_REG"
+    n.buses.loc["z3", "trans_reg"] = "EAST_REG"
 
     # Wind generators (extendable, active in both periods)
     n.add(

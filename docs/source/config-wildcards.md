@@ -73,7 +73,8 @@ i.e. `REM-3H` contains the `REM` regional emissions limit trigger and the `3H` s
 
 The REM, ERM, RPS can be defined using either the reeds zone name 'p##',
 the state code (eg, TX, CA, MT), pypsa-usa interconnect name (western, eastern, texas, usa),
-or nerc region name.
+nerc region name, transmission region name (trans_reg, eg PJM, MISO), or transmission
+group name (trans_grp, eg PJM_East, MISO_Central).
 
 ```{warning}
 TCT Targets can only be used with renewable generators and utility scale batteries in sector studies.
@@ -114,9 +115,9 @@ Only the **dischargers** carry a variable of their own. Every other term is eith
 - No ramping coupling to the base state is imposed, and the constraint is applied at every snapshot rather than only at stress hours
 - Supports overlapping regions with different reserve margins; each region gets its own constraint row, so overlaps are additive in the requirement rather than resolved by taking a maximum
 
-**Requirement granularity.** One row per region and snapshot. `erm: {all: X}` is shorthand for "apply `X` to every NERC region" rather than a single nationwide row: a nationwide region has no boundary, so its flow term would vanish and the requirement would collapse into a nationwide capacity sum. Explicit region keys override the value inherited from `all`.
+**Requirement granularity.** One row per region and snapshot. `erm: {all: X}` is shorthand for "apply `X` to every transmission group (`trans_grp`)" rather than a single nationwide row: a nationwide region has no boundary, so its flow term would vanish and the requirement would collapse into a nationwide capacity sum. A transmission-region key (`trans_reg`, e.g. `PJM`, `MISO`) expands the same way, into one row per transmission group it contains. Transmission group is the unit because that is the granularity at which reserve margins are actually planned and enforced — each ISO/RTO, and each of MISO's and SPP's sub-regions, carries its own requirement. A NERC-region key (`nerc_reg`, e.g. `WECC_NW`) is *not* expanded this way, because `nerc_reg` and `trans_grp` cross-cut each other with no unambiguous mapping between them; it is passed through unchanged as a single pooled row, like a state or interconnect key. Explicit region keys override the value inherited from `all` or a transmission-region key.
 
-The flip side of aggregating is worth stating plainly: within a region the requirement is one sum, so intra-regional transmission earns no adequacy value. A region containing both a large generator and an electrically unreachable load pocket will pass. Use a finer region definition (ReEDS zone rather than NERC region, say) where that matters.
+The flip side of aggregating is worth stating plainly: within a region the requirement is one sum, so intra-regional transmission earns no adequacy value. A region containing both a large generator and an electrically unreachable load pocket will pass. Use a finer region definition (transmission group rather than transmission region, or ReEDS zone, say) where that matters.
 
 One dual is stored after solving:
 
@@ -136,20 +137,22 @@ To customize the ERM values per region, add an `erm` section under `electricity`
 ```yaml
 electricity:
   erm:
-    all: 0.15        # 15% reserve margin for all regions (default)
+    all: 0.15        # 15% reserve margin for all transmission groups (default)
     # Or specify per region:
-    # western: 0.15
-    # SPP: 0.12
-    # CISO: 0.17
+    # PJM: 0.186          # transmission region -> expands to PJM_East, PJM_West
+    # MISO_Central: 0.081 # explicit transmission group
+    # WECC_NW: 0.178      # NERC region -> passed through unchanged, one pooled row
 ```
 
-If no `erm` configuration is provided, a default of `{'all': 0.15}` is used, i.e. a 15% reserve margin on every NERC region.
+If no `erm` configuration is provided, a default of `{'all': 0.15}` is used, i.e. a 15% reserve margin on every transmission group.
 
 **Valid region identifiers:**
-- `all` - applies the same margin to every NERC region present in the network
+- `all` - applies the same margin to every transmission group present in the network
 - State codes: `TX`, `CA`, `MT`, etc.
 - Interconnect names: `western`, `eastern`, `texas`
-- NERC region names
+- NERC region names (`nerc_reg`, e.g. `WECC_NW`) - passed through unchanged as one pooled row; not expanded, since `nerc_reg` and `trans_grp` cross-cut each other
+- Transmission region names (`trans_reg`, e.g. `PJM`, `MISO`, `SPP`) - expanded into one row per transmission group it contains
+- Transmission group names (`trans_grp`, e.g. `PJM_East`, `MISO_Central`) - the finest, and default, granularity
 - ReEDS zone names: `p1`, `p2`, etc.
 
 (sector)=
