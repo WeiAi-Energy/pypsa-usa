@@ -264,7 +264,7 @@ rule add_demand:
     benchmark:
         CASE_BENCHMARKS + "demand/add_demand"
     resources:
-        mem_mb=lambda wildcards, input, attempt: (input_size_bytes(input) // 70000) * attempt * 2,
+        mem_mb=lambda wildcards, input, attempt: (input_size_bytes(input) // 20000) * attempt * 2,
         walltime=config_provider("walltime", "add_demand", default="00:50:00"),
     script:
         "../scripts/add_demand.py"
