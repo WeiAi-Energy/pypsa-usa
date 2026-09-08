@@ -175,7 +175,7 @@ def remove_transformers(n):
     # the Pd sitting on transformer low sides outright -- 5.1% of national peak
     # demand across ~1,170 substations, ~1,045 of which are left at Pd == 0 despite
     # serving load. Downstream that weight drives both the EER demand allocation and
-    # the low-degree reduction in `reduce_low_degree_buses_and_merge_parallel_lines`.
+    # the low-degree reduction in `reduce_low_degree_buses`.
     for col in EXTENSIVE_BUS_ATTRS:
         if col in n.buses.columns:
             values = pd.to_numeric(n.buses[col], errors="coerce").fillna(0.0)
@@ -479,12 +479,9 @@ class MergeHeterogeneity(NamedTuple):
     members -- which is both the right emphasis and the currency the loss is
     denominated in: what a merge discards is transfer capability, and a wildly
     mismatched merge of two tiny stubs matters less than a mismatched merge on
-    the transfer backbone. Where the pooled quantity already *is* ``s_nom`` (the
-    series metric) this is just each group's share of the total, and ``ratio``
-    collapses to ``sum_g(std_g * n_g) / sum_g(sum_i value_i)``. The parallel
-    metric measures dispersion in ``x * s_nom`` but takes its weights
-    separately, so both ratios weight a group by its capacity rather than by
-    whatever each happens to measure dispersion in, and the two stay comparable.
+    the transfer backbone. The pooled quantity here already *is* ``s_nom``, so
+    this is just each group's share of the total and ``ratio`` collapses to
+    ``sum_g(std_g * n_g) / sum_g(sum_i value_i)``.
 
     ``std`` is the population standard deviation (``ddof=0``). The sample
     variant is undefined for a group of one and inflates the very common
@@ -498,28 +495,21 @@ class MergeHeterogeneity(NamedTuple):
     coefficients_of_variation: list[float]
 
 
-def merge_heterogeneity(groups: list, weights: list | None = None) -> MergeHeterogeneity:
+def merge_heterogeneity(groups: list) -> MergeHeterogeneity:
     """Fold per-group member values into a :class:`MergeHeterogeneity`.
 
     Each entry of ``groups`` holds the values one merge pooled -- the ``s_nom``
-    of every segment in a collapsed series string, or the ``x * s_nom`` of every
-    branch in a merged parallel bundle. Groups of fewer than two finite members
-    merged nothing and are skipped, as are groups whose values sum to zero and
-    so have no coefficient of variation.
-
-    ``weights``, when given, holds one member-aligned array per group carrying
-    the MW behind each pooled value; a group weighs the ``s_nom`` of exactly the
-    members that survived the finite-value mask. Omitted, each group weighs its
-    own summed values, which is the same thing whenever the pooled quantity is
-    already ``s_nom``.
+    of every segment in a collapsed series string. Groups of fewer than two
+    finite members merged nothing and are skipped, as are groups whose values sum
+    to zero and so have no coefficient of variation. Each group weighs its own
+    summed values.
     """
     numerator = denominator = 0.0
     group_count = member_count = 0
     coefficients: list[float] = []
-    for index, values in enumerate(groups):
+    for values in groups:
         array = np.asarray(values, dtype=float)
-        finite = np.isfinite(array)
-        array = array[finite]
+        array = array[np.isfinite(array)]
         if array.size < 2:
             continue
         total = float(array.sum())
@@ -527,9 +517,7 @@ def merge_heterogeneity(groups: list, weights: list | None = None) -> MergeHeter
             continue
         deviation = float(array.std())
         coefficient = deviation * array.size / total
-        weight = (
-            total if weights is None else float(np.asarray(weights[index], dtype=float)[finite].sum())
-        )
+        weight = total
         numerator += weight * coefficient
         denominator += weight
         group_count += 1
@@ -561,131 +549,6 @@ def summarize_distribution(values: list[float], fmt: str = "%.4g") -> str:
     return f"n={array.size}, " + ", ".join(f"{name}=" + fmt % value for name, value in parts)
 
 
-def combine_parallel_impedance(values: np.ndarray) -> float:
-    """Standard parallel combination ``1 / sum(1/value)`` for ``r`` or ``x``.
-
-    A non-positive value shorts every other branch in a real circuit, so it
-    is treated the same way here rather than dividing by zero: the combined
-    value is 0. The data should not contain zero-impedance lines, so this is
-    a safety net, not a modelled case.
-    """
-    values = np.asarray(values, dtype=float)
-    if np.any(values <= 0):
-        return 0.0
-    return float(1.0 / np.sum(1.0 / values))
-
-
-def merge_parallel_lines(
-    lines: pd.DataFrame,
-    capacity_cols: list[str],
-    group_stats: list | None = None,
-) -> tuple[pd.DataFrame, int]:
-    """Merge every group of two or more Lines sharing the same unordered bus pair.
-
-    ``r`` and ``x`` combine with the standard parallel-impedance formula
-    (:func:`combine_parallel_impedance`), applied independently -- the same
-    simplification the series merge above makes by summing ``r`` and ``x``
-    separately rather than doing complex-impedance arithmetic.
-
-    Each capacity column (``s_nom`` and, where present, ``s_nom_min``/``max``)
-    combines as ``min(capacity_i * x_i) / x_parallel``. Under the linearised
-    (DC) power-flow assumption used throughout this module, a branch carries a
-    fixed share ``x_parallel / x_i`` of the total transfer, so it saturates
-    once that transfer reaches ``capacity_i * x_i / x_parallel``; the smallest
-    such threshold across the group sets the merged corridor's rating. (Naively
-    combining ``min(capacity_i / x_i)`` instead gets both the direction and the
-    magnitude wrong -- for two identical lines it halves the combined rating
-    instead of doubling it.) A degenerate zero-reactance group falls back to
-    the smallest capacity present, which the data should not contain.
-
-    ``length`` averages rather than sums: parallel circuits run the same
-    physical route, so adding their lengths would double-count it.
-    ``capital_cost`` is a capacity-weighted average, ``sum(cost_i * s_nom_i) /
-    sum(s_nom_i)`` -- it is a per-MW rate, and this keeps the total investment
-    (``cost * s_nom``, summed over the group) unchanged by the merge, matching
-    how pypsa's own clustering treats parallel lines. Other static columns are
-    inherited from the first name in sort order, as in the series-merge case.
-
-    ``group_stats``, when given, collects one record per merged group for the
-    caller's diagnostics: the branch names, each branch's ``s_nom`` (the weight
-    the caller's ratio gives it), and for each branch its saturation angle
-    ``x * s_nom`` -- the angle difference a branch carrying its own rating
-    stands under, since DC flow puts ``x_i * s_nom_i`` across branch ``i`` at
-    ``s_nom_i``. That is the quantity the merge is really pooling, because the
-    ``min(capacity_i * x_i)`` above is exactly the smallest of these: a group
-    whose branches share one saturation angle ``c`` saturates as one body and
-    merges losslessly -- the formula returns ``c / x_parallel = sum(s_nom_i)``,
-    the full sum of the ratings -- while a wide spread means the narrowest-angle
-    branch caps the corridor and the headroom on the rest is written off. (The
-    conductance-like ``s_nom / x`` is *not* this quantity and says nothing about
-    the loss: two branches with equal ``s_nom / x`` but unequal ``x`` merge to
-    half their summed rating.)
-
-    Returns the Lines frame with every such group replaced by one merged row,
-    and the number of groups merged.
-    """
-    if lines.empty:
-        return lines, 0
-
-    # Vectorised min/max rather than a row-wise apply: this module runs on
-    # networks with tens of thousands of Lines, and one pass here happens
-    # every iteration of the caller's fixed-point loop.
-    bus0_le = lines["bus0"] <= lines["bus1"]
-    lo = lines["bus0"].where(bus0_le, lines["bus1"])
-    hi = lines["bus1"].where(bus0_le, lines["bus0"])
-    pair = pd.Series(list(zip(lo, hi)), index=lines.index)
-    merge_groups = [sorted(names) for names in pair.groupby(pair).groups.values() if len(names) > 1]
-    if not merge_groups:
-        return lines, 0
-
-    drop_names: list = []
-    merged_rows: dict = {}
-    for names in merge_groups:
-        rows = lines.loc[names]
-        keep = names[0]
-        merged = rows.loc[keep].copy()
-
-        x = rows["x"].to_numpy(dtype=float)
-        merged["r"] = combine_parallel_impedance(rows["r"].to_numpy(dtype=float))
-        x_p = combine_parallel_impedance(x)
-        merged["x"] = x_p
-
-        for col in capacity_cols:
-            caps = rows[col].to_numpy(dtype=float)
-            merged[col] = float(np.min(caps * x)) / x_p if x_p > 0 else float(np.min(caps))
-
-        if "length" in rows.columns:
-            merged["length"] = float(rows["length"].mean())
-        if "capital_cost" in rows.columns and "s_nom" in rows.columns:
-            caps = rows["s_nom"].to_numpy(dtype=float)
-            total_cap = caps.sum()
-            merged["capital_cost"] = (
-                float((rows["capital_cost"].to_numpy(dtype=float) * caps).sum() / total_cap)
-                if total_cap > 0
-                else float(rows["capital_cost"].mean())
-            )
-
-        if group_stats is not None and "s_nom" in capacity_cols:
-            caps = rows["s_nom"].to_numpy(dtype=float)
-            group_stats.append(
-                {
-                    "names": names,
-                    "s_nom": caps,
-                    "x_s_nom": np.where(x > 0, caps * x, np.nan),
-                },
-            )
-
-        merged_rows[keep] = merged
-        drop_names.extend(names)
-
-    remaining = lines.drop(index=drop_names)
-    add_df = pd.DataFrame(
-        [row.to_dict() for row in merged_rows.values()],
-        index=list(merged_rows.keys()),
-    ).reindex(columns=lines.columns)
-    return pd.concat([remaining, add_df]), len(merge_groups)
-
-
 #: Length below which the two substations a Line joins are treated as one site.
 #: Substation aggregation leaves a few pairs metres apart -- 16 Lines under 100 m
 #: on the 41k-bus network, the shortest at 8.3 m -- which are electrically one
@@ -704,7 +567,7 @@ def contract_short_branches(
     """Contract every Line shorter than ``max_length_km``, merging its two buses.
 
     Edge *contraction*, not the series elimination
-    :func:`reduce_low_degree_buses_and_merge_parallel_lines` performs: the two
+    :func:`reduce_low_degree_buses` performs: the two
     endpoints become one bus and the branch disappears, rather than a mid-point
     being eliminated and its two branches spliced into one corridor. Neither
     pass subsumes the other -- most sub-100 m Lines on the 41k network have an
@@ -726,10 +589,10 @@ def contract_short_branches(
     Short Lines can share endpoints, so they contract as connected groups rather
     than one at a time (at 2 km on the 41k network, 3522 Lines span 3417 groups).
     Any Line left joining two members of one group becomes a self-loop and is
-    dropped, and contraction routinely doubles up a bus pair, so
-    :func:`merge_parallel_lines` runs afterwards -- not optional bookkeeping:
-    with ``low_degree_reduction`` disabled it is the pipeline's only parallel
-    merge, and an unmerged pair reaches the LP as an extra Kirchhoff cycle.
+    dropped. Contraction can also leave two Lines sharing a bus pair; they are
+    kept apart, for the reason :func:`reduce_low_degree_buses` sets out -- pooling
+    them would rate the pair at ``min(x_i s_nom_i) / x_parallel`` and write off
+    the headroom an SSSC could unlock by rebalancing the split.
 
     Returns the network and a busmap over the *pre-contraction* bus index, for
     the caller to compose with the later passes' maps.
@@ -821,16 +684,13 @@ def contract_short_branches(
     )
 
     # Bulk-replace n.lines rather than use pypsa's per-row API, for the reason
-    # given in `reduce_low_degree_buses_and_merge_parallel_lines`.
+    # given in `reduce_low_degree_buses`.
     lines = n.lines.copy()
     lines["bus0"] = lines["bus0"].map(lambda bus: relocation.get(bus, bus))
     lines["bus1"] = lines["bus1"].map(lambda bus: relocation.get(bus, bus))
     collapsed_i = lines.index[lines.bus0 == lines.bus1]
     lines = lines.drop(index=collapsed_i)
 
-    capacity_cols = [col for col in ("s_nom", "s_nom_min", "s_nom_max") if col in lines.columns]
-    parallel_groups: list = []
-    lines, parallel_merged = merge_parallel_lines(lines, capacity_cols, parallel_groups)
     n.lines = lines
 
     link_endpoints_relocated = 0
@@ -855,37 +715,29 @@ def contract_short_branches(
 
     remaining_length = pd.to_numeric(n.lines.length, errors="coerce")
     shortest_after = float(remaining_length.min()) if remaining_length.notna().any() else float("nan")
+    pair = pd.Series(
+        list(
+            zip(
+                n.lines.bus0.where(n.lines.bus0 <= n.lines.bus1, n.lines.bus1),
+                n.lines.bus1.where(n.lines.bus0 <= n.lines.bus1, n.lines.bus0),
+            )
+        ),
+    )
+    parallel_left = int((pair.value_counts() - 1).clip(lower=0).sum())
     logger.info(
         "Contracted %s Lines shorter than %s km across %s merged substation groups: "
-        "%s buses absorbed, %s further Lines collapsed to self-loops, %s parallel-line "
-        "groups merged, %s Link endpoints relocated. Shortest Line %.4g -> %.4g km.",
+        "%s buses absorbed, %s further Lines collapsed to self-loops, %s Link endpoints "
+        "relocated. Shortest Line %.4g -> %.4g km. %s Lines now share a bus pair.",
         len(short_i),
         max_length_km,
         merged_groups,
         len(relocation),
         len(collapsed_i) - len(short_i),
-        parallel_merged,
         link_endpoints_relocated,
         shortest_before,
         shortest_after,
+        parallel_left,
     )
-    if parallel_merged and "s_nom" in capacity_cols:
-        bundles: list = []
-        weights: list = []
-        for group in parallel_groups:
-            finite = np.isfinite(group["x_s_nom"])
-            if finite.sum() > 1:
-                bundles.append(group["x_s_nom"][finite])
-                weights.append(group["s_nom"][finite])
-        parallel = merge_heterogeneity(bundles, weights)
-        logger.info(
-            "Contraction parallel x*s_nom heterogeneity = %.4f over %s merged bundles "
-            "spanning %s branches. Per-bundle contribution: %s.",
-            parallel.ratio,
-            parallel.groups,
-            parallel.members,
-            summarize_distribution(parallel.coefficients_of_variation, "%.4f"),
-        )
     if zones is not None:
         logger.info(
             "Zone-crossing guard on '%s': %s short Lines left uncontracted.",
@@ -895,36 +747,41 @@ def contract_short_branches(
     return n, busmap
 
 
-def reduce_low_degree_buses_and_merge_parallel_lines(n: pypsa.Network) -> tuple[pypsa.Network, pd.Series]:
+def reduce_low_degree_buses(n: pypsa.Network) -> tuple[pypsa.Network, pd.Series]:
     """
-    Iteratively eliminate every bus of degree 1 or 2 and merge parallel Lines.
+    Iteratively eliminate every bus of degree 1 or 2.
 
     Runs to a fixed point, so the result holds no bus with fewer than three
-    incident Lines and no two buses joined by more than one Line: eliminating
-    a bus can drop a neighbour to degree 2 or 1, and merging a parallel group
-    can do the same, so each pass re-examines the whole graph from scratch.
-    Every pass first merges parallel Lines (:func:`merge_parallel_lines`),
-    then reduces low-degree buses; either step can create fresh opportunities
-    for the other; the loop stops only once a full pass does neither.
+    incident Lines: eliminating a bus can drop a neighbour to degree 2 or 1, so
+    each pass re-examines the whole graph from scratch and the loop stops only
+    once a full pass eliminates nothing.
+
+    **Two Lines sharing a bus pair are deliberately left standing**, so the result
+    *does* hold such pairs -- collapsing a triangle creates one every time. Pooling
+    them into a single branch rates the pair at ``min(x_i s_nom_i) / x_parallel``,
+    which is exact while the voltage law pins the split, but an SSSC rebalances the
+    split and the pair can then carry ``sum(s_nom_i)``. Unlocking that headroom is
+    the SSSC's main job on such a corridor, so pooling would write off precisely
+    what this model is built to measure: 79 GW across 1348 pairs on the 41k
+    network, 15% of their own pooled rating. Keeping them costs +4.9% buses and
+    +6.8% Lines there, because an unpooled pair holds its two endpoints at degree
+    2 rather than letting them fall to 1. See
+    ``docs/notes/topology-reduction-and-sssc.md``.
 
     Three cases arise for a low-degree bus:
 
-    * **degree 2** -- the two segments combine in series. Because parallel
-      merging already ran this pass, its two neighbours are always distinct
-      (two Lines to the same neighbour would already be one Line).
+    * **degree 2, distinct neighbours** -- the two segments combine in series.
       ``r``/``x``/``length``/``capital_cost`` add; ``s_nom`` (and
       ``s_nom_min``/``max``) take the *minimum*, since a corridor's transfer
       capability is set by its narrowest section, not the sum of its parts.
       ``capital_cost`` is a per-MW figure proportional to length, so raising the
       merged corridor's rating by 1 MW means widening *both* segments and costs
-      the sum -- unlike the parallel case above, which averages instead. Leaving
-      it at one segment's value would survive the final clustering too, which
-      rescales by ``capital_cost / length``: an n-segment chain would be priced
-      at roughly 1/n of its true cost.
-    * **degree 1** -- a stub. It folds into its single neighbour and the Line
-      is dropped; nothing behind a radial tip constrains the rest of the grid.
-      (A bus with two parallel Lines to the same neighbour ends up here too,
-      one pass later, once those Lines have merged into one.)
+      the sum. Leaving it at one segment's value would survive the final
+      clustering too, which rescales by ``capital_cost / length``: an n-segment
+      chain would be priced at roughly 1/n of its true cost.
+    * **degree 1, or degree 2 with both Lines to one neighbour** -- a stub. It
+      folds into that single neighbour and its Lines are dropped; nothing behind
+      a radial tip constrains the rest of the grid.
     * **degree 0** -- left in place. Deleting it would discard its demand
       weight with nowhere to send it, so it is logged instead.
 
@@ -963,31 +820,20 @@ def reduce_low_degree_buses_and_merge_parallel_lines(n: pypsa.Network) -> tuple[
     remaining static attributes from that same segment; by this point every Line
     shares a nominal voltage courtesy of ``convert_to_voltage_level``.
 
-    Two scalars are logged alongside the counts, one per kind of merge, because
-    both discard information no later stage can recover. Each is a
-    :func:`merge_heterogeneity` ratio -- a dimensionless mean coefficient of
-    variation over the merged groups, each group weighted by the ``s_nom`` at
-    stake in it, that is 0 when every merge pooled identical members:
+    One scalar is logged alongside the counts, because the series merge discards
+    information no later stage can recover. It is a :func:`merge_heterogeneity`
+    ratio over the ``s_nom`` of every segment in each collapsed *string*, not
+    each collapsed pair -- a dimensionless mean coefficient of variation, each
+    string weighted by the ``s_nom`` at stake in it, that is 0 when every string
+    pooled equally rated segments. A chain is collapsed two segments at a time
+    over as many passes as it is long, so provenance is carried on the surviving
+    Line and the string is banked only once it can grow no further (dropped as a
+    stub, or the fixed point is reached). The merged corridor takes the string's
+    *minimum* rating, so the ratio tracks the headroom written off on every wider
+    segment.
 
-    * **series** -- over the ``s_nom`` of every segment in each collapsed
-      *string*, not each collapsed pair. A chain is collapsed two segments at a
-      time over as many passes as it is long, so provenance is carried on the
-      surviving Line and the string is banked only once it can grow no further
-      (it is drained into a parallel bundle, dropped as a stub, or the fixed
-      point is reached). The merged corridor takes the string's *minimum*
-      rating, so this ratio tracks the headroom written off on every wider
-      segment. A segment that came out of a parallel merge counts once, at the
-      bundle's pooled rating, which is what it now is.
-    * **parallel** -- over the ``x * s_nom`` of every branch in each merged
-      bundle (see :func:`merge_parallel_lines`), the saturation angle the merge
-      is really pooling. 0 means every bundle's branches saturate together and
-      the merged corridor is rated at exactly their summed ``s_nom``; the ratio
-      grows as the narrowest-angle branch caps more of the bundle. Dispersion is
-      measured in saturation angle, but a bundle still weighs its summed
-      ``s_nom``, so this ratio and the series one weight groups alike.
-
-    Only the two ratios are logged, with the distribution of their per-group
-    contributions for context; the per-merge records behind them run to tens of
+    Only that ratio is logged, with the distribution of its per-string
+    contributions for context; the per-merge records behind it run to tens of
     thousands on the full network and are not emitted.
 
     Returns the reduced network and a busmap over the *original* bus index
@@ -1005,7 +851,7 @@ def reduce_low_degree_buses_and_merge_parallel_lines(n: pypsa.Network) -> tuple[
     min_cols = [c for c in ("s_nom", "s_nom_min", "s_nom_max") if c in n.lines.columns]
     sum_cols = [c for c in ("length", "capital_cost") if c in n.lines.columns]
 
-    parallel_merged = series_merged = stubs_removed = loops_removed = 0
+    series_merged = stubs_removed = loops_removed = 0
     link_endpoints_relocated = 0
     relocated_generators: set = set()
 
@@ -1018,8 +864,6 @@ def reduce_low_degree_buses_and_merge_parallel_lines(n: pypsa.Network) -> tuple[
     # `collapsed_strings` once it can grow no further.
     segment_ratings: dict[str, list[float]] = {}
     collapsed_strings: list[list[float]] = []
-    parallel_bundles: list[np.ndarray] = []
-    parallel_weights: list[np.ndarray] = []
     track_series = "s_nom" in min_cols
 
     def close_string(name: str) -> None:
@@ -1049,24 +893,6 @@ def reduce_low_degree_buses_and_merge_parallel_lines(n: pypsa.Network) -> tuple[
             loops_removed += len(self_loops)
             for name in self_loops:
                 close_string(name)
-            continue
-
-        parallel_groups: list = []
-        lines, n_parallel_groups = merge_parallel_lines(lines, min_cols, parallel_groups)
-        if n_parallel_groups:
-            n.lines = lines
-            parallel_merged += n_parallel_groups
-            for group in parallel_groups:
-                # Every branch in the bundle stops being extendable as a series
-                # string here; the bundle becomes one fresh segment rated by the
-                # parallel merge, which is what a later series merge should see.
-                for name in group["names"]:
-                    close_string(name)
-
-                finite = np.isfinite(group["x_s_nom"])
-                if finite.sum() > 1:
-                    parallel_bundles.append(group["x_s_nom"][finite])
-                    parallel_weights.append(group["s_nom"][finite])
             continue
 
         adj: dict = {}
@@ -1112,8 +938,23 @@ def reduce_low_degree_buses_and_merge_parallel_lines(n: pypsa.Network) -> tuple[
                 close_string(l1)
                 continue
 
-            # Parallel merging already ran this pass, so a degree-2 bus's two
-            # Lines can never lead to the same neighbour here.
+            # A degree-2 bus whose two Lines lead to the *same* neighbour is a
+            # double stub: nothing but that neighbour reaches it, so it folds in
+            # exactly like a degree-1 stub and both Lines go with it. Series
+            # merging them instead would produce a self-loop, and splitting the
+            # bus contents by the Kron factor would clone every one-port asset
+            # onto the one target only to have it summed back.
+            if len({b for _, b in edges}) == 1:
+                b1 = edges[0][1]
+                hand_over(bus, [(b1, 1.0)])
+                assignments[bus] = [(b1, 1.0)]
+                drop_lines.extend([name for name, _ in edges])
+                consumed.add(bus)
+                stubs_removed += 1
+                for name, _ in edges:
+                    close_string(name)
+                continue
+
             (l1, b1), (l2, b2) = edges
             row1, row2 = lines.loc[l1], lines.loc[l2]
             merged = row1.copy()
@@ -1146,9 +987,6 @@ def reduce_low_degree_buses_and_merge_parallel_lines(n: pypsa.Network) -> tuple[
                 # Concatenate provenance rather than the two current ratings: a
                 # segment that is itself a collapsed string contributes all of
                 # its own segments, so the banked string spans the whole chain.
-                # A segment that came out of a parallel merge has no entry and
-                # counts once, at the bundle's pooled rating -- which is what it
-                # now is, one segment of this string.
                 segment_ratings[min(l1, l2)] = segment_ratings.pop(
                     l1, [float(row1["s_nom"])],
                 ) + segment_ratings.pop(l2, [float(row2["s_nom"])])
@@ -1211,21 +1049,25 @@ def reduce_low_degree_buses_and_merge_parallel_lines(n: pypsa.Network) -> tuple[
     isolated = n.buses.index.difference(pd.Index(n.lines.bus0).union(n.lines.bus1))
     if len(isolated):
         logger.warning("%s buses left with no incident Line after reduction.", len(isolated))
+    duplicated = pd.Series(
+        list(zip(n.lines.bus0.where(n.lines.bus0 <= n.lines.bus1, n.lines.bus1),
+                 n.lines.bus1.where(n.lines.bus0 <= n.lines.bus1, n.lines.bus0))),
+    )
+    parallel_left = int((duplicated.value_counts() - 1).clip(lower=0).sum())
     logger.info(
-        "Reduced low-degree buses and parallel lines: %s parallel-line groups merged, "
-        "%s series merges, %s degree-1 stubs, %s self-loops dropped, %s Link endpoints relocated.",
-        parallel_merged,
+        "Reduced low-degree buses: %s series merges, %s stubs folded in, %s self-loops "
+        "dropped, %s Link endpoints relocated. %s Lines left sharing a bus pair.",
         series_merged,
         stubs_removed,
         loops_removed,
         link_endpoints_relocated,
+        parallel_left,
     )
     # Any string still standing at the fixed point is as long as it will get.
     for name in list(segment_ratings):
         close_string(name)
 
     series = merge_heterogeneity(collapsed_strings)
-    parallel = merge_heterogeneity(parallel_bundles, parallel_weights)
     logger.info(
         "Series s_nom heterogeneity = %.4f -- sum(std(s_nom) * segments) / sum(s_nom) "
         "over %s collapsed strings spanning %s segments. 0 means every string pooled "
@@ -1235,17 +1077,6 @@ def reduce_low_degree_buses_and_merge_parallel_lines(n: pypsa.Network) -> tuple[
         series.groups,
         series.members,
         summarize_distribution(series.coefficients_of_variation, "%.4f"),
-    )
-    logger.info(
-        "Parallel x*s_nom heterogeneity = %.4f -- s_nom-weighted mean of "
-        "std(x*s_nom) * branches / sum(x*s_nom) over %s merged bundles spanning "
-        "%s branches. 0 means every bundle pooled branches of equal saturation "
-        "angle, which merge losslessly into their summed s_nom. Per-bundle "
-        "contribution: %s.",
-        parallel.ratio,
-        parallel.groups,
-        parallel.members,
-        summarize_distribution(parallel.coefficients_of_variation, "%.4f"),
     )
     if zones is not None:
         surviving_zones = bus_zone_labels(n)
@@ -1867,7 +1698,7 @@ def plot_network_topology(
     Draw every bus and Line of the clustered network onto a map.
 
     This is a check on the reduction, not a presentation figure: after
-    ``reduce_low_degree_buses_and_merge_parallel_lines`` collapses the topology, the fastest way to see
+    ``reduce_low_degree_buses`` collapses the topology, the fastest way to see
     whether the surviving graph still looks like the grid it came from -- rather
     than a tangle of long-range shortcuts stitched between distant substations --
     is to look at it. Line width tracks ``s_nom`` so the transfer backbone stands
@@ -2084,7 +1915,7 @@ if __name__ == "__main__":
     n, contraction_busmap = contract_short_branches(n)
 
     if low_degree_reduction:
-        n, reduction_busmap = reduce_low_degree_buses_and_merge_parallel_lines(n)
+        n, reduction_busmap = reduce_low_degree_buses(n)
     else:
         logger.info("Low-degree reduction disabled; leaving degree-1/2 buses in place.")
         reduction_busmap = identity_busmap(n)

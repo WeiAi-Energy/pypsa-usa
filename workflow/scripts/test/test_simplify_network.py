@@ -17,8 +17,7 @@ from simplify_network import (
     clustering_from_busmap,
     contract_short_branches,
     identity_busmap,
-    merge_parallel_lines,
-    reduce_low_degree_buses_and_merge_parallel_lines,
+    reduce_low_degree_buses,
 )
 
 
@@ -88,7 +87,7 @@ def test_low_degree_bus_splits_capacity_and_averages_generator_attributes():
         index=n.snapshots,
     )
 
-    reduced, _ = reduce_low_degree_buses_and_merge_parallel_lines(n)
+    reduced, _ = reduce_low_degree_buses(n)
 
     # x(m-a)=1 and x(m-b)=3, so the Kron split is 3/4 to a and 1/4 to b.
     assert reduced.buses.at["a", "Pd"] == 60.0
@@ -108,11 +107,8 @@ def test_low_degree_bus_splits_capacity_and_averages_generator_attributes():
 
 
 def test_series_merge_sums_length_and_capital_cost():
-    """A merged corridor costs what both of its segments cost, and a fresh
-    parallel pair created by that merge (`m`'s series merge lands on `a`-`b`,
-    which already has its own direct Line) is itself merged before the
-    reduction settles -- proving the loop iterates to a joint fixed point
-    rather than stopping after the first kind of reduction it finds."""
+    """A merged corridor costs what both of its segments cost and is rated at the
+    narrower of the two."""
     n = _network_with_degree_two_bus()
     # $/MW proportional to length, as `update_transmission_costs` builds it.
     n.lines["capital_cost"] = n.lines.length * 7.0
@@ -120,117 +116,63 @@ def test_series_merge_sums_length_and_capital_cost():
     n.lines.loc["line_1", "capital_cost"] = 21.0
     n.lines.loc["line_1", "s_nom"] = 60.0
 
-    reduced, _ = reduce_low_degree_buses_and_merge_parallel_lines(n)
+    reduced, _ = reduce_low_degree_buses(n)
 
-    # m-a and m-b combine in series into a new a-b Line (x=4, s_nom=60, the
-    # narrower of the two), which then merges as a parallel pair with the
-    # pre-existing a-b Line (line_2: x=2, s_nom=100) -- there is only one
-    # Line left between a and b, and no bus in the K4 core dropped below
-    # degree 3.
-    assert (reduced.lines.bus0.isin(["a", "b"]) & reduced.lines.bus1.isin(["a", "b"])).sum() == 1
     merged = reduced.lines.loc["line_0"]
     assert {merged.bus0, merged.bus1} == {"a", "b"}
-    # x_parallel = 1 / (1/4 + 1/2) = 4/3; r combines the same way (0.2 and 0.1).
-    np.testing.assert_allclose(merged.x, 4 / 3)
-    np.testing.assert_allclose(merged.r, 1 / 15)
-    # The series segment saturates at 60*4/(4/3)=180; the direct Line at
-    # 100*2/(4/3)=150 -- the direct Line binds.
-    np.testing.assert_allclose(merged.s_nom, 150.0)
-    # Parallel circuits run the same route, so length averages rather than sums.
-    np.testing.assert_allclose(merged.length, 2.5)
-    # Capacity-weighted average of the two segments' cost: (28*60 + 7*100) / 160.
-    np.testing.assert_allclose(merged.capital_cost, 14.875)
+    np.testing.assert_allclose(merged.x, 4.0)  # 1 + 3
+    np.testing.assert_allclose(merged.r, 0.2)  # 0.1 + 0.1
+    np.testing.assert_allclose(merged.s_nom, 60.0)  # the narrower section
+    np.testing.assert_allclose(merged.length, 4.0)  # 1 + 3
+    np.testing.assert_allclose(merged.capital_cost, 28.0)  # 7 + 21
 
 
-def test_merge_parallel_lines_sets_capacity_from_whichever_branch_saturates_first():
-    """Direct unit check of the parallel-merge formula, independent of the
-    low-degree-bus machinery above."""
-    lines = pd.DataFrame(
-        {
-            "bus0": ["p", "p"],
-            "bus1": ["q", "q"],
-            "x": [1.0, 2.0],
-            "r": [1.0, 2.0],
-            "s_nom": [100.0, 100.0],
-            "length": [10.0, 12.0],
-            "capital_cost": [50.0, 40.0],
-        },
-        index=["line_p", "line_q"],
-    )
+def test_parallel_lines_left_by_a_series_merge_are_not_merged():
+    """`m`'s series merge lands on `a`-`b`, which already has its own direct Line.
 
-    merged, n_groups = merge_parallel_lines(lines, ["s_nom"])
-
-    assert n_groups == 1
-    assert len(merged) == 1
-    row = merged.iloc[0]
-    # x_parallel = 1 / (1/1 + 1/2) = 2/3; r combines the same way.
-    np.testing.assert_allclose(row.x, 2 / 3)
-    np.testing.assert_allclose(row.r, 2 / 3)
-    # line_p saturates at 100*1/(2/3)=150 before line_q does at 100*2/(2/3)=300.
-    np.testing.assert_allclose(row.s_nom, 150.0)
-    np.testing.assert_allclose(row.length, 11.0)
-    # Capacity-weighted: both segments carry the same s_nom, so it is a plain mean.
-    np.testing.assert_allclose(row.capital_cost, 45.0)
-
-
-def test_merge_parallel_lines_identical_lines_double_the_capacity():
-    """Sanity check against the wrong formula: min(s_nom_i / x_i) / x_parallel
-    would *halve* two identical lines' combined rating instead of doubling it."""
-    lines = pd.DataFrame(
-        {
-            "bus0": ["p", "p"],
-            "bus1": ["q", "q"],
-            "x": [1.0, 1.0],
-            "r": [0.1, 0.1],
-            "s_nom": [100.0, 100.0],
-        },
-        index=["line_p", "line_q"],
-    )
-
-    merged, _ = merge_parallel_lines(lines, ["s_nom"])
-
-    row = merged.iloc[0]
-    np.testing.assert_allclose(row.x, 0.5)
-    np.testing.assert_allclose(row.s_nom, 200.0)
-
-
-def test_bus_with_a_dc_link_relocates_wholesale_to_the_majority_neighbour():
-    """A degree-two bus carrying a Link is reduced like any other; the Link
-    moves entirely to the neighbour with the larger Kron share rather than
-    splitting or holding the bus out of the reduction."""
+    Both survive with their own attributes: an SSSC can then be sited on either,
+    which is what lets it rebalance the split. Merging them would rate the pair at
+    ``min(x_i s_nom_i) / x_parallel`` and write that headroom off.
+    """
     n = _network_with_degree_two_bus()
-    n.add("Link", "hvdc", bus0="m", bus1="c", p_nom=40.0)
 
-    reduced, busmap = reduce_low_degree_buses_and_merge_parallel_lines(n)
+    reduced, _ = reduce_low_degree_buses(n)
 
-    # x(m-a)=1 and x(m-b)=3, so `a` gets the majority (3/4) Kron share.
-    assert "m" not in reduced.buses.index
-    assert busmap.at["m"] == "a"
-    # Its two Lines combine in series, same as the no-Link case.
-    merged = reduced.lines.loc["line_0"]
-    assert {merged.bus0, merged.bus1} == {"a", "b"}
-    hvdc = reduced.links.loc["hvdc"]
-    assert (hvdc.bus0, hvdc.bus1) == ("a", "c")
-    assert hvdc.p_nom == 40.0
-    # Demand weight still splits 3/4 to `a`, 1/4 to `b`, same as without a Link.
-    assert reduced.buses.at["a", "Pd"] == 60.0
-    assert reduced.buses.at["b", "Pd"] == 20.0
+    a_b = reduced.lines[reduced.lines.bus0.isin(["a", "b"]) & reduced.lines.bus1.isin(["a", "b"])]
+    assert len(a_b) == 2
+    assert set(a_b.index) == {"line_0", "line_2"}
+    # the series merge of m-a (x=1) and m-b (x=3), and the untouched direct Line
+    np.testing.assert_allclose(sorted(a_b.x), [2.0, 4.0])
+    # no bus in the K4 core dropped below degree 3, so nothing else moved
+    assert set(reduced.buses.index) == {"a", "b", "c", "d"}
 
 
-def test_link_stranded_as_a_self_loop_is_dropped():
-    """If both of a Link's endpoints relocate onto the same surviving bus,
-    the Link is a self-loop and gets dropped rather than left invalid."""
+def test_degree_two_bus_with_both_lines_to_one_neighbour_folds_in_as_a_stub():
+    """A double stub has no series merge to make -- it folds in whole.
+
+    Reaching the degree-2 branch with both Lines on one neighbour, a series merge
+    would produce a self-loop and the Kron split would clone every one-port asset
+    onto its single target.
+    """
     n = _network_with_degree_two_bus()
-    # `c` is degree-2 within the K4 core's Line set once `m`'s pair is added;
-    # instead, force the self-loop directly by landing both Link ends on `m`
-    # and `m`'s sole reduction target.
-    n.add("Link", "hvdc", bus0="m", bus1="a", p_nom=40.0)
+    n.lines.loc["line_1", "bus1"] = "a"  # both of m's Lines now lead to a
+    n.add("Generator", "gen_m", bus="m", carrier="onwind", p_nom=90.0, p_nom_max=90.0)
+    n.add("Load", "load_m", bus="m", p_set=25.0)
 
-    reduced, busmap = reduce_low_degree_buses_and_merge_parallel_lines(n)
+    reduced, busmap = reduce_low_degree_buses(n)
 
     assert "m" not in reduced.buses.index
     assert busmap.at["m"] == "a"
-    assert "hvdc" not in reduced.links.index
+    assert reduced.buses.at["a", "Pd"] == 80.0  # the whole weight, not a Kron share
+    assert {"line_0", "line_1"}.isdisjoint(reduced.lines.index)
+    assert len(reduced.lines) == 6
+    # moved wholesale rather than split into clones
+    assert list(reduced.generators.index) == ["gen_m"]
+    assert reduced.generators.at["gen_m", "bus"] == "a"
+    np.testing.assert_allclose(reduced.generators.at["gen_m", "p_nom"], 90.0)
+    assert list(reduced.loads.index) == ["load_m"]
+    assert reduced.loads.at["load_m", "bus"] == "a"
+    np.testing.assert_allclose(reduced.loads.at["load_m", "p_set"], 25.0)
 
 
 def _grid_network(rows=3, columns=6, split_column=3):
@@ -535,7 +477,7 @@ def test_short_branch_contraction_merges_the_two_substations():
 def test_short_branch_contraction_reaches_endpoints_the_low_degree_pass_cannot():
     """A short tie between two degree-three buses: a no-op for the degree-1/2
     rule at any length, which is why this is a separate pass."""
-    untouched, low_degree_busmap = reduce_low_degree_buses_and_merge_parallel_lines(_short_tie_in_a_k4())
+    untouched, low_degree_busmap = reduce_low_degree_buses(_short_tie_in_a_k4())
     assert len(untouched.buses) == 4
     assert untouched.lines.length.min() == pytest.approx(0.05)
     assert (low_degree_busmap == low_degree_busmap.index).all()
@@ -546,17 +488,22 @@ def test_short_branch_contraction_reaches_endpoints_the_low_degree_pass_cannot()
     assert busmap["b"] == "a"
 
 
-def test_short_branch_contraction_merges_the_parallel_lines_it_creates():
-    """Collapsing a-b in a K4 doubles up a-c/b-c and a-d/b-d; with
-    ``low_degree_reduction`` off nothing else would merge them."""
+def test_short_branch_contraction_leaves_the_parallel_lines_it_creates():
+    """Collapsing a-b in a K4 doubles up a-c/b-c and a-d/b-d, and both survive.
+
+    Pooling them would rate each pair at ``min(x_i s_nom_i) / x_parallel`` and
+    write off the headroom an SSSC could unlock by rebalancing the split.
+    """
     n, _ = contract_short_branches(_short_tie_in_a_k4())
 
     pairs = [tuple(sorted(pair)) for pair in zip(n.lines.bus0, n.lines.bus1)]
-    assert len(pairs) == len(set(pairs)) == 3
+    assert len(pairs) == 5
+    assert sorted(pairs) == [("a", "c"), ("a", "c"), ("a", "d"), ("a", "d"), ("c", "d")]
     assert (n.lines.bus0 != n.lines.bus1).all()
-    # Two identical-x parallel branches merge to their summed rating.
-    merged = n.lines[(n.lines.bus0 == "a") | (n.lines.bus1 == "a")]
-    assert (merged.s_nom > 100.0).all()
+    # Each keeps its own reactance and rating, so an SSSC can be sited on either.
+    np.testing.assert_allclose(sorted(n.lines.loc[[i for i, p in zip(n.lines.index, pairs)
+                                                   if p == ("a", "c")], "x"]), [0.35, 0.4])
+    assert (n.lines.s_nom == 100.0).all()
 
 
 def test_short_branch_contraction_collapses_a_chain_of_short_lines_at_once():

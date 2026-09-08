@@ -116,7 +116,7 @@ def build_allocation(buses: pd.DataFrame, states: pd.Index) -> pd.DataFrame:
     network the demand is about to be attached to, rather than re-deriving it
     from the base network via the busmap, keeps the allocation consistent with
     every other consumer of ``Pd`` -- notably the zero-injection test in
-    ``reduce_low_degree_buses_and_merge_parallel_lines``, which decides which buses survive at all.
+    ``reduce_low_degree_buses``, which decides which buses survive at all.
 
     The state key is ``reeds_state``, the same key the policy constraints use.
     It disagrees with the base network's ``state`` attribute on a small number
