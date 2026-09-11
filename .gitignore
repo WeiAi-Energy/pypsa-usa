@@ -270,3 +270,6 @@ connect.sh
 /workflow/config/config.cluster.yaml
 /workflow/repo_data/dag.png
 !.pre-commit-config.yaml
+
+# Local figure scripts (not tracked)
+/workflow/scripts/make_figure/
