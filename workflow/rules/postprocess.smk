@@ -73,9 +73,9 @@ rule plot_statistics:
             "statistics",
             figure="global_constraints.csv",
         ),
-        sssc_capacity_by_nerc=result_figure_path(
+        sssc_capacity_by_trans_grp=result_figure_path(
             "statistics",
-            figure="sssc_capacity_by_nerc.csv",
+            figure="sssc_capacity_by_trans_grp.csv",
         ),
     log:
         CASE_LOGS + "plot_figures/plot_statistics.log",

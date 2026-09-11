@@ -16,7 +16,7 @@ from plot_statistics import (
     _sort_area_plot_columns_by_variability,
     _split_mixed_sign_area_series,
     get_carrier_cost_breakdown,
-    get_sssc_capacity_by_nerc_region,
+    get_sssc_capacity_by_trans_grp,
     normalize_line_x_statistics_columns,
 )
 
@@ -101,11 +101,11 @@ def test_calculate_line_x_capex_counts_sssc_when_line_is_not_extendable():
     assert sssc_capex.to_dict() == {"Ac SSSC": 20.0}
 
 
-def test_get_sssc_capacity_by_nerc_region_splits_cross_region_lines_evenly():
+def test_get_sssc_capacity_by_trans_grp_splits_cross_region_lines_evenly():
     n = SimpleNamespace(
         buses=pd.DataFrame(
             {
-                "nerc_reg": ["PJM", "PJM", "PJM", "NPCC_NE", "ERCOT"],
+                "trans_grp": ["PJM_East", "PJM_East", "PJM_East", "ISONE", "ERCOT"],
             },
             index=["pjm1", "pjm2", "pjm3", "ne1", "ercot1"],
         ),
@@ -119,24 +119,24 @@ def test_get_sssc_capacity_by_nerc_region_splits_cross_region_lines_evenly():
         ),
     )
 
-    result = get_sssc_capacity_by_nerc_region(n)
+    result = get_sssc_capacity_by_trans_grp(n)
 
-    assert list(result.index) == ["ERCOT", "NPCC_NE", "PJM"]
-    assert result["sssc_capacity_mw"].to_dict() == {"ERCOT": 0.0, "NPCC_NE": 3.0, "PJM": 13.0}
-    assert result.loc["PJM", "pct_of_national_total"] == pytest.approx(81.25)
-    assert result.loc["NPCC_NE", "pct_of_national_total"] == pytest.approx(18.75)
+    assert list(result.index) == ["ERCOT", "ISONE", "PJM_East"]
+    assert result["sssc_capacity_mw"].to_dict() == {"ERCOT": 0.0, "ISONE": 3.0, "PJM_East": 13.0}
+    assert result.loc["PJM_East", "pct_of_national_total"] == pytest.approx(81.25)
+    assert result.loc["ISONE", "pct_of_national_total"] == pytest.approx(18.75)
     assert result.loc["ERCOT", "pct_of_national_total"] == pytest.approx(0.0)
 
 
-def test_get_sssc_capacity_by_nerc_region_handles_missing_line_xs():
+def test_get_sssc_capacity_by_trans_grp_handles_missing_line_xs():
     n = SimpleNamespace(
-        buses=pd.DataFrame({"nerc_reg": ["PJM", "ERCOT"]}, index=["pjm1", "ercot1"]),
+        buses=pd.DataFrame({"trans_grp": ["PJM_East", "ERCOT"]}, index=["pjm1", "ercot1"]),
         line_xs=pd.DataFrame(),
     )
 
-    result = get_sssc_capacity_by_nerc_region(n)
+    result = get_sssc_capacity_by_trans_grp(n)
 
-    assert list(result.index) == ["ERCOT", "PJM"]
+    assert list(result.index) == ["ERCOT", "PJM_East"]
     assert (result["sssc_capacity_mw"] == 0.0).all()
     assert (result["pct_of_national_total"] == 0.0).all()
 

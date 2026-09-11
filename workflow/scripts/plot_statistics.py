@@ -861,29 +861,32 @@ def get_currently_installed_capacity(n: pypsa.Network) -> pd.DataFrame:
     return existing_capacity.groupby(level=[0, 1]).sum()
 
 
-def get_sssc_capacity_by_nerc_region(n: pypsa.Network) -> pd.DataFrame:
-    """Return optimal SSSC capacity (MW) and its share of the national total by NERC region.
+def get_sssc_capacity_by_trans_grp(n: pypsa.Network) -> pd.DataFrame:
+    """Return optimal SSSC capacity (MW) and its share of the national total by transmission group.
 
-    Each LineX's optimal SSSC capacity (sssc_nom_opt) is split evenly between the NERC
-    regions of its two terminal buses, so a line entirely within one region has all of its
-    capacity counted there, while a line crossing regions has half counted in each. NERC
-    regions are listed in a fixed (alphabetical) order.
+    Each LineX's optimal SSSC capacity (sssc_nom_opt) is split evenly between the transmission
+    groups (``trans_grp``) of its two terminal buses, so a line entirely within one group has all
+    of its capacity counted there, while a line crossing groups has half counted in each.
+    Transmission group is the unit here for the same reason the ERM requirement uses it: it is the
+    granularity at which the grid is actually planned and operated (one per ISO/RTO, with MISO and
+    SPP split into their sub-regions), unlike ``nerc_reg`` which cross-cuts it. Groups are listed
+    in a fixed (alphabetical) order.
     """
-    nerc_regions = sorted(r for r in n.buses["nerc_reg"].dropna().unique() if str(r).strip())
+    trans_grps = sorted(r for r in n.buses["trans_grp"].dropna().unique() if str(r).strip())
 
     line_xs = getattr(n, "line_xs", pd.DataFrame())
     if line_xs.empty or not {"bus0", "bus1"}.issubset(line_xs.columns):
-        capacity = pd.Series(0.0, index=nerc_regions)
+        capacity = pd.Series(0.0, index=trans_grps)
     else:
         sssc_nom_opt = line_xs.get("sssc_nom_opt", pd.Series(0.0, index=line_xs.index, dtype=float)).fillna(0.0)
         half_capacity = sssc_nom_opt / 2.0
-        bus0_reg = line_xs["bus0"].map(n.buses["nerc_reg"])
-        bus1_reg = line_xs["bus1"].map(n.buses["nerc_reg"])
+        bus0_grp = line_xs["bus0"].map(n.buses["trans_grp"])
+        bus1_grp = line_xs["bus1"].map(n.buses["trans_grp"])
         capacity = (
-            pd.concat([half_capacity.groupby(bus0_reg).sum(), half_capacity.groupby(bus1_reg).sum()])
+            pd.concat([half_capacity.groupby(bus0_grp).sum(), half_capacity.groupby(bus1_grp).sum()])
             .groupby(level=0)
             .sum()
-            .reindex(nerc_regions)
+            .reindex(trans_grps)
             .fillna(0.0)
         )
 
@@ -895,7 +898,7 @@ def get_sssc_capacity_by_nerc_region(n: pypsa.Network) -> pd.DataFrame:
             "sssc_capacity_mw": capacity.round(3),
             "pct_of_national_total": share_pct.round(3),
         },
-    ).rename_axis("nerc_region")
+    ).rename_axis("trans_grp")
 
 
 def get_statistics(n, column_name):
@@ -2320,7 +2323,7 @@ if __name__ == "__main__":
     )
     build_statistics_summary_table(n).round(4).to_csv(snakemake.output.statistics_summary)
     get_carrier_cost_breakdown(n).round(4).to_csv(snakemake.output.cost_breakdown)
-    get_sssc_capacity_by_nerc_region(n).to_csv(snakemake.output.sssc_capacity_by_nerc)
+    get_sssc_capacity_by_trans_grp(n).to_csv(snakemake.output.sssc_capacity_by_trans_grp)
     n.generators.to_csv(snakemake.output.generators)
     n.storage_units.to_csv(snakemake.output.storage_units)
     n.links.to_csv(snakemake.output.links)
