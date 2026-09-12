@@ -298,90 +298,62 @@ def get_interconnect(wildcards=None, cfg=None):
     return str(interconnect)
 
 
-def representative_periods_config():
+def representative_periods_config(wildcards=None, cfg=None):
     """
-    Return the shared representative-period settings.
+    Return the representative-period settings for the current case.
 
-    These are deliberately read from the top-level config rather than per case.
-    Representative-period selection and renewable profiles are upstream shared
-    resources, so their snapshots must be identical across cases.
-    ``validate_shared_representative_periods`` warns if a case overrides them.
+    Selection is case-scoped, so a case may override
+    ``clustering.temporal.representative_periods`` freely; the resulting
+    snapshots live under that case's own resource directory.
     """
-    return config.get("clustering", {}).get("temporal", {}).get("representative_periods", {}) or {}
+    if cfg is None:
+        cfg = config_for_wildcards(wildcards) if wildcards is not None else config
+    return cfg.get("clustering", {}).get("temporal", {}).get("representative_periods", {}) or {}
 
 
-def representative_periods_enabled():
-    """Return whether representative-period selection is active."""
-    return bool(representative_periods_config().get("enable", False))
+def representative_periods_enabled(wildcards=None, cfg=None):
+    """Return whether representative-period selection is active for this case."""
+    return bool(representative_periods_config(wildcards, cfg=cfg).get("enable", False))
 
 
-def representative_periods_planning_horizons():
-    """
-    Return the shared planning horizon driving representative-period selection.
-
-    Read from the top-level config, not per case, because the selection remains a
-    shared upstream resource.
-    """
-    return config.get("scenario", {}).get("planning_horizons", [])
-
-
-def validate_shared_representative_periods():
-    """Warn when a case config overrides the shared representative-period settings."""
-    shared = representative_periods_config()
-    for case_name in config.get("cases", {}):
-        case_setting = (
-            case_config(case_name)
-            .get("clustering", {})
-            .get("temporal", {})
-            .get("representative_periods", {})
-            or {}
-        )
-        if case_setting != shared:
-            smk_logger.warning(
-                "Case %s overrides clustering.temporal.representative_periods, but the setting is "
-                "shared across cases and the override is ignored. Shared value: %s",
-                case_name,
-                shared,
-            )
+def representative_periods_planning_horizons(wildcards=None, cfg=None):
+    """Return the case's planning horizon driving representative-period selection."""
+    if cfg is None:
+        cfg = config_for_wildcards(wildcards) if wildcards is not None else config
+    return cfg.get("scenario", {}).get("planning_horizons", [])
 
 
 def demand_level_for_wildcards(wildcards, cfg=None):
-    """Resolve the demand level: use the rule's own wildcard if it carries one,
-    otherwise infer it from the case config.
+    """Resolve the demand level from the case config.
 
-    Only the shared resources under ``RESOURCES`` are keyed by demand level, and
-    just the two rules writing them carry a `demand_level` wildcard.  Everything
-    case-scoped resolves the level from the case config instead, because within a
-    case the level is fixed and does not belong in the path."""
-    if "demand_level" in wildcards.keys():
-        return wildcards.demand_level
+    Every rule that depends on the demand level is case-scoped, and within a case
+    the level is fixed, so it is read from the config rather than carried in a
+    wildcard or a path segment."""
     if cfg is None:
         cfg = config_for_wildcards(wildcards)
     return cfg.get("scenario", {}).get("demand_level", "High")
 
 
 def representative_periods_dir(wildcards, cfg=None):
-    """Return the demand-level-scoped representative-period output directory."""
-    level = demand_level_for_wildcards(wildcards, cfg=cfg)
-    return RESOURCES + f"{level}Dmd/representative_periods/"
+    """Return the case-specific representative-period output directory."""
+    return case_resource_dir(wildcards) + "representative_periods/"
 
 
 def renewable_profile_path(wildcards, technology, cfg=None):
-    """Return the shared, demand-level-scoped renewable profile for a technology."""
-    level = demand_level_for_wildcards(wildcards, cfg=cfg)
-    return RESOURCES + f"{level}Dmd/profile_{technology}.nc"
+    """Return the case-specific renewable profile for a technology."""
+    return case_resource_dir(wildcards) + f"profile_{technology}.nc"
 
 
 def representative_snapshots_input(wildcards):
     """Snapshot-definition input, empty when representative periods are disabled."""
-    if not representative_periods_enabled():
+    if not representative_periods_enabled(wildcards):
         return {}
     return {"representative_snapshots": representative_periods_dir(wildcards) + "snapshots.csv"}
 
 
 def representative_metadata_input(wildcards):
     """Snapshot definition plus JSON metadata, empty when disabled."""
-    if not representative_periods_enabled():
+    if not representative_periods_enabled(wildcards):
         return {}
     return {
         "representative_metadata": representative_periods_dir(wildcards) + "metadata.json",
@@ -401,7 +373,7 @@ def temperature_derate_input(wildcards):
     selected source hours only. With representative periods disabled there is no
     derate at all -- the old static summer/winter derate has been removed.
     """
-    if not representative_periods_enabled():
+    if not representative_periods_enabled(wildcards):
         return {}
     return {
         "region_temperature": region_temperature_path(wildcards),

@@ -139,13 +139,11 @@ rule build_renewable_profiles:
     output:
         # Profiles remain keyed to raw buses.  They are attached once and
         # aggregated by the downstream simplify/cluster stages.
-        profile=RESOURCES + "{demand_level}Dmd/profile_{technology}.nc",
+        profile=CASE_RESOURCES + "profile_{technology}.nc",
     log:
-        LOGS
-        + "{demand_level}Dmd/build_renewable_profile_{technology}.log",
+        CASE_LOGS + "build_renewable_profile_{technology}.log",
     benchmark:
-        BENCHMARKS
-        + "{demand_level}Dmd/build_renewable_profiles_{technology}"
+        CASE_BENCHMARKS + "build_renewable_profiles_{technology}"
     threads: 1
     resources:
         mem_mb=16000,
@@ -154,7 +152,6 @@ rule build_renewable_profiles:
         ),
     wildcard_constraints:
         technology="onwind|offwind|offwind_floating|solar",
-        demand_level="Low|Mid|High",
     script:
         "../scripts/build_reeds_renewable_profiles.py"
 
@@ -171,9 +168,6 @@ def eer_demand_file_for_wildcards(wildcards):
     return DATA + "eer/" + EER_DEMAND_FILES[demand_level_for_wildcards(wildcards)]
 
 
-validate_shared_representative_periods()
-
-
 def representative_periods_reeds_files(wildcards):
     """
     Raw ReEDS supply curves and CF tables feeding the national clustering features.
@@ -182,7 +176,7 @@ def representative_periods_reeds_files(wildcards):
     directly. ``offwind`` and ``offwind_floating`` share one ReEDS technology, so
     the set is deduplicated.
     """
-    carriers = config["electricity"]["renewable_carriers"]
+    carriers = config_for_wildcards(wildcards)["electricity"]["renewable_carriers"]
     techs = {
         "offwind" if tech.startswith("offwind") else tech
         for tech in carriers
@@ -196,26 +190,23 @@ def representative_periods_reeds_files(wildcards):
 
 
 rule select_representative_periods:
-    wildcard_constraints:
-        demand_level="Low|Mid|High",
     params:
-        representative_periods=lambda wildcards: representative_periods_config(),
-        planning_horizons=lambda wildcards: representative_periods_planning_horizons(),
+        representative_periods=representative_periods_config,
+        planning_horizons=representative_periods_planning_horizons,
         renewable_weather_years=config_provider("renewable_weather_years"),
-        renewable_carriers=lambda wildcards: config["electricity"]["renewable_carriers"],
+        renewable_carriers=config_provider("electricity", "renewable_carriers"),
         reeds_vre_dir=DATA + "ReEDS_VRE",
     input:
         reeds_vre_files=representative_periods_reeds_files,
         electricity_demand=eer_demand_file_for_wildcards,
     output:
-        snapshots=RESOURCES
-        + "{demand_level}Dmd/representative_periods/snapshots.csv",
-        metadata=RESOURCES
-        + "{demand_level}Dmd/representative_periods/metadata.json",
-        plot=RESOURCES
-        + "{demand_level}Dmd/representative_periods/profiles.png",
+        snapshots=CASE_RESOURCES + "representative_periods/snapshots.csv",
+        metadata=CASE_RESOURCES + "representative_periods/metadata.json",
+        plot=CASE_RESOURCES + "representative_periods/profiles.png",
     log:
-        LOGS + "{demand_level}Dmd/select_representative_periods.log",
+        CASE_LOGS + "select_representative_periods.log",
+    benchmark:
+        CASE_BENCHMARKS + "select_representative_periods"
     threads: 1
     resources:
         mem_mb=16000,
