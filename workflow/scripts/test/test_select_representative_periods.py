@@ -16,8 +16,8 @@ from build_reeds_renewable_profiles import (
 )
 from select_representative_periods import (
     LOAD_FEATURE,
-    NET_LOAD_SOLAR_COLUMN,
-    NET_LOAD_WIND_COLUMN,
+    NET_LOAD_SUMMER_COLUMN,
+    NET_LOAD_WINTER_COLUMN,
     SOLAR_FEATURE,
     SUMMER_MONTHS,
     WIND_FEATURE,
@@ -148,29 +148,40 @@ def _seasonal_feature_frame(columns):
     return _feature_frame(columns, periods=4)
 
 
-def test_extreme_ranking_columns_are_normalized_demand_minus_capacity_factor():
-    """Load is min-max normalized onto [0, 1] before the capacity factor is subtracted."""
+def _by_max(values):
+    """Scale a list by its maximum, the way the ranking columns do."""
+    high = max(values)
+    return [value / high for value in values]
+
+
+def test_extreme_ranking_columns_are_normalized_demand_minus_both_normalized_capacity_factors():
+    """Load and both capacity factors are divided by their own maximum, then differenced."""
     feature_t = _seasonal_feature_frame([WIND_FEATURE, SOLAR_FEATURE, LOAD_FEATURE])
     feature_t[LOAD_FEATURE] = [100.0, 200.0, 300.0, 400.0]
-    feature_t[SOLAR_FEATURE] = [0.1, 0.2, 0.3, 0.4]
-    feature_t[WIND_FEATURE] = [0.5, 0.5, 0.5, 0.5]
+    feature_t[SOLAR_FEATURE] = [0.1, 0.2, 0.3, 0.7]
+    feature_t[WIND_FEATURE] = [0.5, 0.5, 0.7, 0.9]
 
     ranked, ranking_columns = add_extreme_ranking_columns(feature_t, _SEASONAL_SOURCE_HOURS, 2)
 
-    assert ranking_columns == [NET_LOAD_SOLAR_COLUMN, NET_LOAD_WIND_COLUMN]
-    load_normalized = [0.0, 1 / 3, 2 / 3, 1.0]
-    solar_residual = [load - cf for load, cf in zip(load_normalized, [0.1, 0.2, 0.3, 0.4])]
-    wind_residual = [load - 0.5 for load in load_normalized]
+    assert ranking_columns == [NET_LOAD_SUMMER_COLUMN, NET_LOAD_WINTER_COLUMN]
+    load_normalized = [0.25, 0.5, 0.75, 1.0]
+    residual = [
+        load - solar - wind
+        for load, solar, wind in zip(
+            load_normalized,
+            _by_max([0.1, 0.2, 0.3, 0.7]),
+            _by_max([0.5, 0.5, 0.7, 0.9]),
+        )
+    ]
 
-    # The summer column keeps the July period and buries the January one a full range
-    # below the series minimum; the winter column does the mirror image.
-    solar_sentinel = min(solar_residual) - (max(solar_residual) - min(solar_residual)) - 1.0
-    wind_sentinel = min(wind_residual) - (max(wind_residual) - min(wind_residual)) - 1.0
-    assert ranked[NET_LOAD_SOLAR_COLUMN].tolist() == pytest.approx(
-        solar_residual[:2] + [solar_sentinel, solar_sentinel],
+    # Both columns carry the same residual load; the summer one keeps the July period and
+    # buries the January one a full range below the series minimum, the winter one mirrors it.
+    sentinel = min(residual) - (max(residual) - min(residual)) - 1.0
+    assert ranked[NET_LOAD_SUMMER_COLUMN].tolist() == pytest.approx(
+        residual[:2] + [sentinel, sentinel],
     )
-    assert ranked[NET_LOAD_WIND_COLUMN].tolist() == pytest.approx(
-        [wind_sentinel, wind_sentinel] + wind_residual[2:],
+    assert ranked[NET_LOAD_WINTER_COLUMN].tolist() == pytest.approx(
+        [sentinel, sentinel] + residual[2:],
     )
     # The source features must survive untouched alongside the ranking columns.
     assert ranked[LOAD_FEATURE].tolist() == [100.0, 200.0, 300.0, 400.0]
@@ -186,7 +197,7 @@ def test_extreme_ranking_column_sentinel_cannot_win_the_ranking():
 
     ranked, _ = add_extreme_ranking_columns(feature_t, _SEASONAL_SOURCE_HOURS, 2)
 
-    period_means = ranked[NET_LOAD_SOLAR_COLUMN].to_numpy().reshape(2, 2).mean(axis=1)
+    period_means = ranked[NET_LOAD_SUMMER_COLUMN].to_numpy().reshape(2, 2).mean(axis=1)
     assert period_means[0] > period_means[1]
 
 
@@ -201,14 +212,20 @@ def test_period_season_mask_assigns_a_straddling_block_to_its_majority_season():
     assert period_season_mask(hours, 8, WINTER_MONTHS).tolist() == [False]
 
 
-def test_extreme_ranking_columns_skip_a_missing_capacity_factor_feature():
-    """A ranking column for a carrier that is not modelled is dropped, not fatal."""
+def test_extreme_ranking_columns_drop_a_missing_capacity_factor_from_residual_load():
+    """A carrier that is not modelled leaves the residual load, but both seasons survive."""
     feature_t = _seasonal_feature_frame([SOLAR_FEATURE, LOAD_FEATURE])
+    feature_t[LOAD_FEATURE] = [100.0, 200.0, 300.0, 400.0]
+    feature_t[SOLAR_FEATURE] = [0.1, 0.2, 0.3, 0.7]
 
     ranked, ranking_columns = add_extreme_ranking_columns(feature_t, _SEASONAL_SOURCE_HOURS, 2)
 
-    assert ranking_columns == [NET_LOAD_SOLAR_COLUMN]
-    assert NET_LOAD_WIND_COLUMN not in ranked.columns
+    assert ranking_columns == [NET_LOAD_SUMMER_COLUMN, NET_LOAD_WINTER_COLUMN]
+    solar_only = [
+        load - solar
+        for load, solar in zip([0.25, 0.5, 0.75, 1.0], _by_max([0.1, 0.2, 0.3, 0.7]))
+    ]
+    assert ranked[NET_LOAD_SUMMER_COLUMN].tolist()[:2] == pytest.approx(solar_only[:2])
 
 
 def test_extreme_ranking_columns_skip_a_season_with_no_candidate_period():
@@ -220,8 +237,32 @@ def test_extreme_ranking_columns_skip_a_season_with_no_candidate_period():
 
     ranked, ranking_columns = add_extreme_ranking_columns(feature_t, july_only, 2)
 
-    assert ranking_columns == [NET_LOAD_SOLAR_COLUMN]
-    assert NET_LOAD_WIND_COLUMN not in ranked.columns
+    assert ranking_columns == [NET_LOAD_SUMMER_COLUMN]
+    assert NET_LOAD_WINTER_COLUMN not in ranked.columns
+
+
+def test_extreme_ranking_columns_drop_a_degenerate_capacity_factor_from_residual_load():
+    """A capacity factor that never moves carries no ranking signal, so it leaves the metric."""
+    feature_t = _seasonal_feature_frame([WIND_FEATURE, SOLAR_FEATURE, LOAD_FEATURE])
+    feature_t[LOAD_FEATURE] = [100.0, 200.0, 300.0, 400.0]
+    feature_t[SOLAR_FEATURE] = [0.1, 0.2, 0.3, 0.7]
+    feature_t[WIND_FEATURE] = 0.4
+
+    ranked, ranking_columns = add_extreme_ranking_columns(feature_t, _SEASONAL_SOURCE_HOURS, 2)
+
+    assert ranking_columns == [NET_LOAD_SUMMER_COLUMN, NET_LOAD_WINTER_COLUMN]
+    solar_only = [
+        load - solar
+        for load, solar in zip([0.25, 0.5, 0.75, 1.0], _by_max([0.1, 0.2, 0.3, 0.7]))
+    ]
+    assert ranked[NET_LOAD_SUMMER_COLUMN].tolist()[:2] == pytest.approx(solar_only[:2])
+
+
+def test_extreme_ranking_columns_need_at_least_one_capacity_factor_feature():
+    """With no renewable feature left there is no residual load, so no extreme period."""
+    feature_t = _seasonal_feature_frame([LOAD_FEATURE])
+
+    assert add_extreme_ranking_columns(feature_t, _SEASONAL_SOURCE_HOURS, 2)[1] == []
 
 
 def test_extreme_ranking_columns_need_a_non_constant_load_feature():

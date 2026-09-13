@@ -163,9 +163,9 @@ clustering:
       enable: false
       period_length: 1  # days; one tsam run, so representative and extreme periods share it
       number: 8
-      # true adds two extreme periods, one per season: the summer (Jun-Aug) period with
-      # the highest mean normalized-demand-minus-solar-CF, and the winter (Dec-Feb)
-      # period with the highest mean normalized-demand-minus-wind-CF
+      # true adds two extreme periods, one per season: the summer (Jun-Aug) and the
+      # winter (Dec-Feb) period with the highest mean residual load, where residual load
+      # is normalized demand minus normalized solar CF minus normalized wind CF
       include_extreme: true
 
 focus_weights:
