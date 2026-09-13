@@ -56,10 +56,9 @@ def storage_elapsed_hours(n, sns, config=None):
     backing of a reserve discharge -- has to be written in these hours, never in the
     weighting, or a block's storage looks ``weight`` times bigger or smaller than it is.
 
-    ``sns`` may be a *subset* of the timeline -- the ERM writes its rows on the extreme
-    periods only -- and a subset that skips whole blocks has a gap where the skipped
-    block was. That gap is not a timestep, so the spacing is always measured on the
-    network's full snapshots and only then read off for ``sns``.
+    ``sns`` may be a *subset* of the timeline, and a subset that skips whole blocks has
+    a gap where the skipped block was. That gap is not a timestep, so the spacing is
+    always measured on the network's full snapshots and only then read off for ``sns``.
     """
     if not representative_periods_active(n, config):
         return n.snapshot_weightings.stores[sns]
@@ -91,7 +90,7 @@ def extreme_period_snapshots(n, snapshots, config=None):
 
     An empty index means something different: representative periods *are* active and
     the metadata *was* read, and it says none of the selected periods is extreme --
-    ``include_extreme`` is off, or tsam dropped both requests because clustering had
+    ``include_extreme`` is off, or tsam dropped every request because clustering had
     already picked those periods as cluster centers.
     """
     if not representative_periods_active(n, config):
