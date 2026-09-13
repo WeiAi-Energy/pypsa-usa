@@ -95,18 +95,18 @@ definition where that matters.
 
 Snapshot coverage
 -----------------
-The requirement is written on **every snapshot** handed to it, on a chronological
-timeline and under representative periods alike. Under representative periods that
-includes the ordinary representative blocks and not just the extreme ones: each
-representative block stands for many real weeks of the year, and adequacy is a
-condition the system has to hold in all of them, not only in the residual-load stress
-cases.
+On a chronological timeline the requirement is written on every snapshot. Under
+representative periods it is written on the **extreme periods only** (see
+``_erm_snapshots``): those blocks are the residual-load stress cases the margin
+exists to cover, while a representative block stands for many ordinary weeks and a
+margin written on it would size capacity against an average one. A selection with no
+extreme block at all falls back to every snapshot.
 
-``sns`` may still be a *subset* of the model's snapshots -- a caller is free to hand
-in fewer -- while every base-state variable spans all of them. linopy aligns operands
-with ``join="exact"``, so each base-state variable is cut down with
-``.sel(snapshot=sns)`` where it enters a requirement term; without it the expression
-build fails outright rather than silently misaligning.
+That makes the reserve state live on a *subset* of the model's snapshots while every
+base-state variable still spans all of them. linopy aligns operands with
+``join="exact"``, so each base-state variable is cut down with ``.sel(snapshot=sns)``
+where it enters a requirement term; without it the expression build fails outright
+rather than silently misaligning.
 """
 
 import logging
@@ -114,7 +114,7 @@ import logging
 import numpy as np
 import pandas as pd
 from opts._helpers import get_region_buses
-from opts.representative_periods import storage_elapsed_hours
+from opts.representative_periods import extreme_period_snapshots, storage_elapsed_hours
 from pypsa.descriptors import (
     expand_series,
     get_activity_mask,
@@ -169,6 +169,42 @@ def _named_snapshots(n, sns):
     sns = sns.copy()
     sns.name = expected
     return sns
+
+
+def _erm_snapshots(n, sns, config):
+    """
+    Snapshots the requirement is written on: the extreme periods, when there are any.
+
+    Under representative periods the adequacy question belongs on the stress blocks. A
+    representative block stands for many ordinary weeks, so a reserve margin written on
+    it sizes capacity against an average week; the extreme blocks are exactly the
+    residual-load peaks the margin exists to cover. Writing the row on every
+    representative snapshot both dilutes the requirement and multiplies its row count
+    by the number of blocks.
+
+    Falls back to every snapshot when the selection carries no extreme block at all --
+    ``include_extreme`` off, or tsam dropped the requests because clustering had already
+    picked those periods as cluster centers. Dropping the constraint instead would
+    silently remove the adequacy policy from the run.
+    """
+    extreme = extreme_period_snapshots(n, sns, config)
+    if extreme is None:
+        return sns
+    if extreme.empty:
+        logger.warning(
+            "Representative periods are active but no period is marked extreme. Writing the ERM "
+            "requirement on all %d representative snapshots instead.",
+            len(sns),
+        )
+        return sns
+
+    logger.info(
+        "Representative periods are active: writing the ERM requirement on %d extreme-period "
+        "snapshots out of %d.",
+        len(extreme),
+        len(sns),
+    )
+    return _named_snapshots(n, extreme)
 
 
 def _erm_buses(n):
@@ -746,15 +782,16 @@ def add_ERM_constraints(
     n : pypsa.Network
         The PyPSA network object.
     snapshots : pd.Index
-        Snapshots the requirement is written on -- all of them, representative and
-        extreme blocks alike.
+        Candidate snapshots. Under representative periods the requirement is narrowed
+        to the extreme periods among them; see ``_erm_snapshots``.
     config : dict, optional
         Configuration dictionary containing ``electricity.erm``. Required if
         ``regional_erm_data`` is not provided. Also read for
         ``clustering.temporal.representative_periods``, which decides whether the
         hours backing a storage discharge come from the snapshot weightings or from
-        the physical timestep; without it the network's own representative-period
-        metadata decides.
+        the physical timestep, and -- together with the period metadata the network
+        carries -- which snapshots are extreme; without it the network's own
+        representative-period metadata decides.
     snakemake : snakemake object, optional
         Not used, kept for API compatibility.
     regional_erm_data : dict, optional
@@ -781,7 +818,7 @@ def add_ERM_constraints(
         logger.warning("No AC buses found. Skipping ERM constraints.")
         return
 
-    snapshots = _named_snapshots(n, snapshots)
+    snapshots = _erm_snapshots(n, _named_snapshots(n, snapshots), config)
     erm_dict = _expand_all_to_transmission_groups(n, erm_dict, buses)
 
     regions = {}
@@ -847,9 +884,9 @@ def store_ERM_duals(n):
     region_dual = pd.DataFrame(
         {region: constraints[erm_requirement_name(region)].dual.to_pandas() for region in regions},
     )
-    # Not unconditionally ``n.snapshots``: the requirement is written on whatever
-    # snapshots the caller handed it, which is normally the whole timeline but need not
-    # be, so the frame is labelled from the constraint's own index where they differ.
+    # Not ``n.snapshots``: under representative periods the requirement covers only the
+    # extreme-period snapshots, so the dual frame is shorter than the timeline and is
+    # indexed by whatever the constraint itself was written on.
     region_dual.index = _dual_snapshot_index(n, region_dual.index)
     region_dual.columns.name = "erm_region"
     n.erm_region_price = region_dual
