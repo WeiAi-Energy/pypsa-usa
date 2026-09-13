@@ -11,6 +11,7 @@ aggregation pass runs here.
 
 import logging
 import warnings
+from contextlib import contextmanager
 from functools import reduce
 from heapq import heappop, heappush
 from typing import NamedTuple
@@ -218,21 +219,23 @@ def aggregate_to_substations(
     one_port_strategies = aggregation_strategies.get("one_ports", dict())
     line_strategies = aggregation_strategies.get("lines", dict())
 
-    clustering = get_clustering_from_busmap(
-        network,
-        busmap,
-        aggregate_generators_weighted=True,
-        aggregate_one_ports=["Load"],
-        line_length_factor=line_length_factor,
-        line_strategies=line_strategies,
-        bus_strategies={
-            "type": "max",
-            "Pd": "sum",
-            "LAF_state": "sum",
-        },
-        generator_strategies=generator_strategies,
-        one_port_strategies=one_port_strategies,
-    )
+    with split_retired_generators(network) as horizon:
+        clustering = get_clustering_from_busmap(
+            network,
+            busmap,
+            aggregate_generators_weighted=True,
+            aggregate_one_ports=["Load"],
+            line_length_factor=line_length_factor,
+            line_strategies=line_strategies,
+            bus_strategies={
+                "type": "max",
+                "Pd": "sum",
+                "LAF_state": "sum",
+            },
+            generator_strategies=generator_strategies,
+            one_port_strategies=one_port_strategies,
+        )
+    restore_retired_carriers(clustering.network, horizon)
 
     substations = network.buses[
         [
@@ -311,6 +314,114 @@ def aggregate_to_substations(
     return network_s, clustering.busmap
 
 
+#: Carrier suffix marking plant whose lifetime has run out by the planning
+#: horizon, for as long as one clustering call needs to keep it apart. Only the
+#: retired group is tagged, so surviving aggregates keep the plain
+#: ``<bus> <carrier>`` name, and one planning year leaves at most two existing
+#: generators per bus and carrier.
+RETIRED_CARRIER_TAG = "_retired"
+
+
+def planning_horizon(n: pypsa.Network) -> int | None:
+    """The planning year retirement is judged against.
+
+    ``None`` when the network carries no investment period, where
+    ``build_year`` and ``lifetime`` decide nothing. Only this one year is
+    considered, so a run with several horizons still has the retirement dates
+    *within* the retired group averaged.
+    """
+    periods = list(n.investment_periods)
+    return int(periods[-1]) if periods else None
+
+
+def retired_by(n: pypsa.Network, horizon: int) -> pd.Series:
+    """Generators whose lifetime has run out by ``horizon``.
+
+    pypsa calls an asset active in a period when
+    ``build_year <= period < build_year + lifetime``
+    (``pypsa.descriptors.get_active_assets``), so the bound is strict on the
+    retirement side: a unit whose lifetime ends exactly in 2050 is already gone
+    in 2050.
+
+    Aggregation averages ``build_year`` and ``lifetime`` across a group, which
+    moves that date -- pool a 1975 and a 1995 coal unit of 70-year lifetime and
+    the half that retired in 2045 stays online through 2050. Splitting the two
+    sides of this test into separate groups is what stops the drift crossing
+    the horizon: an average of dates that all sit on one side of it sits on
+    that side too.
+    """
+    build_year = pd.to_numeric(n.generators.build_year, errors="coerce").fillna(0.0)
+    lifetime = pd.to_numeric(n.generators.lifetime, errors="coerce").fillna(np.inf)
+    return build_year + lifetime <= horizon
+
+
+def keep_alive_past_horizon(n: pypsa.Network, horizon: int, surviving: pd.Series) -> None:
+    """Repair a surviving aggregate that the integer ``build_year`` retired early.
+
+    ``build_year`` is an integer column, so an averaged retirement date is
+    rounded down by up to a year -- enough to retire a whole block whose mean
+    retirement lands just past the horizon. Half a year past it restores the
+    group without reaching the next horizon.
+    """
+    build_year = pd.to_numeric(n.generators.build_year, errors="coerce")
+    lifetime = pd.to_numeric(n.generators.lifetime, errors="coerce")
+    short = surviving & (build_year + lifetime <= horizon)
+    if short.any():
+        n.generators.loc[short, "lifetime"] = horizon - build_year[short] + 0.5
+
+
+@contextmanager
+def split_retired_generators(n: pypsa.Network):
+    """Tag retired plant's ``carrier`` for the duration of one clustering call.
+
+    pypsa groups one-port components by ``(bus, carrier)`` with no hook for a
+    third key, so the distinction rides inside the carrier and
+    :func:`restore_retired_carriers` strips it off the clustered network.
+    Yields the planning horizon, or ``None`` when there is nothing to judge.
+    """
+    horizon = planning_horizon(n)
+    if horizon is None or n.generators.empty:
+        yield None
+        return
+
+    retired = retired_by(n, horizon)
+    if not retired.any():
+        yield horizon
+        return
+
+    base = n.generators.carrier.astype(str)
+    n.generators["carrier"] = base.mask(retired, base + RETIRED_CARRIER_TAG)
+    logger.info(
+        "Aggregating the %s generators retired by %s apart from the %s that survive it, so "
+        "averaging their retirement dates cannot bring them back online.",
+        int(retired.sum()),
+        horizon,
+        int((~retired).sum()),
+    )
+    try:
+        yield horizon
+    finally:
+        n.generators["carrier"] = base
+
+
+def restore_retired_carriers(n: pypsa.Network, horizon: int | None) -> None:
+    """Undo :func:`split_retired_generators` on a *clustered* network.
+
+    ``carrier`` goes back to the plain technology every downstream cost,
+    emission and policy lookup keys on. The aggregated generator *names* keep
+    the tag: it is the only thing telling the retired block apart from the
+    surviving one at the same bus and carrier.
+    """
+    if horizon is None or n.generators.empty:
+        return
+
+    carrier = n.generators.carrier.astype(str)
+    tagged = carrier.str.endswith(RETIRED_CARRIER_TAG)
+    if tagged.any():
+        n.generators["carrier"] = carrier.str.removesuffix(RETIRED_CARRIER_TAG)
+    keep_alive_past_horizon(n, horizon, ~tagged)
+
+
 def merge_colocated_generators(n: pypsa.Network, moved: set) -> int:
     """
     Combine same-carrier generators that a relocation left sharing one bus.
@@ -318,16 +429,24 @@ def merge_colocated_generators(n: pypsa.Network, moved: set) -> int:
     Only groups containing a relocated generator are touched -- everything else
     was already aggregated per (bus, carrier) upstream and is left alone.
 
-    Nominal capacities add.  Efficiency, capital/marginal costs and per-unit
-    availability are averaged with the same effective capacity weights used by
-    the clustering stages: ``p_nom`` for existing plant and finite
-    ``p_nom_max`` for pure candidates.
+    Nominal capacities add.  Efficiency, capital/marginal costs, retirement
+    dates and per-unit availability are averaged with the same effective
+    capacity weights used by the clustering stages: ``p_nom`` for existing
+    plant and finite ``p_nom_max`` for pure candidates.
+
+    Plant retired by the planning horizon is never pooled with plant that
+    survives it: that test joins the group key, for the reason given in
+    :func:`retired_by`.
     """
     generators = n.generators
     if generators.empty or not moved:
         return 0
 
     group_key = generators.bus.astype(str) + "|" + generators.carrier.astype(str)
+    horizon = planning_horizon(n)
+    retired = None if horizon is None else retired_by(n, horizon)
+    if retired is not None:
+        group_key = group_key + "|" + retired.astype(str)
     counts = group_key.value_counts()
     touched = {key for key in group_key.reindex(list(moved)).dropna() if counts.get(key, 0) > 1}
     if not touched:
@@ -368,6 +487,19 @@ def merge_colocated_generators(n: pypsa.Network, moved: set) -> int:
             if values.notna().any():
                 generators.at[keep, col] = float((values.fillna(0.0) * weight).sum())
 
+        # Retirement dates are averaged rather than inherited from `keep`, and
+        # never filled: a missing one would either retire the block at once
+        # (`build_year` 0 with a finite lifetime) or make it immortal. The mean
+        # build year is truncated like pypsa's integer column truncates it,
+        # which can only bring a retirement date forward -- never past the
+        # horizon -- and `keep_alive_past_horizon` repairs the other side.
+        lifetimes = pd.to_numeric(generators.lifetime.reindex(members), errors="coerce")
+        if lifetimes.notna().all():
+            generators.at[keep, "lifetime"] = float((lifetimes * weight).sum())
+        years = pd.to_numeric(generators.build_year.reindex(members), errors="coerce")
+        if years.notna().all():
+            generators.at[keep, "build_year"] = int((years * weight).sum())
+
         for col in ("p_nom", "p_nom_min", "p_nom_max"):
             if col in generators.columns:
                 generators.at[keep, col] = pd.to_numeric(
@@ -378,6 +510,8 @@ def merge_colocated_generators(n: pypsa.Network, moved: set) -> int:
         drop.extend(member for member in members if member != keep)
 
     n.mremove("Generator", drop)
+    if retired is not None:
+        keep_alive_past_horizon(n, horizon, ~retired.reindex(n.generators.index))
     logger.info(
         "Merged %s co-located generators into %s (p_nom_max-weighted p_max_pu).",
         len(drop) + len(touched),
@@ -550,14 +684,7 @@ def summarize_distribution(values: list[float], fmt: str = "%.4g") -> str:
 
 
 #: Length below which the two substations a Line joins are treated as one site.
-#: Substation aggregation leaves a few pairs metres apart -- 16 Lines under 100 m
-#: on the 41k-bus network, the shortest at 8.3 m -- which are electrically one
-#: bus (``x_pu`` down to 1.1e-6) yet reach the LP as a near-zero-impedance branch
-#: and set the smallest coefficient of the whole matrix (8e-06) through the
-#: transmission-volume limit, whose row is written on ``length``. Far below any
-#: real corridor, so nothing merged here is a transmission decision; raising it
-#: turns this into topology reduction, which the two passes below already do.
-SHORT_BRANCH_LENGTH_KM = 0.1
+SHORT_BRANCH_LENGTH_KM = 0.5
 
 
 def contract_short_branches(
@@ -570,7 +697,7 @@ def contract_short_branches(
     :func:`reduce_low_degree_buses` performs: the two
     endpoints become one bus and the branch disappears, rather than a mid-point
     being eliminated and its two branches spliced into one corridor. Neither
-    pass subsumes the other -- most sub-100 m Lines on the 41k network have an
+    pass subsumes the other -- most sub-500 m Lines on the 41k network have an
     endpoint of degree three or more (up to nine), which the degree-1/2 rule
     never reaches, while a degree-two bus between two 300 km Lines is a corridor
     to splice, not two sites to merge.
@@ -1151,6 +1278,13 @@ def apply_wind_solar_cf_aggregation_weights(
         "p_min_pu",
     ):
         generator_strategies[attribute] = "weighted_average"
+
+    # pypsa's defaults here are `build_year = 0` and `lifetime = inf`, which
+    # would make every aggregate immortal and silently keep retired plant in
+    # the fleet. Averaging both with one set of capacity weights is what keeps
+    # the split of `split_retired_generators` on the right side of the horizon.
+    for attribute in ("build_year", "lifetime"):
+        generator_strategies.setdefault(attribute, "capacity_weighted_average")
     return generator_strategies
 
 
@@ -1179,19 +1313,28 @@ def clustering_from_busmap(
     )
     one_port_strategies = aggregation_strategies.get("one_ports", dict())
     bus_strategies = {"Pd": "sum", "LAF_state": "sum"}
-    return get_clustering_from_busmap(
-        n,
-        busmap,
-        aggregate_generators_weighted=True,
-        aggregate_generators_carriers=aggregate_carriers,
-        aggregate_one_ports=["Load", "StorageUnit"],
-        line_length_factor=line_length_factor,
-        line_strategies=line_strategies,
-        generator_strategies=generator_strategies,
-        bus_strategies=bus_strategies,
-        one_port_strategies=one_port_strategies,
-        scale_link_capital_costs=False,
-    )
+    with split_retired_generators(n) as horizon:
+        # The tag rides inside `carrier`, so a caller-supplied carrier filter
+        # has to be translated to the tagged names or it would match nothing.
+        carriers = aggregate_carriers
+        if carriers is not None:
+            tagged = n.generators.carrier.astype(str)
+            carriers = set(tagged[tagged.str.removesuffix(RETIRED_CARRIER_TAG).isin(set(carriers))])
+        clustering = get_clustering_from_busmap(
+            n,
+            busmap,
+            aggregate_generators_weighted=True,
+            aggregate_generators_carriers=carriers,
+            aggregate_one_ports=["Load", "StorageUnit"],
+            line_length_factor=line_length_factor,
+            line_strategies=line_strategies,
+            generator_strategies=generator_strategies,
+            bus_strategies=bus_strategies,
+            one_port_strategies=one_port_strategies,
+            scale_link_capital_costs=False,
+        )
+    restore_retired_carriers(clustering.network, horizon)
+    return clustering
 
 
 class ReactanceEmbedding(NamedTuple):

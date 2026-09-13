@@ -51,7 +51,6 @@ from opts.reserves import (
     add_ERM_constraints,
     store_ERM_duals,
 )
-from regional_cost import SectorCosts
 
 patch_linopy_multiindex_assign()
 
@@ -63,6 +62,8 @@ pypsa.pf.logger.setLevel(logging.WARNING)
 
 FLEXIBLE_ELECTROLYSIS_LINK_SUFFIX = " flexible electrolysis"
 FLEXIBLE_ELECTROLYSIS_BUS_SUFFIX = " flexible electrolysis H2"
+
+DEFAULT_ANNUAL_ELECTRICITY_TWH = 1612.0
 
 
 def prepare_network(n, solve_opts=None):
@@ -127,11 +128,11 @@ def prepare_network(n, solve_opts=None):
 
 
 def flexible_electrolysis_accounting_region(flex_config):
-    """Return the validated hydrogen balance accounting level.
+    """Return the validated electrolysis accounting level.
 
     Mirrors ``add_extra_components.flexible_electrolysis_accounting_region``:
-    ``h2ptcreg`` balances hydrogen production per 45V hydrogen PTC region,
-    ``nation`` balances it once over the whole modelled system.
+    ``h2ptcreg`` balances electrolysis per 45V hydrogen PTC region, ``nation``
+    balances it once over the whole modelled system.
     """
     accounting_region = flex_config.get("accounting_region", "h2ptcreg")
     if accounting_region not in ("h2ptcreg", "nation"):
@@ -179,34 +180,36 @@ def _electrolysis_capacity_terms(n, links):
     return fixed_capacity, n.model["Link-p_nom"].loc[extendable_links].sum()
 
 
-def add_electrolysis_hydrogen_target_constraint(
+def add_electrolysis_electricity_target_constraint(
     n,
     snapshots,
     config,
-    sector_costs_path,
     hydrogen_share_path,
 ):
-    """Fix annual electrolyzer H2 output per accounting region in every period.
+    """Fix annual electrolyzer electricity demand per accounting region in every period.
+
+    The target is an electricity quantity (TWh_e): it fixes what the electrolyzer
+    fleet withdraws from the grid, not what it delivers as hydrogen. Divide by the
+    ``h2 electrolysis`` / ``electricity-input`` ratio in ``simple_sector_costs.csv``
+    to recover the implied hydrogen output.
 
     The accounting region follows ``flexible_electrolysis: accounting_region``.
     With ``h2ptcreg`` the configured national total is split across the 45V
-    hydrogen PTC regions by their share of national hydrogen demand. With
-    ``nation`` a single constraint requires the whole electrolyzer fleet to
-    deliver the sum of those regional productions, i.e. the configured total.
+    hydrogen PTC regions by their share of national hydrogen demand -- the fleet
+    has the same electricity input per unit of hydrogen everywhere, so splitting
+    the electricity by hydrogen demand is the same split. With ``nation`` a single
+    constraint requires the whole electrolyzer fleet to draw the configured total.
 
     The electrolysis links carry ``efficiency = 0`` in the network so that the H2
-    accounting buses balance trivially. Hydrogen output is derived from link
-    electricity withdrawal ``p0`` and the conversion efficiency implied by
-    ``h2 electrolysis`` / ``electricity-input`` in
-    ``simple_sector_costs.csv``.
+    accounting buses balance trivially; the constraint therefore acts on the link
+    electricity withdrawal ``p0`` directly.
 
     The target is written as two rows per region and period rather than one. A
-    per-snapshot variable ``h2_rate`` carries the region's instantaneous H2 output
-    in MW_H2 and is pinned to the fleet's electricity withdrawal; the annual row
-    then sums that one variable over the snapshots. This keeps the annual row
-    sparse and both rows well scaled -- the aggregation row sits on the efficiency,
-    the annual row on the snapshot weightings divided by ``1e3``, since the target
-    is configured in TWh but accounted in GWh.
+    per-snapshot variable ``power_rate`` carries the region's instantaneous fleet
+    withdrawal in MW_e; the annual row then sums that one variable over the
+    snapshots. This keeps the annual row sparse and both rows well scaled -- the
+    annual row sits on the snapshot weightings divided by ``1e3``, since the
+    target is configured in TWh but accounted in GWh.
     """
     flex_config = config.get("flexible_electrolysis", {})
     if not flex_config.get("enable", False):
@@ -230,22 +233,9 @@ def add_electrolysis_hydrogen_target_constraint(
         )
         return
 
-    if not sector_costs_path:
-        raise ValueError(
-            "Flexible electrolysis is enabled but no simple_sector_costs.csv path was provided "
-            "to the hydrogen target constraint.",
-        )
-    total_target_twh = float(flex_config.get("annual_hydrogen_twh", 1612.0))
-    electricity_input = SectorCosts(sector_costs_path).value(
-        "h2 electrolysis",
-        "electricity-input",
+    total_target_twh = float(
+        flex_config.get("annual_electricity_twh", DEFAULT_ANNUAL_ELECTRICITY_TWH),
     )
-    if electricity_input <= 0.0:
-        raise ValueError(
-            "'h2 electrolysis' 'electricity-input' in simple_sector_costs.csv must be positive; "
-            f"got {electricity_input}.",
-        )
-    efficiency = 1.0 / electricity_input
 
     # Each link feeds the accounting H2 bus of the region it sits in, so the
     # region name is recoverable from bus1 (see add_extra_components.py).
@@ -338,13 +328,13 @@ def add_electrolysis_hydrogen_target_constraint(
                 region_links,
             )
             if extendable_capacity is None:
-                fixed_annual_twh = fixed_capacity * period_hours * efficiency / 1e6
+                fixed_annual_twh = fixed_capacity * period_hours / 1e6
                 tolerance = 1e-9 * max(1.0, float(target_twh))
                 if fixed_annual_twh + tolerance < float(target_twh):
                     raise ValueError(
                         f"Fixed flexible electrolysis capacity in {region} ({period}) "
-                        f"can produce at most {fixed_annual_twh:.6g} TWh, below "
-                        f"the {float(target_twh):.6g} TWh target.",
+                        f"can consume at most {fixed_annual_twh:.6g} TWh_e, below "
+                        f"the {float(target_twh):.6g} TWh_e target.",
                     )
 
             # Aggregate the fleet per snapshot before summing over the year. Written
@@ -352,8 +342,8 @@ def add_electrolysis_hydrogen_target_constraint(
             # non-zeros for a nationwide fleet -- and a row that dense ties every
             # Link-p column into one row of the barrier's normal equations. The
             # aggregation is exact (associativity of the sum), so ``rate`` adds no
-            # degree of freedom: it is the region's instantaneous H2 output in MW_H2,
-            # pinned by its own equality.
+            # degree of freedom: it is the region's instantaneous fleet withdrawal
+            # in MW_e, pinned by its own equality.
             #
             # Slicing a snapshot MultiIndex drops its name, which linopy needs to
             # key the dimension off and match the Link-p snapshot axis.
@@ -362,26 +352,26 @@ def add_electrolysis_hydrogen_target_constraint(
             rate = n.model.add_variables(
                 lower=0.0,
                 coords=[rate_coords],
-                name=f"FlexibleElectrolysis-h2_rate-{region}{label}",
+                name=f"FlexibleElectrolysis-power_rate-{region}{label}",
             )
             n.model.add_constraints(
-                rate - link_p.loc[period_snapshots, region_links].mul(efficiency).sum("Link"),
+                rate - link_p.loc[period_snapshots, region_links].sum("Link"),
                 "=",
                 0.0,
-                name=f"FlexibleElectrolysis-h2_rate-{region}{label}-definition",
+                name=f"FlexibleElectrolysis-power_rate-{region}{label}-definition",
             )
             n.model.add_constraints(
                 rate.mul(period_weights / 1e3).sum() == float(target_twh) * 1e3,
-                name=f"FlexibleElectrolysis-annual_hydrogen-{region}{label}",
+                name=f"FlexibleElectrolysis-annual_electricity-{region}{label}",
             )
 
     logger.info(
-        "Applied per-%s annual hydrogen targets (%.1f TWh total) across %d "
-        "region(s): %s.",
+        "Applied per-%s annual electrolysis electricity targets (%.1f TWh_e total) across "
+        "%d region(s): %s.",
         accounting_region,
         total_target_twh,
         len(region_targets),
-        ", ".join(f"{r} {t:.1f} TWh" for r, t in region_targets.items()),
+        ", ".join(f"{r} {t:.1f} TWh_e" for r, t in region_targets.items()),
     )
 
 
@@ -624,11 +614,10 @@ def extra_functionality(n, snapshots):
     # When representative periods are enabled, enforce cyclic closure
     # inside each representative period block for storage technologies.
     add_representative_period_storage_constraints(n, config, snapshots)
-    add_electrolysis_hydrogen_target_constraint(
+    add_electrolysis_electricity_target_constraint(
         n,
         snapshots,
         config,
-        getattr(global_snakemake.input, "sector_costs", None) if global_snakemake else None,
         getattr(global_snakemake.input, "hydrogen_demand_share", None) if global_snakemake else None,
     )
     if config.get("scenario", {}).get("decarbonization") == "BAU":

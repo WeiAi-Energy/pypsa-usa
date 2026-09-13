@@ -13,9 +13,12 @@ from simplify_network import (
     SHORT_BRANCH_LENGTH_KM,
     _earth_centered_km,
     _effective_reactance_embedding,
+    aggregate_to_substations,
     busmap_by_target_bus_count,
     clustering_from_busmap,
     contract_short_branches,
+    planning_horizon,
+    retired_by,
     identity_busmap,
     reduce_low_degree_buses,
 )
@@ -584,3 +587,166 @@ def test_short_branch_contraction_busmap_feeds_the_standard_clustering_wrapper()
     assert set(busmap) <= set(original.buses.index)
     clustered = clustering_from_busmap(original, busmap, line_length_factor=1.0).network
     assert len(clustered.buses) == 3
+
+
+def _three_bus_line_with_investment_periods(periods=(2030, 2040, 2050)):
+    """Three buses in a row, over the given planning horizons."""
+    n = pypsa.Network()
+    n.set_snapshots(pd.date_range("2030-01-01", periods=2, freq="h"))
+    n.investment_periods = list(periods)
+    for bus in ("b0", "b1", "b2"):
+        n.add("Bus", bus, v_nom=230.0)
+    n.add("Line", "l0", bus0="b0", bus1="b1", x=0.1, r=0.01, s_nom=100.0, length=1.0)
+    n.add("Line", "l1", bus0="b1", bus1="b2", x=0.1, r=0.01, s_nom=100.0, length=1.0)
+    n.add("Carrier", "coal")
+    return n
+
+
+def _active_capacity(n):
+    """Installed capacity pypsa treats as online, per investment period."""
+    return {
+        int(period): float(n.generators.p_nom[n.get_active_assets("Generator", period)].sum())
+        for period in n.investment_periods
+    }
+
+
+def test_retirement_test_follows_pypsas_strict_bound():
+    """pypsa's rule is `build_year <= period < build_year + lifetime`.
+
+    A unit whose lifetime ends exactly in 2050 is already gone in 2050, so it
+    must not share an aggregation group with one that survives the year.
+    """
+    n = _three_bus_line_with_investment_periods(periods=(2050,))
+    n.add("Generator", "retires_in_2050", bus="b0", carrier="coal", build_year=1980, lifetime=70)
+    n.add("Generator", "survives_2050", bus="b1", carrier="coal", build_year=1981, lifetime=70)
+
+    retired = retired_by(n, planning_horizon(n))
+
+    assert planning_horizon(n) == 2050
+    assert retired["retires_in_2050"]
+    assert not retired["survives_2050"]
+    assert not n.get_active_assets("Generator", 2050)["retires_in_2050"]
+    assert n.get_active_assets("Generator", 2050)["survives_2050"]
+
+
+def test_clustering_keeps_retiring_and_surviving_plant_in_separate_generators():
+    """Pooling the two would keep retired plant online; splitting them does not."""
+    n = _three_bus_line_with_investment_periods()
+    n.add("Generator", "g_old", bus="b0", carrier="coal", p_nom=100.0, build_year=1975, lifetime=70)
+    n.add("Generator", "g_mid", bus="b1", carrier="coal", p_nom=100.0, build_year=1995, lifetime=70)
+    n.add("Generator", "g_new", bus="b2", carrier="coal", p_nom=300.0, build_year=2005, lifetime=70)
+    before = _active_capacity(n)
+
+    clustered = clustering_from_busmap(
+        n,
+        pd.Series({"b0": "B", "b1": "B", "b2": "B"}),
+        line_length_factor=1.0,
+        aggregate_carriers=set(n.generators.carrier),
+    ).network
+
+    assert before == {2030: 500.0, 2040: 500.0, 2050: 400.0}
+    assert _active_capacity(clustered) == before
+    assert clustered.generators.p_nom.sum() == pytest.approx(n.generators.p_nom.sum())
+    # The tag is stripped from `carrier`, which every cost and policy lookup
+    # keys on, and kept in the name, which is all that tells the groups apart.
+    assert set(clustered.generators.carrier) == {"coal"}
+    assert len(clustered.generators) == 2
+    assert clustered.generators.index.is_unique
+
+
+def test_substation_aggregation_splits_retired_plant_too():
+    n = _three_bus_line_with_investment_periods()
+    n.buses["sub_id"] = [0, 0, 0]
+    for column in ("interconnect", "state", "country", "county", "balancing_area", "reeds_zone", "reeds_ba", "reeds_state"):
+        n.buses[column] = "x"
+    n.add("Generator", "g_old", bus="b0", carrier="coal", p_nom=100.0, build_year=1975, lifetime=70)
+    n.add("Generator", "g_new", bus="b1", carrier="coal", p_nom=100.0, build_year=1995, lifetime=70)
+
+    clustered, _ = aggregate_to_substations(
+        n,
+        n.buses.sub_id.astype(int).astype(str),
+        "reeds_zone",
+        1.0,
+        {},
+    )
+
+    assert _active_capacity(clustered) == {2030: 200.0, 2040: 200.0, 2050: 100.0}
+    assert set(clustered.generators.carrier) == {"coal"}
+
+
+def test_colocated_merge_keeps_retired_plant_apart_and_averages_the_dates():
+    """A relocation that lands both kinds on one bus must not pool them."""
+    n = _network_with_degree_two_bus()
+    n.set_snapshots(pd.date_range("2030-01-01", periods=2, freq="h"))
+    n.investment_periods = [2030, 2040, 2050]
+    n.add("Generator", "old_m", bus="m", carrier="coal", p_nom=100.0, build_year=1975, lifetime=70)
+    n.add("Generator", "mid_m", bus="m", carrier="coal", p_nom=100.0, build_year=1995, lifetime=70)
+    n.add("Generator", "new_a", bus="a", carrier="coal", p_nom=300.0, build_year=2005, lifetime=70)
+
+    reduced, _ = reduce_low_degree_buses(n)
+
+    # The Kron split sends 3/4 of each unit on `m` to `a`. The 1975 block
+    # retires in 2045, so it stays out of the group the 1995 and 2005 units
+    # merge into, even though all three now sit on one bus.
+    at_a = reduced.generators.query("bus == 'a'")
+    assert len(at_a) == 2
+    retiring = at_a[at_a.build_year < 1990]
+    merged = at_a[at_a.build_year > 1990]
+    assert float(retiring.p_nom.iloc[0]) == pytest.approx(75.0)
+    assert float(merged.p_nom.iloc[0]) == pytest.approx(375.0)
+    # 75 MW of 1995 plant and 300 MW of 2005 plant.
+    assert int(merged.build_year.iloc[0]) == 2003
+    assert float(merged.lifetime.iloc[0]) == pytest.approx(70.0)
+
+    assert _active_capacity(reduced) == {2030: 500.0, 2040: 500.0, 2050: 400.0}
+
+
+def test_fractional_lifetimes_survive_the_integer_build_year_column():
+    """`build_year` is an integer, so a mean retirement date can round down.
+
+    Both units here outlive 2050 by a few months, and their mean build year
+    falls mid-year; truncating it would retire the whole aggregate in 2050.
+    """
+    n = _three_bus_line_with_investment_periods()
+    n.add("Generator", "g_a", bus="b0", carrier="coal", p_nom=100.0, build_year=1980, lifetime=70.1)
+    n.add("Generator", "g_b", bus="b1", carrier="coal", p_nom=100.0, build_year=1981, lifetime=69.5)
+    assert not retired_by(n, planning_horizon(n)).any()
+
+    clustered = clustering_from_busmap(
+        n,
+        pd.Series({"b0": "B", "b1": "B", "b2": "B"}),
+        line_length_factor=1.0,
+        aggregate_carriers=set(n.generators.carrier),
+    ).network
+
+    merged = clustered.generators.iloc[0]
+    assert merged.build_year + merged.lifetime > 2050
+    assert _active_capacity(clustered) == {2030: 200.0, 2040: 200.0, 2050: 200.0}
+
+
+def test_single_planning_year_yields_at_most_two_existing_generators_per_carrier():
+    """The repository default is one planning year, so one boundary decides all.
+
+    Plant whose lifetime has run out by then is active in no period at all and
+    belongs in its own block; everything else survives the whole horizon and
+    keeps the plain `<bus> <carrier>` name.
+    """
+    n = _three_bus_line_with_investment_periods(periods=(2050,))
+    n.add("Generator", "spent", bus="b0", carrier="coal", p_nom=100.0, build_year=1975, lifetime=70)
+    n.add("Generator", "just_spent", bus="b1", carrier="coal", p_nom=200.0, build_year=1980, lifetime=70)
+    n.add("Generator", "alive", bus="b2", carrier="coal", p_nom=300.0, build_year=1981, lifetime=70)
+
+    clustered = clustering_from_busmap(
+        n,
+        pd.Series({"b0": "B", "b1": "B", "b2": "B"}),
+        line_length_factor=1.0,
+        aggregate_carriers=set(n.generators.carrier),
+    ).network
+
+    # 1980 + 70 == 2050 is retirement, not survival: pypsa's bound is strict.
+    assert set(clustered.generators.index) == {"B coal", "B coal_retired"}
+    assert clustered.generators.at["B coal", "p_nom"] == pytest.approx(300.0)
+    assert clustered.generators.at["B coal_retired", "p_nom"] == pytest.approx(300.0)
+    assert set(clustered.generators.carrier) == {"coal"}
+    assert _active_capacity(clustered) == {2050: 300.0}
+    assert clustered.generators.p_nom.sum() == pytest.approx(n.generators.p_nom.sum())

@@ -82,7 +82,7 @@ electricity:
 
 flexible_electrolysis:
   enable: true
-  annual_hydrogen_twh: 1512
+  annual_electricity_twh: 1512 # total annual electricity demand of the electrolyzer fleet (TWh_e), not its hydrogen output
   accounting_region: h2ptcreg # h2ptcreg: one H2 balance per 45V PTC region | nation: a single national H2 balance
 
 
@@ -168,7 +168,10 @@ clustering:
       enable: true
       period_length: 14  # days; one tsam run, so representative and extreme periods share it
       number: 2
-      include_extreme: [demand_max, solar_min, wind_min]
+      # true adds two extreme periods, one per season: the summer (Jun-Aug) period with
+      # the highest mean normalized-demand-minus-solar-CF, and the winter (Dec-Feb)
+      # period with the highest mean normalized-demand-minus-wind-CF
+      include_extreme: true
 
 focus_weights:
 

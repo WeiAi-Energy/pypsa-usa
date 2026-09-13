@@ -55,6 +55,11 @@ def storage_elapsed_hours(n, sns, config=None):
     energy-against-power relation -- the storage balance here, and the ERM's energy
     backing of a reserve discharge -- has to be written in these hours, never in the
     weighting, or a block's storage looks ``weight`` times bigger or smaller than it is.
+
+    ``sns`` may be a *subset* of the timeline -- the ERM writes its rows on the extreme
+    periods only -- and a subset that skips whole blocks has a gap where the skipped
+    block was. That gap is not a timestep, so the spacing is always measured on the
+    network's full snapshots and only then read off for ``sns``.
     """
     if not representative_periods_active(n, config):
         return n.snapshot_weightings.stores[sns]
@@ -67,8 +72,64 @@ def storage_elapsed_hours(n, sns, config=None):
         )
         return n.snapshot_weightings.stores[sns]
 
-    elapsed = _get_physical_elapsed_hours(snapshot_index)
+    full_index = _to_multiindex_snapshots(n.snapshots)
+    if full_index is not None and snapshot_index.isin(full_index).all():
+        elapsed = _get_physical_elapsed_hours(full_index).reindex(snapshot_index)
+    else:
+        elapsed = _get_physical_elapsed_hours(snapshot_index)
     return pd.Series(elapsed.to_numpy(), index=sns)
+
+
+def extreme_period_snapshots(n, snapshots, config=None):
+    """
+    The subset of ``snapshots`` that falls inside an extreme representative period.
+
+    ``None`` means "no extreme-period restriction applies" and callers should use every
+    snapshot: representative periods are not active, or the snapshots are not the
+    ``period``/``timestep`` MultiIndex the block metadata is keyed on, or the network
+    carries no metadata to tell an extreme block from a representative one.
+
+    An empty index means something different: representative periods *are* active and
+    the metadata *was* read, and it says none of the selected periods is extreme --
+    ``include_extreme`` is off, or tsam dropped both requests because clustering had
+    already picked those periods as cluster centers.
+    """
+    if not representative_periods_active(n, config):
+        return None
+
+    snapshot_index = _to_multiindex_snapshots(snapshots)
+    if snapshot_index is None or snapshot_index.nlevels < 2:
+        logger.warning(
+            "Representative periods are active, but the snapshots are not a MultiIndex, "
+            "so extreme periods cannot be identified.",
+        )
+        return None
+
+    metadata = _get_representative_period_metadata(n)
+    if not metadata:
+        logger.warning(
+            "Representative periods are active, but the network carries no representative-period "
+            "metadata, so extreme periods cannot be told apart from representative ones.",
+        )
+        return None
+
+    rep_cfg = representative_periods_config(config)
+    base_hours = _get_period_hours(rep_cfg) if rep_cfg.get("period_length") is not None else None
+    blocks = _get_representative_blocks(snapshot_index, base_hours, metadata=metadata)
+
+    extreme = [
+        entry["snapshots"]
+        for entries in blocks.values()
+        for entry in entries
+        if str(entry.get("kind", "representative")) == "extreme"
+    ]
+    if not extreme:
+        return snapshot_index[:0]
+
+    selected = extreme[0].append(extreme[1:])
+    # Filtering the original index rather than concatenating the blocks keeps the
+    # snapshots in model order and keeps the index name linopy keys its dimension off.
+    return snapshot_index[snapshot_index.isin(selected)]
 
 
 def _get_representative_period_metadata(n):
@@ -156,6 +217,15 @@ def _get_representative_blocks(snapshots, base_hours, metadata=None):
                     len(period_snapshots),
                     len(period_snapshots) - offset,
                 )
+        elif base_hours is None:
+            # Only reachable from ``extreme_period_snapshots``, which has metadata for
+            # some years but may have none for this one and no config to fall back on.
+            logger.warning(
+                "No representative-period metadata for %s and no configured period length. "
+                "No blocks can be built for it.",
+                year,
+            )
+            continue
         else:
             steps = int(round(base_hours / timestep_hours))
             if steps <= 0 or not np.isclose(steps * timestep_hours, base_hours):

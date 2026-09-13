@@ -18,7 +18,7 @@ def _make_template(year: int) -> dict:
         },
         "flexible_electrolysis": {
             "enable": False,
-            "annual_hydrogen_twh": 1512,
+            "annual_electricity_twh": 1512,
         },
     }
 
@@ -36,7 +36,7 @@ def test_generate_cases_covers_demand_ll_dc_sssc_dimensions():
 
     sssc_case = generated_cases["2050_MidDmd_v1.30_DCNet_SSSC_InfGVA"]
     assert sssc_case["scenario"]["demand_level"] == "Mid"
-    assert sssc_case["flexible_electrolysis"] == {"enable": False, "annual_hydrogen_twh": 1512}
+    assert sssc_case["flexible_electrolysis"] == {"enable": False, "annual_electricity_twh": 1512}
     assert sssc_case["lines"]["convert_lines_to_line_x"]["sssc_tot_max"] == float("inf")
     assert "max_extension" not in sssc_case["links"]
 

@@ -24,7 +24,7 @@ def _make_2030_template() -> dict:
         },
         "flexible_electrolysis": {
             "enable": False,
-            "annual_hydrogen_twh": 1512,
+            "annual_electricity_twh": 1512,
         },
     }
 
@@ -48,7 +48,7 @@ def _make_2050_template() -> dict:
         },
         "flexible_electrolysis": {
             "enable": True,
-            "annual_hydrogen_twh": 1512,
+            "annual_electricity_twh": 1512,
         },
     }
 
@@ -92,7 +92,7 @@ def test_generate_cases_changes_one_dimension_at_a_time():
     assert baseline_2050["lines"]["convert_lines_to_line_x"]["sssc_tot_max"] == float("inf")
 
     one_gva_2050 = generated_cases["2050_MidDmd_v1.30_NoDCNet_SSSC_1GVA"]
-    assert one_gva_2050["flexible_electrolysis"]["annual_hydrogen_twh"] == 1512
+    assert one_gva_2050["flexible_electrolysis"]["annual_electricity_twh"] == 1512
     assert one_gva_2050["lines"]["convert_lines_to_line_x"]["sssc_tot_max"] == 1000
 
     high_cost_2050 = generated_cases["2050_MidDmd_v1.30_NoDCNet_SSSC_InfGVA_HighCost"]

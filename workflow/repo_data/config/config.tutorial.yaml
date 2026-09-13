@@ -163,7 +163,10 @@ clustering:
       enable: false
       period_length: 1  # days; one tsam run, so representative and extreme periods share it
       number: 8
-      include_extreme: true  # true keeps legacy defaults; or use [solar_min, solar_max, wind_min, wind_max, demand_min, demand_max]
+      # true adds two extreme periods, one per season: the summer (Jun-Aug) period with
+      # the highest mean normalized-demand-minus-solar-CF, and the winter (Dec-Feb)
+      # period with the highest mean normalized-demand-minus-wind-CF
+      include_extreme: true
 
 focus_weights:
 

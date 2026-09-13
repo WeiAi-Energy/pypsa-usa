@@ -43,6 +43,8 @@ def network_with_ac_buses():
 
 def test_attach_tes_uses_reference_bus_store_link_topology():
     n = network_with_ac_buses()
+    n.add("Generator", "ac_1 coal", bus="ac_1", carrier="coal", p_nom=100.0)
+    n.add("Generator", "ac_2 ccgt", bus="ac_2", carrier="CCGT", p_nom=100.0)
     attach_tes_storageunits(n, str(COSTS))
 
     assert {"ac_1 tes", "ac_2 tes"}.issubset(n.buses.index)
@@ -64,6 +66,32 @@ def test_attach_tes_uses_reference_bus_store_link_topology():
     assert (n.links.carrier == "tes").all()
 
 
+def test_attach_tes_is_restricted_to_buses_with_existing_thermal_generators():
+    n = network_with_ac_buses()
+    n.add("Bus", "ac_3", carrier="AC", x=5.0, y=6.0, country="US")
+    n.add("Generator", "existing ccgt ccs", bus="ac_2", carrier="CCGT-95CCS", p_nom=50.0)
+    n.add("Generator", "existing solar", bus="ac_3", carrier="solar", p_nom=10.0)
+
+    attach_tes_storageunits(n, str(COSTS))
+
+    # ac_1 hosts nothing and ac_3 only hosts solar, so neither is a TES site.
+    assert set(n.stores.index) == {"ac_2 tes"}
+    assert set(n.links.index) == {"ac_2 tes charger", "ac_2 tes discharger"}
+    assert "ac_1 tes" not in n.buses.index
+    assert "ac_3 tes" not in n.buses.index
+
+
+def test_attach_tes_adds_nothing_without_existing_thermal_generators():
+    n = network_with_ac_buses()
+    n.add("Generator", "existing solar", bus="ac_1", carrier="solar", p_nom=10.0)
+
+    attach_tes_storageunits(n, str(COSTS))
+
+    assert n.stores.empty
+    assert n.links.empty
+    assert not n.buses.index.str.endswith(" tes").any()
+
+
 def test_attach_flexible_electrolysis_uses_reference_costs_and_zero_efficiency_links():
     n = network_with_ac_buses()
     n.add("Generator", "existing generator", bus="ac_1", carrier="gas", p_nom=100.0)
@@ -80,7 +108,7 @@ def test_attach_flexible_electrolysis_uses_reference_costs_and_zero_efficiency_l
         n,
         {
             "enable": True,
-            "annual_hydrogen_twh": 1512,
+            "annual_electricity_twh": 1512,
         },
         str(COSTS),
     )
@@ -251,18 +279,6 @@ def test_existing_ocgt_still_seeds_gas_and_nuclear_siting():
     assert "OCGT" not in new_build_carriers(["OCGT", "CCGT"])
 
 
-def test_flexible_electrolysis_rejects_nonpositive_electricity_input(tmp_path):
-    n = network_with_ac_buses()
-    costs = pd.read_csv(COSTS)
-    mask = (costs["pypsa-name"] == "h2 electrolysis") & (costs["parameter"] == "electricity-input")
-    costs.loc[mask, "value"] = 0.0
-    broken = tmp_path / "simple_sector_costs.csv"
-    costs.to_csv(broken, index=False)
-
-    with pytest.raises(ValueError, match="must be positive"):
-        attach_flexible_electrolysis(n, {"enable": True}, str(broken))
-
-
 ###
 # Regional overnight-capex multipliers (regional_cost.py)
 ###
@@ -423,6 +439,8 @@ def test_flexible_electrolysis_applies_per_bus_overnight_multiplier():
 
 def test_tes_applies_per_bus_overnight_multiplier():
     n = network_with_ac_buses()
+    n.add("Generator", "ac_1 coal", bus="ac_1", carrier="coal", p_nom=100.0)
+    n.add("Generator", "ac_2 ccgt", bus="ac_2", carrier="CCGT", p_nom=100.0)
     bus_multipliers = pd.DataFrame({"tes": [1.0, 1.5]}, index=["ac_1", "ac_2"])
 
     attach_tes_storageunits(n, str(COSTS), bus_multipliers=bus_multipliers)

@@ -28,24 +28,47 @@ Representative periods are used exactly as tsam selects them.
 
 Extreme periods and weighting
 -----------------------------
-Extreme periods are tsam's job: they are requested through
-``extremePeriodMethod="new_cluster_center"`` with ``addMeanMin`` / ``addMeanMax``
-pointed straight at the clustering features. tsam then picks the period with the
-lowest/highest period mean per selector, adds it as an *additional cluster
-center*, and re-checks every other period against it -- a period closer to the
-extreme than to its own medoid joins the extreme's cluster. Weights therefore
-fall out of the cluster membership counts for representative and extreme periods
-alike: an extreme week represents all the weeks that look like it, not only its
-own hours. Snapshot weightings are finally rescaled so ``objective`` sums to
-8760 h per planning horizon.
+``include_extreme`` is a plain on/off switch. When it is true, two extreme periods
+are requested -- one residual-load stress case per half of the year:
+
+* **summer** (June-August): the period with the highest mean
+  ``normalized demand - solar CF``;
+* **winter** (December-February): the period with the highest mean
+  ``normalized demand - wind CF``.
+
+Confining one to each season is what keeps the pair from collapsing onto the same
+few weeks: the highest residual load of both kinds usually sits in whichever season
+the system peaks in, so an unconstrained search returns two neighbouring summer
+blocks (or, once tsam drops the duplicate, only one extreme at all). The
+resource/season pairing is the physical one -- the summer stress case is the evening
+a hot afternoon's load outlasts the sun, the winter one a cold snap with the wind
+not blowing. A period counts as belonging to a season when more than half its hours
+fall in it, so a block straddling the boundary lands on the side it mostly sits in.
+
+Demand is min-max normalized onto [0, 1] over the clustering timeline first so it
+shares a scale with the capacity factor it is differenced against; capacity
+factors are already fractions and enter unscaled. Each difference is appended to
+the tsam frame as its own column and handed to ``addMeanMax``, because tsam can
+only rank periods on columns of the series it clusters, and every out-of-season
+period in that column is pushed below every in-season one so it cannot win the
+ranking. Those two ranking columns carry tsam's minimum column weight
+(``EXTREME_RANKING_WEIGHT``), so they steer the extreme choice without measurably
+changing the clustering distance that picks the representative periods.
+
+tsam picks the period with the highest period mean per ranking column, adds it as
+an *additional cluster center*, and re-checks every other period against it -- a
+period closer to the extreme than to its own medoid joins the extreme's cluster.
+Weights therefore fall out of the cluster membership counts for representative
+and extreme periods alike: an extreme week represents all the weeks that look
+like it, not only its own hours. Snapshot weightings are finally rescaled so
+``objective`` sums to 8760 h per planning horizon.
 
 Because both kinds of period come out of one tsam run over one period partition,
 extreme and representative periods necessarily share a length: the single
 ``period_length`` config key (see ``get_period_hours``). Note also that tsam
 *drops* a requested extreme period that is already a cluster center rather than
 falling back to the next-most-extreme candidate, so a run can legitimately return
-fewer periods than ``number + len(include_extreme)``; ``validate_period_counts``
-warns about it.
+fewer periods than ``number + 2``; ``validate_period_counts`` warns about it.
 
 Timezone
 --------
@@ -54,8 +77,8 @@ Time (UTC-06:00). ``build_eer_demand.ReadEer`` performs the CST -> UTC roll
 inside each 8760-hour block, which is why the demand series is read through that
 class rather than from the h5 directly. Feeding a CST series into the feature
 frame would shift the load feature six hours out of phase with the renewable
-features and silently corrupt both the clustering and the ``demand_max`` extreme
-window; ``build_national_feature_frame`` asserts index equality as a backstop.
+features and silently corrupt both the clustering and the residual-load extreme
+windows; ``build_national_feature_frame`` asserts index equality as a backstop.
 
 Snapshot labels
 ---------------
@@ -81,24 +104,28 @@ WIND_CARRIERS = ("onwind", "offwind", "offwind_floating")
 SOLAR_CARRIERS = ("solar",)
 REEDS_FEATURE_GROUPS = {"wind": WIND_CARRIERS, "solar": SOLAR_CARRIERS}
 
-_EXTREME_PERIOD_DEFAULTS = {
-    "solar": "solar_min",
-    "wind": "wind_min",
-    "demand": "demand_max",
-}
-# Each extreme selector names the clustering feature tsam ranks periods on, and
-# whether the lowest (addMeanMin) or highest (addMeanMax) period mean is wanted.
 WIND_FEATURE = ("Generator", "p_max_pu", "wind")
 SOLAR_FEATURE = ("Generator", "p_max_pu", "solar")
 LOAD_FEATURE = ("Load", "p_set", "ac_load")
-_EXTREME_PERIOD_SELECTORS = {
-    "solar_min": {"feature": SOLAR_FEATURE, "mode": "min"},
-    "solar_max": {"feature": SOLAR_FEATURE, "mode": "max"},
-    "wind_min": {"feature": WIND_FEATURE, "mode": "min"},
-    "wind_max": {"feature": WIND_FEATURE, "mode": "max"},
-    "demand_min": {"feature": LOAD_FEATURE, "mode": "min"},
-    "demand_max": {"feature": LOAD_FEATURE, "mode": "max"},
+
+# Extreme periods are ranked on residual load -- normalized demand minus the capacity
+# factor of one renewable resource -- and each one is confined to a season, so the pair
+# brackets the year instead of both landing in the same month. The resource/season
+# pairing is the physical one: the summer stress case is the evening a hot afternoon's
+# load outlasts the sun, the winter one a cold snap with the wind not blowing.
+SUMMER_MONTHS = (6, 7, 8)
+WINTER_MONTHS = (12, 1, 2)
+NET_LOAD_SOLAR_COLUMN = ("Extreme", "net_load", "solar")
+NET_LOAD_WIND_COLUMN = ("Extreme", "net_load", "wind")
+EXTREME_RANKING_COLUMNS = {
+    NET_LOAD_SOLAR_COLUMN: {"feature": SOLAR_FEATURE, "season": "summer", "months": SUMMER_MONTHS},
+    NET_LOAD_WIND_COLUMN: {"feature": WIND_FEATURE, "season": "winter", "months": WINTER_MONTHS},
 }
+# tsam's minimum tolerated column weight (``tsam.timeseriesaggregation.MIN_WEIGHT``).
+# The ranking columns exist only so ``addMeanMax`` has something to rank, so they
+# get the smallest weight tsam accepts without clamping (and printing): their
+# contribution to the clustering distance is ~1e-12 of a real feature's.
+EXTREME_RANKING_WEIGHT = 1e-6
 
 
 # Superseded by the single ``period_length``; a config still carrying one of these
@@ -132,74 +159,157 @@ def get_period_hours(representative_periods):
     return days * 24.0
 
 
-def get_extreme_period_selectors(representative_periods):
-    """Return normalized extreme-period selectors from config."""
-    include_extreme = representative_periods.get("include_extreme", [])
-    allowed_entries = list(_EXTREME_PERIOD_DEFAULTS) + list(_EXTREME_PERIOD_SELECTORS)
+def get_include_extreme(representative_periods):
+    """
+    Return the boolean ``representative_periods.include_extreme`` switch.
 
-    if isinstance(include_extreme, bool):
-        return list(_EXTREME_PERIOD_DEFAULTS.values()) if include_extreme else []
+    The key used to take a list of per-feature selectors (``demand_max``,
+    ``solar_min``, ...). Those are gone -- extreme periods are now the two
+    residual-load stress cases described in the module docstring -- so the key is
+    a plain on/off switch and a leftover list is rejected rather than silently
+    reinterpreted.
+    """
+    include_extreme = representative_periods.get("include_extreme", False)
     if include_extreme is None:
-        return []
-
-    if isinstance(include_extreme, str):
-        categories = [include_extreme]
-    elif isinstance(include_extreme, (list, tuple, set)):
-        categories = list(include_extreme)
-    else:
-        raise ValueError(
-            "representative_periods.include_extreme must be a bool, string, or list drawn from "
-            f"{allowed_entries}.",
-        )
-
-    normalized = []
-    invalid = []
-    for category in categories:
-        category_str = str(category).strip().lower()
-        if category_str in _EXTREME_PERIOD_DEFAULTS:
-            category_str = _EXTREME_PERIOD_DEFAULTS[category_str]
-        if category_str in _EXTREME_PERIOD_SELECTORS:
-            if category_str not in normalized:
-                normalized.append(category_str)
-        else:
-            invalid.append(category)
-
-    if invalid:
-        raise ValueError(
-            f"Unsupported representative_periods.include_extreme entries {invalid}. "
-            f"Choose from {allowed_entries}.",
-        )
-    return normalized
+        return False
+    if isinstance(include_extreme, bool):
+        return include_extreme
+    raise ValueError(
+        "representative_periods.include_extreme must be true or false; per-feature selector lists "
+        f"are no longer supported (got {include_extreme!r}). true selects the summer period with the "
+        "highest mean normalized demand minus solar CF and the winter period with the highest mean "
+        "normalized demand minus wind CF.",
+    )
 
 
-def build_extreme_period_selector_columns(feature_t, extreme_selectors):
+def period_season_mask(source_timestamps, period_steps, months):
     """
-    Translate configured extreme selectors into tsam's ``addMeanMin``/``addMeanMax``.
+    Whether each candidate period counts as belonging to ``months``.
 
-    The selectors point at the clustering features themselves rather than at
-    duplicated helper columns: tsam requires every ``addMean*`` entry to be a
-    column of the time series it clusters, and a duplicate would double the weight
-    of that feature in the clustering distance. One feature can appear in both
-    lists (``demand_min`` plus ``demand_max``); tsam handles the two independently.
+    A period qualifies when more than half its hours fall inside the season. The two
+    seasons are disjoint, so no period can qualify for both, and a block straddling a
+    season boundary lands on the side it mostly sits in.
 
-    A selector whose feature is missing -- no wind carrier configured, say -- is
-    skipped with a warning instead of failing the run.
+    ``source_timestamps`` are the *real* weather hours behind the clustering rows, laid
+    out period by period. The frame handed to tsam carries synthetic contiguous labels
+    instead (see the module docstring), so reading the month off its own index would
+    date a July block to January.
+
+    Returns
+    -------
+    numpy.ndarray
+        One boolean per candidate period.
     """
-    add_mean_min = []
-    add_mean_max = []
-    for selector in extreme_selectors:
-        column = _EXTREME_PERIOD_SELECTORS[selector]["feature"]
-        if column not in feature_t.columns:
+    in_season = np.asarray(pd.DatetimeIndex(source_timestamps).month.isin(months))
+    return in_season.reshape(-1, int(period_steps)).mean(axis=1) > 0.5
+
+
+def _confine_to_season(residual, in_season, period_steps):
+    """
+    Push every out-of-season period below every in-season one.
+
+    ``addMeanMax`` ranks on the period mean of the whole column, so confining the search
+    to a season means making the out-of-season periods unable to win it. The sentinel
+    sits a full range below the series minimum, which puts any penalized period's mean
+    strictly below the lowest in-season period mean. It is a finite number rather than
+    ``-inf`` or NaN because tsam min-max normalizes the column -- an affine map, so the
+    ranking survives -- and rejects NaN outright.
+    """
+    values = residual.to_numpy(dtype=float).reshape(-1, int(period_steps))
+    low, high = float(np.nanmin(values)), float(np.nanmax(values))
+    sentinel = low - (high - low) - 1.0
+    confined = np.where(np.asarray(in_season)[:, None], values, sentinel)
+    return pd.Series(confined.reshape(-1), index=residual.index)
+
+
+def add_extreme_ranking_columns(feature_t, source_timestamps, period_steps):
+    """
+    Append the residual-load columns tsam ranks the extreme periods on.
+
+    tsam requires every ``addMean*`` entry to be a column of the time series it
+    clusters, so the two residual-load metrics are materialised as real columns of
+    the frame handed to tsam rather than computed on the side. They are given
+    ``EXTREME_RANKING_WEIGHT`` in tsam's ``weightDict``, which leaves the
+    clustering that picks the representative periods untouched.
+
+    Demand is min-max normalized over the clustering timeline before the capacity
+    factor is subtracted, so the two sides of the difference share a scale. tsam
+    min-max normalizes every column again internally, which is an affine map and
+    therefore leaves the period ranking these columns exist for unchanged.
+
+    Each column is then confined to its season (``EXTREME_RANKING_COLUMNS``) by
+    ``_confine_to_season``, so the solar column can only ever be won by a summer period
+    and the wind column by a winter one.
+
+    A ranking column is skipped with a warning rather than failing the run when its
+    capacity-factor feature is missing -- no wind carrier configured, say -- or when no
+    candidate period falls in its season; and every column is skipped when there is no
+    load feature to form residual load from.
+
+    Parameters
+    ----------
+    feature_t : pandas.DataFrame
+        The frame handed to tsam, carrying synthetic contiguous timestamps.
+    source_timestamps : pandas.DatetimeIndex
+        The real weather hour behind each row of ``feature_t``, positionally aligned.
+    period_steps : int
+        Rows per candidate period; ``feature_t`` holds exactly this many rows per period.
+
+    Returns
+    -------
+    tuple[pandas.DataFrame, list[tuple]]
+        A copy of ``feature_t`` with the ranking columns appended, and the labels
+        of the columns that were appended (empty if none could be built).
+    """
+    feature_t = feature_t.copy()
+    if LOAD_FEATURE not in feature_t.columns:
+        logger.warning(
+            "Skipping extreme periods: clustering feature %s is not available, so residual load "
+            "cannot be formed.",
+            LOAD_FEATURE,
+        )
+        return feature_t, []
+
+    load = feature_t[LOAD_FEATURE].astype(float)
+    load_span = float(load.max() - load.min())
+    if not np.isfinite(load_span) or load_span <= 0:
+        logger.warning(
+            "Skipping extreme periods: the load feature is constant, so it cannot be normalized.",
+        )
+        return feature_t, []
+    load_normalized = (load - float(load.min())) / load_span
+
+    ranking_columns = []
+    for column, spec in EXTREME_RANKING_COLUMNS.items():
+        cf_column = spec["feature"]
+        if cf_column not in feature_t.columns:
             logger.warning(
-                "Skipping extreme period '%s': clustering feature %s is not available.",
-                selector,
-                column,
+                "Skipping the %s extreme period: clustering feature %s is not available.",
+                spec["season"],
+                cf_column,
             )
             continue
-        target = add_mean_min if _EXTREME_PERIOD_SELECTORS[selector]["mode"] == "min" else add_mean_max
-        if column not in target:
-            target.append(column)
-    return add_mean_min, add_mean_max
+
+        in_season = period_season_mask(source_timestamps, period_steps, spec["months"])
+        if not in_season.any():
+            logger.warning(
+                "Skipping the %s extreme period: no candidate period falls mostly in months %s.",
+                spec["season"],
+                list(spec["months"]),
+            )
+            continue
+
+        residual = load_normalized - feature_t[cf_column].astype(float)
+        feature_t[column] = _confine_to_season(residual, in_season, period_steps)
+        ranking_columns.append(column)
+        logger.info(
+            "Ranking the %s extreme period on %s over %s of %s candidate periods.",
+            spec["season"],
+            column,
+            int(in_season.sum()),
+            len(in_season),
+        )
+    return feature_t, ranking_columns
 
 
 def _build_contiguous_timestep_index(start, periods, timestep_hours):
@@ -448,8 +558,8 @@ def select_period_entries(feature_t_full, source_index_full, representative_peri
     One tsam run does everything: hierarchical clustering picks ``number``
     representative periods (represented by the real historical period closest to
     each cluster centroid, tsam's ``medoidRepresentation``), and -- when
-    ``include_extreme`` asks for them -- tsam's ``new_cluster_center`` method adds
-    the configured extreme periods as further cluster centers and reassigns
+    ``include_extreme`` is true -- tsam's ``new_cluster_center`` method adds the
+    two residual-load extreme periods as further cluster centers and reassigns
     whatever is closer to them. Period weights are the resulting cluster
     membership counts (see the module docstring).
 
@@ -477,7 +587,7 @@ def select_period_entries(feature_t_full, source_index_full, representative_peri
     if number <= 0:
         raise ValueError("representative_periods.number must be a positive integer.")
 
-    extreme_selectors = get_extreme_period_selectors(representative_periods_cfg)
+    include_extreme = get_include_extreme(representative_periods_cfg)
     period_hours = get_period_hours(representative_periods_cfg)
 
     if feature_t_full.empty:
@@ -506,18 +616,32 @@ def select_period_entries(feature_t_full, source_index_full, representative_peri
         feature_t_full.index[0], len(feature_cluster), timestep_hours,
     )
 
+    ranking_columns = []
+    if include_extreme:
+        feature_cluster, ranking_columns = add_extreme_ranking_columns(
+            feature_cluster,
+            source_index_full[cluster_rows],
+            period_steps,
+        )
+
     tsam_kwargs = dict(
         timeSeries=feature_cluster,
         hoursPerPeriod=period_hours,
         noTypicalPeriods=number,
         clusterMethod="hierarchical",
+        # Only the period *mapping* is read out of tsam (medoid indices, extreme labels,
+        # cluster membership); every value downstream is sliced from the raw source data
+        # by ``source_snapshots``. Rescaling only rewrites ``agg.typicalPeriods``, which
+        # nothing here touches, and it cannot converge on the seasonally confined ranking
+        # columns -- so it is switched off rather than left to warn about a 98% integral
+        # deviation in a series that is never used.
+        rescaleClusterPeriods=False,
     )
-    add_mean_min, add_mean_max = build_extreme_period_selector_columns(feature_cluster, extreme_selectors)
-    if add_mean_min or add_mean_max:
+    if ranking_columns:
         tsam_kwargs.update(
             extremePeriodMethod="new_cluster_center",
-            addMeanMin=add_mean_min,
-            addMeanMax=add_mean_max,
+            addMeanMax=ranking_columns,
+            weightDict={column: EXTREME_RANKING_WEIGHT for column in ranking_columns},
         )
 
     agg = tsam.TimeSeriesAggregation(**tsam_kwargs)
@@ -763,8 +887,8 @@ def build_national_feature_frame(carrier_profiles, demand_total):
     tuple[pandas.DataFrame, dict[str, pandas.Series | None]]
         The feature frame (wind, solar, AC demand) and the individual aggregate
         profiles keyed ``"wind"`` / ``"solar"`` / ``"load"``, which the diagnostic
-        plots reuse. Extreme periods are ranked on the feature columns themselves
-        (see ``build_extreme_period_selector_columns``).
+        plots reuse. Extreme periods are ranked on residual-load columns derived
+        from this frame (see ``add_extreme_ranking_columns``).
     """
     load = None
     if demand_total is not None and len(demand_total):
@@ -1244,7 +1368,7 @@ def validate_period_counts(period_entries_by_horizon, representative_periods) ->
     reported as a warning, not an error.
     """
     number = int(representative_periods.get("number", 4))
-    extreme_selectors = get_extreme_period_selectors(representative_periods)
+    expected_extremes = len(EXTREME_RANKING_COLUMNS) if get_include_extreme(representative_periods) else 0
     period_hours = get_period_hours(representative_periods)
 
     for horizon, entries in period_entries_by_horizon.items():
@@ -1255,14 +1379,14 @@ def validate_period_counts(period_entries_by_horizon, representative_periods) ->
                 f"Representative selection produced {len(representative_entries)} representative periods "
                 f"for {horizon}; expected {number}.",
             )
-        if len(extreme_entries) != len(extreme_selectors):
+        if len(extreme_entries) != expected_extremes:
             logger.warning(
-                "Selection produced %s extreme periods for %s instead of the %s requested (%s): tsam drops "
-                "an extreme period that is already a cluster center.",
+                "Selection produced %s extreme periods for %s instead of the %s requested: tsam drops an "
+                "extreme period that is already a cluster center, and a residual-load ranking column is "
+                "skipped when its capacity-factor feature is missing.",
                 len(extreme_entries),
                 horizon,
-                len(extreme_selectors),
-                extreme_selectors,
+                expected_extremes,
             )
 
         expected_steps = len(entries) * period_hours

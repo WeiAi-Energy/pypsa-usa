@@ -63,6 +63,22 @@ NO_NEW_BUILD_BASE_CARRIERS = {"coal", "OCGT"}
 RESOURCE_PROFILE_CARRIERS = {"onwind", "offwind", "offwind_floating", "solar"}
 
 
+def thermal_siting_buses(n: pypsa.Network) -> pd.Index:
+    """
+    Buses that already host a unit whose base carrier is in
+    ``NUCLEAR_SITING_BASE_CARRIERS`` -- the existing thermal footprint.
+
+    Shared by new nuclear and by TES: both are sited where a thermal plant
+    (and its interconnection/steam cycle) already exists, not at any AC bus.
+    """
+    return pd.Index(
+        n.generators.loc[
+            n.generators.carrier.str.split("-").str[0].isin(NUCLEAR_SITING_BASE_CARRIERS),
+            "bus",
+        ].unique(),
+    )
+
+
 def carrier_new_build_buses(
     n: pypsa.Network,
     carrier: str,
@@ -97,12 +113,7 @@ def carrier_new_build_buses(
       is logged -- it adds one extendable generator per AC bus.
     """
     if carrier == "nuclear":
-        thermal_buses_i = pd.Index(
-            n.generators.loc[
-                n.generators.carrier.str.split("-").str[0].isin(NUCLEAR_SITING_BASE_CARRIERS),
-                "bus",
-            ].unique(),
-        )
+        thermal_buses_i = thermal_siting_buses(n)
         if thermal_buses_i.empty:
             # Deliberately no fallback to all AC buses here (unlike the generic
             # branch below): falling back would turn the siting restriction into
@@ -287,10 +298,33 @@ def attach_storageunits(n, costs, elec_opts, investment_year, bus_multipliers=No
 
 
 def attach_tes_storageunits(n: pypsa.Network, sector_costs_path: str, bus_multipliers=None):
-    """Attach reference TES buses, stores, chargers, and dischargers."""
-    buses_i = n.buses.index[n.buses.carrier == "AC"]
-    if buses_i.empty:
+    """
+    Attach reference TES buses, stores, chargers, and dischargers.
+
+    Only buses that already host a thermal generator are eligible, matching the
+    new-nuclear siting rule (``thermal_siting_buses``).
+    """
+    ac_buses_i = n.buses.index[n.buses.carrier == "AC"]
+    if ac_buses_i.empty:
         return
+
+    # TES is sited like new nuclear: only at buses that already host a thermal
+    # unit (see NUCLEAR_SITING_BASE_CARRIERS), since the storage is retrofitted
+    # against an existing steam cycle / interconnection. As for nuclear there is
+    # deliberately no fallback to all AC buses -- that would void the restriction.
+    buses_i = ac_buses_i.intersection(thermal_siting_buses(n))
+    if buses_i.empty:
+        logger.warning(
+            "No existing %s capacity in the network -- no TES attached.",
+            sorted(NUCLEAR_SITING_BASE_CARRIERS),
+        )
+        return
+    logger.info(
+        "TES restricted to %s of %s AC buses with existing %s capacity.",
+        len(buses_i),
+        len(ac_buses_i),
+        sorted(NUCLEAR_SITING_BASE_CARRIERS),
+    )
 
     costs = SectorCosts(sector_costs_path)
     crp = costs.value("TES", "crp")
@@ -357,10 +391,10 @@ def attach_tes_storageunits(n: pypsa.Network, sector_costs_path: str, bus_multip
 
 
 def flexible_electrolysis_accounting_region(config: dict) -> str:
-    """Return the validated hydrogen balance accounting level.
+    """Return the validated electrolysis accounting level.
 
-    ``h2ptcreg`` (default) balances hydrogen production per 45V hydrogen PTC
-    region; ``nation`` balances it once over the whole modelled system.
+    ``h2ptcreg`` (default) balances electrolysis per 45V hydrogen PTC region;
+    ``nation`` balances it once over the whole modelled system.
     """
     accounting_region = config.get("accounting_region", "h2ptcreg")
     if accounting_region not in ("h2ptcreg", "nation"):
@@ -387,12 +421,9 @@ def attach_flexible_electrolysis(
     total. Either way, buses without an ``h2ptcreg`` (non-US) get no link. The
     links have ``efficiency = 0``, so nothing is
     injected into the H2 buses and their nodal
-    balance holds trivially without any sink component. The annual hydrogen
-    production is instead imposed in ``solve_network`` as a per-accounting-region
-    constraint on the link electricity withdrawal (``p0``) times the conversion
-    efficiency implied by ``h2 electrolysis`` / ``electricity-input`` in
-    ``simple_sector_costs.csv``. The value is validated here so a broken cost file
-    fails at build time.
+    balance holds trivially without any sink component. The annual electrolysis
+    electricity demand is instead imposed in ``solve_network`` as a
+    per-accounting-region constraint on the link electricity withdrawal (``p0``).
     """
     if not config.get("enable", False):
         return
@@ -404,12 +435,6 @@ def attach_flexible_electrolysis(
         return
 
     costs = SectorCosts(sector_costs_path)
-    electricity_input = costs.value("h2 electrolysis", "electricity-input")
-    if electricity_input <= 0.0:
-        raise ValueError(
-            "'h2 electrolysis' 'electricity-input' in simple_sector_costs.csv must be positive; "
-            f"got {electricity_input}.",
-        )
 
     ac_buses = n.buses.index[n.buses.carrier == "AC"]
     if ac_buses.empty:
@@ -481,8 +506,8 @@ def attach_flexible_electrolysis(
         p_nom_extendable=True,
         p_nom_max=1e5,
         # Zero efficiency: no hydrogen flows into the accounting bus, so its energy
-        # balance is satisfied automatically. Hydrogen output is accounted for in
-        # solve_network from p0 and the configured electricity input per hydrogen.
+        # balance is satisfied automatically. The fleet's annual electricity demand
+        # is imposed on p0 in solve_network.
         efficiency=0.0,
         capital_cost=costs.annualized(
             "h2 electrolysis",

@@ -37,6 +37,7 @@ import atlite.datasets.era5 as era5
 import numpy as np
 import pandas as pd
 import pypsa
+import xarray as xr
 from _helpers import configure_cds_api, configure_logging
 from scipy import sparse
 from scipy.spatial import cKDTree
@@ -66,6 +67,19 @@ def required_months(source_timesteps: pd.DatetimeIndex) -> list[pd.Period]:
     """Return the calendar months the representative source hours fall in."""
     months = pd.PeriodIndex(pd.DatetimeIndex(source_timesteps), freq="M").unique()
     return sorted(months)
+
+
+def cached_hours(path: str) -> pd.DatetimeIndex:
+    """Times already stored in a cached cutout, leaving no open handle on ``path``.
+
+    Deliberately bypasses ``atlite.Cutout``: for an existing file its constructor does
+    ``xr.open_dataset(path).chunk(...)`` and keeps only the chunked result. ``Dataset.chunk``
+    drops the dataset's ``_close``, so ``cutout.data.close()`` is a silent no-op and the
+    netCDF handle stays open with no reference left to close it. On Windows that makes the
+    file impossible to delete or replace.
+    """
+    with xr.open_dataset(path) as ds:
+        return pd.DatetimeIndex(ds.indexes["time"])
 
 
 def build_monthly_cutout(path, month: pd.Period, hours: pd.DatetimeIndex, bounds: dict) -> atlite.Cutout:
@@ -104,9 +118,7 @@ def build_monthly_cutout(path, month: pd.Period, hours: pd.DatetimeIndex, bounds
         )
 
     if os.path.exists(path):
-        existing = open_cutout()
-        available = pd.DatetimeIndex(existing.data.indexes["time"])
-        missing = hours.difference(available)
+        missing = hours.difference(cached_hours(path))
         if not missing.empty:
             logger.warning(
                 "ERA5 cutout for %s is missing %s representative hours (first: %s); deleting "
@@ -116,10 +128,16 @@ def build_monthly_cutout(path, month: pd.Period, hours: pd.DatetimeIndex, bounds
                 missing[0],
                 path,
             )
-            existing.data.close()
             os.remove(path)
 
     cutout = open_cutout()
+    if os.path.exists(path):
+        # Same ``chunk``-drops-``_close`` problem as above: atlite's own ``prepare`` does
+        # ``cutout.data.close()`` then unlinks the file before renaming the new one into
+        # place, which fails on Windows unless the dataset can actually close itself.
+        # ``open_dataset(..., chunks=...)`` keeps ``_close``, ``open_dataset(...).chunk(...)``
+        # does not.
+        cutout.data = xr.open_dataset(path, chunks=cutout.chunks or {})
     logger.info("Preparing 2 m air-temperature cutout for %s hours in %s at %s.", len(hours), month, path)
     cutout.prepare(features=["temperature"])
     return cutout

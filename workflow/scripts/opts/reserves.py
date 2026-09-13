@@ -92,6 +92,21 @@ Note the flip side of aggregating: within a region the requirement is one sum, s
 intra-regional transmission earns no adequacy value -- a region containing both a
 large generator and an unreachable load pocket will pass. Use a finer region
 definition where that matters.
+
+Snapshot coverage
+-----------------
+On a chronological timeline the requirement is written on every snapshot. Under
+representative periods it is written on the **extreme periods only** (see
+``_erm_snapshots``): those blocks are the residual-load stress cases the margin
+exists to cover, while a representative block stands for many ordinary weeks and a
+margin written on it would size capacity against an average one. A selection with no
+extreme block at all falls back to every snapshot.
+
+That makes the reserve state live on a *subset* of the model's snapshots while every
+base-state variable still spans all of them. linopy aligns operands with
+``join="exact"``, so each base-state variable is cut down with ``.sel(snapshot=sns)``
+where it enters a requirement term; without it the expression build fails outright
+rather than silently misaligning.
 """
 
 import logging
@@ -99,7 +114,7 @@ import logging
 import numpy as np
 import pandas as pd
 from opts._helpers import get_region_buses
-from opts.representative_periods import storage_elapsed_hours
+from opts.representative_periods import extreme_period_snapshots, storage_elapsed_hours
 from pypsa.descriptors import (
     expand_series,
     get_activity_mask,
@@ -154,6 +169,42 @@ def _named_snapshots(n, sns):
     sns = sns.copy()
     sns.name = expected
     return sns
+
+
+def _erm_snapshots(n, sns, config):
+    """
+    Snapshots the requirement is written on: the extreme periods, when there are any.
+
+    Under representative periods the adequacy question belongs on the stress blocks. A
+    representative block stands for many ordinary weeks, so a reserve margin written on
+    it sizes capacity against an average week; the extreme blocks are exactly the
+    residual-load peaks the margin exists to cover. Writing the row on every
+    representative snapshot both dilutes the requirement and multiplies its row count
+    by the number of blocks.
+
+    Falls back to every snapshot when the selection carries no extreme block at all --
+    ``include_extreme`` off, or tsam dropped the requests because clustering had already
+    picked those periods as cluster centers. Dropping the constraint instead would
+    silently remove the adequacy policy from the run.
+    """
+    extreme = extreme_period_snapshots(n, sns, config)
+    if extreme is None:
+        return sns
+    if extreme.empty:
+        logger.warning(
+            "Representative periods are active but no period is marked extreme. Writing the ERM "
+            "requirement on all %d representative snapshots instead.",
+            len(sns),
+        )
+        return sns
+
+    logger.info(
+        "Representative periods are active: writing the ERM requirement on %d extreme-period "
+        "snapshots out of %d.",
+        len(extreme),
+        len(sns),
+    )
+    return _named_snapshots(n, extreme)
 
 
 def _erm_buses(n):
@@ -283,7 +334,8 @@ def define_erm_storage_unit_capacity(n, sns, config=None):
     eh = expand_series(storage_elapsed_hours(n, sns, config), assets.index)
     eff_dispatch = get_as_dense(n, c, "efficiency_dispatch", sns)
     m.add_constraints(
-        DataArray(eh / eff_dispatch) * m[f"{c}-p_dispatch_ERM"] - m[f"{c}-state_of_charge"],
+        DataArray(eh / eff_dispatch) * m[f"{c}-p_dispatch_ERM"]
+        - m[f"{c}-state_of_charge"].sel(snapshot=sns),
         "<=",
         0,
         name=f"{c}-p_dispatch-soc-upper_ERM",
@@ -316,7 +368,7 @@ def define_erm_store_link_capacity(n, sns, links_i, config=None):
     )
 
     store_indexer = DataArray(link_to_store.to_numpy(), dims=[c], coords={c: links_i})
-    store_e = m["Store-e"].sel(Store=store_indexer)
+    store_e = m["Store-e"].sel(snapshot=sns).sel(Store=store_indexer)
 
     store_activity = get_activity_mask(n, "Store", sns, pd.Index(link_to_store.unique()))
     store_activity.columns.name = "Store"
@@ -396,10 +448,10 @@ def _erm_boundary_flow(n, sns, region_buses, electric_links_i):
         sign = DataArray(
             pd.Series(np.where(into[crossing], 1.0, -1.0), index=crossing.rename(c)),
         )
-        terms.append((sign * m[f"{c}-s"].sel({c: crossing})).where(active).sum(c))
+        terms.append((sign * m[f"{c}-s"].sel(snapshot=sns).sel({c: crossing})).where(active).sum(c))
 
         if f"{c}-loss" in m.variables:
-            loss = m[f"{c}-loss"].sel({c: crossing})
+            loss = m[f"{c}-loss"].sel(snapshot=sns).sel({c: crossing})
             terms.append((-0.5 * loss).where(active).sum(c))
 
     if len(electric_links_i):
@@ -415,7 +467,8 @@ def _erm_boundary_flow(n, sns, region_buses, electric_links_i):
                 columns=crossing.rename(c),
             )
             active = DataArray(get_activity_mask(n, c, sns, crossing))
-            terms.append((DataArray(coef) * m[f"{c}-p"].sel({c: crossing})).where(active).sum(c))
+            link_p = m[f"{c}-p"].sel(snapshot=sns).sel({c: crossing})
+            terms.append((DataArray(coef) * link_p).where(active).sum(c))
 
     return terms
 
@@ -458,7 +511,7 @@ def _erm_internal_loss(n, sns, region_buses, electric_links_i):
             continue
 
         active = DataArray(get_activity_mask(n, c, sns, internal))
-        loss = m[f"{c}-loss"].sel({c: internal})
+        loss = m[f"{c}-loss"].sel(snapshot=sns).sel({c: internal})
         terms.append((-1.0 * loss).where(active).sum(c))
 
     if len(electric_links_i):
@@ -485,7 +538,8 @@ def _erm_internal_loss(n, sns, region_buses, electric_links_i):
             coef = -(1.0 - efficiency)
             coef.columns = coef.columns.rename(c)
             active = DataArray(get_activity_mask(n, c, sns, internal))
-            terms.append((DataArray(coef) * m[f"{c}-p"].sel({c: internal})).where(active).sum(c))
+            link_p = m[f"{c}-p"].sel(snapshot=sns).sel({c: internal})
+            terms.append((DataArray(coef) * link_p).where(active).sum(c))
 
     return terms
 
@@ -582,6 +636,7 @@ def define_erm_regional_requirements(n, sns, regions, buses):
             terms.append(
                 (1.0 + erm_value)
                 * m["Generator-p"]
+                .sel(snapshot=sns)
                 .sel(Generator=region_shedding_i)
                 .sum("Generator"),
             )
@@ -727,14 +782,16 @@ def add_ERM_constraints(
     n : pypsa.Network
         The PyPSA network object.
     snapshots : pd.Index
-        Snapshots the requirement is written on.
+        Candidate snapshots. Under representative periods the requirement is narrowed
+        to the extreme periods among them; see ``_erm_snapshots``.
     config : dict, optional
         Configuration dictionary containing ``electricity.erm``. Required if
         ``regional_erm_data`` is not provided. Also read for
         ``clustering.temporal.representative_periods``, which decides whether the
         hours backing a storage discharge come from the snapshot weightings or from
-        the physical timestep; without it the network's own representative-period
-        metadata decides.
+        the physical timestep, and -- together with the period metadata the network
+        carries -- which snapshots are extreme; without it the network's own
+        representative-period metadata decides.
     snakemake : snakemake object, optional
         Not used, kept for API compatibility.
     regional_erm_data : dict, optional
@@ -761,7 +818,7 @@ def add_ERM_constraints(
         logger.warning("No AC buses found. Skipping ERM constraints.")
         return
 
-    snapshots = _named_snapshots(n, snapshots)
+    snapshots = _erm_snapshots(n, _named_snapshots(n, snapshots), config)
     erm_dict = _expand_all_to_transmission_groups(n, erm_dict, buses)
 
     regions = {}
@@ -786,6 +843,15 @@ def add_ERM_constraints(
 
     define_erm_discharge_variables(n, snapshots, config)
     define_erm_regional_requirements(n, snapshots, regions, buses)
+
+
+def _dual_snapshot_index(n, index):
+    """Label a dual frame with the network's own snapshot index where they line up."""
+    if len(index) == len(n.snapshots):
+        return n.snapshots
+    if isinstance(index, pd.MultiIndex):
+        return index.set_names(n.snapshots.names)
+    return index.rename(getattr(n.snapshots, "name", "snapshot"))
 
 
 def store_ERM_duals(n):
@@ -818,6 +884,9 @@ def store_ERM_duals(n):
     region_dual = pd.DataFrame(
         {region: constraints[erm_requirement_name(region)].dual.to_pandas() for region in regions},
     )
-    region_dual.index = n.snapshots
+    # Not ``n.snapshots``: under representative periods the requirement covers only the
+    # extreme-period snapshots, so the dual frame is shorter than the timeline and is
+    # indexed by whatever the constraint itself was written on.
+    region_dual.index = _dual_snapshot_index(n, region_dual.index)
     region_dual.columns.name = "erm_region"
     n.erm_region_price = region_dual

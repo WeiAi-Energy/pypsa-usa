@@ -18,7 +18,6 @@ rule solve_network:
         opts=config_provider("scenario", "opts"),
     input:
         network=solve_network_input,
-        sector_costs="repo_data/costs/simple_sector_costs.csv",
         hydrogen_demand_share="repo_data/ReEDS_Constraints/hydrogen_demand_share.csv",
         flowgates="repo_data/ReEDS_Constraints/transmission/transmission_capacity_init_AC_ba_NARIS2024.csv",
         safer_reeds="config/policy_constraints/reeds/prm_annual.csv",

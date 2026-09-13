@@ -12,11 +12,9 @@ import pytest
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 import solve_network as solve_network_module
 from solve_network import (
-    add_electrolysis_hydrogen_target_constraint,
+    add_electrolysis_electricity_target_constraint,
     h2ptcreg_hydrogen_shares,
 )
-
-SECTOR_COSTS = Path(__file__).parents[2] / "repo_data" / "costs" / "simple_sector_costs.csv"
 HYDROGEN_DEMAND_SHARE = (
     Path(__file__).parents[2] / "repo_data" / "ReEDS_Constraints" / "hydrogen_demand_share.csv"
 )
@@ -95,7 +93,7 @@ def test_run_optimize_passes_extra_functionality_into_iterative_solver():
     assert captured["proximal"] is True
 
 
-def test_add_electrolysis_constraint_splits_hydrogen_target_across_h2ptcreg_regions():
+def test_add_electrolysis_constraint_splits_electricity_target_across_h2ptcreg_regions():
     hours_2030 = pd.date_range("2030-01-01 00:00", "2030-01-01 02:00", freq="h")
     hours_2040 = pd.date_range("2040-01-01 00:00", "2040-01-01 02:00", freq="h")
     snapshots = pd.MultiIndex.from_tuples(
@@ -119,8 +117,6 @@ def test_add_electrolysis_constraint_splits_hydrogen_target_across_h2ptcreg_regi
     n.add("Bus", "Texas flexible electrolysis H2", carrier="H2")
     n.add("Bus", "California flexible electrolysis H2", carrier="H2")
     n.add("Carrier", "electrolysis")
-    efficiency = 1.0 / 1.351
-    # Network links carry zero efficiency; the constraint must use the configured factor.
     n.add(
         "Link",
         "b flexible electrolysis",
@@ -144,16 +140,15 @@ def test_add_electrolysis_constraint_splits_hydrogen_target_across_h2ptcreg_regi
     n.snapshot_weightings.loc[:, "generators"] = 2920.0
 
     n.optimize.create_model(multi_investment_periods=True)
-    add_electrolysis_hydrogen_target_constraint(
+    add_electrolysis_electricity_target_constraint(
         n,
         snapshots,
         {
             "flexible_electrolysis": {
                 "enable": True,
-                "annual_hydrogen_twh": 1512,
+                "annual_electricity_twh": 1512,
             },
         },
-        str(SECTOR_COSTS),
         str(HYDROGEN_DEMAND_SHARE),
     )
 
@@ -172,7 +167,7 @@ def test_add_electrolysis_constraint_splits_hydrogen_target_across_h2ptcreg_regi
     for period, hours in ((2030, hours_2030), (2040, hours_2040)):
         for region, link in region_links.items():
             rate_labels = (
-                n.model.variables[f"FlexibleElectrolysis-h2_rate-{region}-{period}"]
+                n.model.variables[f"FlexibleElectrolysis-power_rate-{region}-{period}"]
                 .labels.to_numpy()
                 .reshape(-1)
             )
@@ -184,18 +179,18 @@ def test_add_electrolysis_constraint_splits_hydrogen_target_across_h2ptcreg_regi
             # The fleet is aggregated per snapshot, one row per snapshot, so the
             # annual row never carries a term per link and snapshot.
             definition = n.model.constraints[
-                f"FlexibleElectrolysis-h2_rate-{region}-{period}-definition"
+                f"FlexibleElectrolysis-power_rate-{region}-{period}-definition"
             ]
             assert set(np.asarray(definition.sign).ravel().tolist()) == {"="}
             assert np.asarray(definition.rhs).ravel().tolist() == pytest.approx([0.0] * 3)
             assert np.asarray(definition.coeffs).ravel().tolist() == pytest.approx(
-                [1.0, -efficiency] * 3,
+                [1.0, -1.0] * 3,
             )
             assert np.asarray(definition.vars).ravel().tolist() == [
                 label for pair in zip(rate_labels, expected_vars) for label in pair
             ]
 
-            constraint = n.model.constraints[f"FlexibleElectrolysis-annual_hydrogen-{region}-{period}"]
+            constraint = n.model.constraints[f"FlexibleElectrolysis-annual_electricity-{region}-{period}"]
             assert constraint.rhs.item() == pytest.approx(expected_rhs[region] * 1e3)
             assert constraint.sign.item() == "="
             assert constraint.coeffs.to_numpy().tolist() == pytest.approx([2920.0 / 1e3] * 3)
@@ -242,38 +237,36 @@ def _national_electrolysis_network(accounting_bus):
     return n, snapshots, hours
 
 
-def test_add_electrolysis_constraint_pools_hydrogen_target_nationally():
+def test_add_electrolysis_constraint_pools_electricity_target_nationally():
     n, snapshots, hours = _national_electrolysis_network(
         "nation flexible electrolysis H2",
     )
 
-    add_electrolysis_hydrogen_target_constraint(
+    add_electrolysis_electricity_target_constraint(
         n,
         snapshots,
         {
             "flexible_electrolysis": {
                 "enable": True,
-                "annual_hydrogen_twh": 1512,
+                "annual_electricity_twh": 1512,
                 "accounting_region": "nation",
             },
         },
-        str(SECTOR_COSTS),
         str(HYDROGEN_DEMAND_SHARE),
     )
 
     # A single constraint over every electrolysis link, for the full national total.
     assert not any(
-        name.startswith("FlexibleElectrolysis-annual_hydrogen-")
-        and not name.startswith("FlexibleElectrolysis-annual_hydrogen-nation")
+        name.startswith("FlexibleElectrolysis-annual_electricity-")
+        and not name.startswith("FlexibleElectrolysis-annual_electricity-nation")
         for name in n.model.constraints
     )
-    constraint = n.model.constraints["FlexibleElectrolysis-annual_hydrogen-nation-2030"]
+    constraint = n.model.constraints["FlexibleElectrolysis-annual_electricity-nation-2030"]
     assert constraint.rhs.item() == pytest.approx(1512.0 * 1e3)
     assert constraint.sign.item() == "="
 
-    efficiency = 1.0 / 1.351
     rate_labels = (
-        n.model.variables["FlexibleElectrolysis-h2_rate-nation-2030"]
+        n.model.variables["FlexibleElectrolysis-power_rate-nation-2030"]
         .labels.to_numpy()
         .reshape(-1)
     )
@@ -283,7 +276,7 @@ def test_add_electrolysis_constraint_pools_hydrogen_target_nationally():
     assert constraint.vars.to_numpy().tolist() == rate_labels.tolist()
 
     # The whole fleet enters through the aggregation rows instead.
-    definition = n.model.constraints["FlexibleElectrolysis-h2_rate-nation-2030-definition"]
+    definition = n.model.constraints["FlexibleElectrolysis-power_rate-nation-2030-definition"]
     expected_vars = (
         n.model.variables["Link-p"]
         .labels.sel(
@@ -294,7 +287,7 @@ def test_add_electrolysis_constraint_pools_hydrogen_target_nationally():
     )
     assert np.asarray(definition.rhs).ravel().tolist() == pytest.approx([0.0] * 3)
     assert np.asarray(definition.coeffs).ravel().tolist() == pytest.approx(
-        [1.0, -efficiency, -efficiency] * 3,
+        [1.0, -1.0, -1.0] * 3,
     )
     assert sorted(np.asarray(definition.vars).ravel().tolist()) == sorted(
         rate_labels.tolist() + expected_vars.tolist(),
@@ -305,23 +298,50 @@ def test_add_electrolysis_constraint_pools_hydrogen_target_nationally():
     assert not [name for name in n.model.constraints if "capacity_energy" in name]
 
 
+def test_add_electrolysis_constraint_target_is_electricity_not_hydrogen():
+    """The annual row fixes the fleet's grid withdrawal, with no conversion factor."""
+    n, snapshots, hours = _national_electrolysis_network(
+        "nation flexible electrolysis H2",
+    )
+
+    add_electrolysis_electricity_target_constraint(
+        n,
+        snapshots,
+        {
+            "flexible_electrolysis": {
+                "enable": True,
+                "annual_electricity_twh": 1000.0,
+                "accounting_region": "nation",
+            },
+        },
+        str(HYDROGEN_DEMAND_SHARE),
+    )
+
+    # 1000 TWh_e over 3 snapshots weighted 2920 h each: the rate is the fleet's
+    # electricity draw, so p sums to the target without the 1.351 electricity
+    # input per unit of hydrogen.
+    constraint = n.model.constraints["FlexibleElectrolysis-annual_electricity-nation-2030"]
+    assert constraint.rhs.item() == pytest.approx(1000.0 * 1e3)
+    definition = n.model.constraints["FlexibleElectrolysis-power_rate-nation-2030-definition"]
+    assert np.asarray(definition.coeffs).ravel().tolist() == pytest.approx([1.0, -1.0, -1.0] * 3)
+
+
 def test_add_electrolysis_constraint_rejects_accounting_region_network_mismatch():
     n, snapshots, _ = _national_electrolysis_network(
         "Texas flexible electrolysis H2",
     )
 
     with pytest.raises(ValueError, match="accounting_region"):
-        add_electrolysis_hydrogen_target_constraint(
+        add_electrolysis_electricity_target_constraint(
             n,
             snapshots,
             {
                 "flexible_electrolysis": {
                     "enable": True,
-                    "annual_hydrogen_twh": 1512,
+                    "annual_electricity_twh": 1512,
                     "accounting_region": "nation",
                 },
             },
-            str(SECTOR_COSTS),
             str(HYDROGEN_DEMAND_SHARE),
         )
 
@@ -355,13 +375,13 @@ def test_electrolysis_representative_periods_use_single_annual_equality():
     n.optimize.create_model(multi_investment_periods=True)
 
     target_twh = 0.01
-    add_electrolysis_hydrogen_target_constraint(
+    add_electrolysis_electricity_target_constraint(
         n,
         snapshots,
         {
             "flexible_electrolysis": {
                 "enable": True,
-                "annual_hydrogen_twh": target_twh,
+                "annual_electricity_twh": target_twh,
             },
             "clustering": {
                 "temporal": {
@@ -372,7 +392,6 @@ def test_electrolysis_representative_periods_use_single_annual_equality():
                 },
             },
         },
-        str(SECTOR_COSTS),
         str(HYDROGEN_DEMAND_SHARE),
     )
 
@@ -381,12 +400,11 @@ def test_electrolysis_representative_periods_use_single_annual_equality():
     assert not [name for name in n.model.variables if "hydrogen_budget" in name]
     assert not [name for name in n.model.constraints if "-block_" in name]
 
-    efficiency = 1.0 / 1.351
     annual = n.model.constraints[
-        "FlexibleElectrolysis-annual_hydrogen-Texas-2030"
+        "FlexibleElectrolysis-annual_electricity-Texas-2030"
     ]
     rate_labels = (
-        n.model.variables["FlexibleElectrolysis-h2_rate-Texas-2030"]
+        n.model.variables["FlexibleElectrolysis-power_rate-Texas-2030"]
         .labels.to_numpy()
         .reshape(-1)
     )
@@ -395,10 +413,10 @@ def test_electrolysis_representative_periods_use_single_annual_equality():
     assert annual.rhs.item() == pytest.approx(target_twh * 1e3)
 
     # The links reach the target only through the per-snapshot aggregation rows.
-    definition = n.model.constraints["FlexibleElectrolysis-h2_rate-Texas-2030-definition"]
+    definition = n.model.constraints["FlexibleElectrolysis-power_rate-Texas-2030-definition"]
     link_p_labels = n.model["Link-p"].labels.to_numpy().reshape(-1)
     assert np.asarray(definition.coeffs).ravel().tolist() == pytest.approx(
-        [1.0, -efficiency] * 4,
+        [1.0, -1.0] * 4,
     )
     assert np.asarray(definition.vars).ravel().tolist() == [
         label for pair in zip(rate_labels, link_p_labels) for label in pair

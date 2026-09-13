@@ -16,19 +16,24 @@ from build_reeds_renewable_profiles import (
 )
 from select_representative_periods import (
     LOAD_FEATURE,
+    NET_LOAD_SOLAR_COLUMN,
+    NET_LOAD_WIND_COLUMN,
     SOLAR_FEATURE,
+    SUMMER_MONTHS,
     WIND_FEATURE,
+    WINTER_MONTHS,
     _build_contiguous_source_period_rows,
     _build_period_entry,
     _build_representative_period_mapping,
     _build_representative_snapshot_weightings,
     _get_extreme_period_ids,
     _scale_snapshot_weightings_to_total_hours,
-    build_extreme_period_selector_columns,
+    add_extreme_ranking_columns,
     build_national_feature_frame,
     build_plot_data,
-    get_extreme_period_selectors,
+    get_include_extreme,
     get_period_hours,
+    period_season_mask,
     select_period_entries,
     serialize_representative_period_metadata,
     validate_period_counts,
@@ -102,34 +107,20 @@ def test_period_hours_rejects_the_retired_length_keys(retired_key):
         get_period_hours({"period_length": 5, retired_key: 5})
 
 
-def test_get_extreme_period_selectors_bool_defaults():
-    """Boolean config should preserve the previous default extreme selectors."""
-    assert get_extreme_period_selectors({"include_extreme": True}) == ["solar_min", "wind_min", "demand_max"]
-    assert get_extreme_period_selectors({"include_extreme": []}) == []
+def test_get_include_extreme_is_a_plain_switch():
+    """include_extreme is on/off; an absent or null key means off."""
+    assert get_include_extreme({"include_extreme": True}) is True
+    assert get_include_extreme({"include_extreme": False}) is False
+    assert get_include_extreme({"include_extreme": None}) is False
+    assert get_include_extreme({}) is False
 
 
-def test_get_extreme_period_selectors_accepts_explicit_min_max_entries():
-    """Explicit min/max entries should be preserved in input order."""
-    assert get_extreme_period_selectors({"include_extreme": ["solar_min", "demand_max", "wind_max"]}) == [
-        "solar_min",
-        "demand_max",
-        "wind_max",
-    ]
-
-
-def test_get_extreme_period_selectors_accepts_legacy_category_entries():
-    """Legacy category entries should map to their historical defaults."""
-    assert get_extreme_period_selectors({"include_extreme": ["solar", "wind", "demand"]}) == [
-        "solar_min",
-        "wind_min",
-        "demand_max",
-    ]
-
-
-def test_get_extreme_period_selectors_rejects_invalid_entries():
-    """Invalid extreme selectors should raise a clear validation error."""
-    with pytest.raises(ValueError, match="include_extreme"):
-        get_extreme_period_selectors({"include_extreme": ["hydro_max"]})
+def test_get_include_extreme_rejects_the_retired_selector_lists():
+    """A config still carrying per-feature selectors must fail loudly."""
+    with pytest.raises(ValueError, match="must be true or false"):
+        get_include_extreme({"include_extreme": ["solar_min", "demand_max"]})
+    with pytest.raises(ValueError, match="must be true or false"):
+        get_include_extreme({"include_extreme": "demand_max"})
 
 
 def _feature_frame(columns, periods=3):
@@ -140,30 +131,107 @@ def _feature_frame(columns, periods=3):
     return frame
 
 
-def test_extreme_selector_columns_point_at_the_clustering_features():
-    """tsam ranks periods on the feature columns themselves, min and max alike."""
-    feature_t = _feature_frame([WIND_FEATURE, SOLAR_FEATURE, LOAD_FEATURE])
+# Two one-hour candidate periods per season, so a period index maps straight onto a
+# season without any block arithmetic in the test.
+_SEASONAL_SOURCE_HOURS = pd.DatetimeIndex(
+    [
+        "2030-07-01 00:00",
+        "2030-07-01 01:00",
+        "2030-01-01 00:00",
+        "2030-01-01 01:00",
+    ],
+)
 
-    add_mean_min, add_mean_max = build_extreme_period_selector_columns(
-        feature_t,
-        ["solar_min", "wind_max", "demand_min", "demand_max"],
+
+def _seasonal_feature_frame(columns):
+    """Feature frame whose two 2-hour periods are one summer block and one winter block."""
+    return _feature_frame(columns, periods=4)
+
+
+def test_extreme_ranking_columns_are_normalized_demand_minus_capacity_factor():
+    """Load is min-max normalized onto [0, 1] before the capacity factor is subtracted."""
+    feature_t = _seasonal_feature_frame([WIND_FEATURE, SOLAR_FEATURE, LOAD_FEATURE])
+    feature_t[LOAD_FEATURE] = [100.0, 200.0, 300.0, 400.0]
+    feature_t[SOLAR_FEATURE] = [0.1, 0.2, 0.3, 0.4]
+    feature_t[WIND_FEATURE] = [0.5, 0.5, 0.5, 0.5]
+
+    ranked, ranking_columns = add_extreme_ranking_columns(feature_t, _SEASONAL_SOURCE_HOURS, 2)
+
+    assert ranking_columns == [NET_LOAD_SOLAR_COLUMN, NET_LOAD_WIND_COLUMN]
+    load_normalized = [0.0, 1 / 3, 2 / 3, 1.0]
+    solar_residual = [load - cf for load, cf in zip(load_normalized, [0.1, 0.2, 0.3, 0.4])]
+    wind_residual = [load - 0.5 for load in load_normalized]
+
+    # The summer column keeps the July period and buries the January one a full range
+    # below the series minimum; the winter column does the mirror image.
+    solar_sentinel = min(solar_residual) - (max(solar_residual) - min(solar_residual)) - 1.0
+    wind_sentinel = min(wind_residual) - (max(wind_residual) - min(wind_residual)) - 1.0
+    assert ranked[NET_LOAD_SOLAR_COLUMN].tolist() == pytest.approx(
+        solar_residual[:2] + [solar_sentinel, solar_sentinel],
+    )
+    assert ranked[NET_LOAD_WIND_COLUMN].tolist() == pytest.approx(
+        [wind_sentinel, wind_sentinel] + wind_residual[2:],
+    )
+    # The source features must survive untouched alongside the ranking columns.
+    assert ranked[LOAD_FEATURE].tolist() == [100.0, 200.0, 300.0, 400.0]
+
+
+def test_extreme_ranking_column_sentinel_cannot_win_the_ranking():
+    """Whatever the out-of-season load does, its period mean stays below every in-season one."""
+    feature_t = _seasonal_feature_frame([SOLAR_FEATURE, LOAD_FEATURE])
+    # The January period carries by far the highest residual load; the season confines
+    # the summer column to July anyway.
+    feature_t[LOAD_FEATURE] = [100.0, 110.0, 9000.0, 9500.0]
+    feature_t[SOLAR_FEATURE] = [0.6, 0.6, 0.0, 0.0]
+
+    ranked, _ = add_extreme_ranking_columns(feature_t, _SEASONAL_SOURCE_HOURS, 2)
+
+    period_means = ranked[NET_LOAD_SOLAR_COLUMN].to_numpy().reshape(2, 2).mean(axis=1)
+    assert period_means[0] > period_means[1]
+
+
+def test_period_season_mask_assigns_a_straddling_block_to_its_majority_season():
+    """More than half the hours in the season wins the block; a minority does not."""
+    hours = pd.date_range("2030-08-29 00:00", periods=8, freq="D")
+
+    # Aug 29-31 + Sep 1, then Sep 2-5: the first block is 3/4 summer, the second none.
+    assert period_season_mask(hours, 4, SUMMER_MONTHS).tolist() == [True, False]
+    # As one 8-day block it is only 3/8 summer, so it belongs to neither season.
+    assert period_season_mask(hours, 8, SUMMER_MONTHS).tolist() == [False]
+    assert period_season_mask(hours, 8, WINTER_MONTHS).tolist() == [False]
+
+
+def test_extreme_ranking_columns_skip_a_missing_capacity_factor_feature():
+    """A ranking column for a carrier that is not modelled is dropped, not fatal."""
+    feature_t = _seasonal_feature_frame([SOLAR_FEATURE, LOAD_FEATURE])
+
+    ranked, ranking_columns = add_extreme_ranking_columns(feature_t, _SEASONAL_SOURCE_HOURS, 2)
+
+    assert ranking_columns == [NET_LOAD_SOLAR_COLUMN]
+    assert NET_LOAD_WIND_COLUMN not in ranked.columns
+
+
+def test_extreme_ranking_columns_skip_a_season_with_no_candidate_period():
+    """A timeline that never reaches winter yields the summer extreme only."""
+    feature_t = _seasonal_feature_frame([WIND_FEATURE, SOLAR_FEATURE, LOAD_FEATURE])
+    july_only = pd.DatetimeIndex(
+        ["2030-07-01 00:00", "2030-07-01 01:00", "2030-07-02 00:00", "2030-07-02 01:00"],
     )
 
-    assert add_mean_min == [SOLAR_FEATURE, LOAD_FEATURE]
-    assert add_mean_max == [WIND_FEATURE, LOAD_FEATURE]
+    ranked, ranking_columns = add_extreme_ranking_columns(feature_t, july_only, 2)
+
+    assert ranking_columns == [NET_LOAD_SOLAR_COLUMN]
+    assert NET_LOAD_WIND_COLUMN not in ranked.columns
 
 
-def test_extreme_selector_columns_skip_missing_features():
-    """A selector for a carrier that is not modelled is dropped, not fatal."""
-    feature_t = _feature_frame([SOLAR_FEATURE, LOAD_FEATURE])
+def test_extreme_ranking_columns_need_a_non_constant_load_feature():
+    """Without load -- or with flat load -- there is no residual load to rank on."""
+    no_load = _seasonal_feature_frame([SOLAR_FEATURE, WIND_FEATURE])
+    assert add_extreme_ranking_columns(no_load, _SEASONAL_SOURCE_HOURS, 2)[1] == []
 
-    add_mean_min, add_mean_max = build_extreme_period_selector_columns(
-        feature_t,
-        ["wind_min", "solar_min", "demand_max"],
-    )
-
-    assert add_mean_min == [SOLAR_FEATURE]
-    assert add_mean_max == [LOAD_FEATURE]
+    flat = _seasonal_feature_frame([SOLAR_FEATURE, WIND_FEATURE, LOAD_FEATURE])
+    flat[LOAD_FEATURE] = 100.0
+    assert add_extreme_ranking_columns(flat, _SEASONAL_SOURCE_HOURS, 2)[1] == []
 
 
 def test_scale_snapshot_weightings_to_total_hours_preserves_column_ratios():
@@ -191,9 +259,90 @@ def test_select_period_entries_rejects_a_retired_period_length_key():
             {
                 "period_length": 5,
                 "extreme_period_length": 2,
-                "include_extreme": ["solar_min"],
+                "include_extreme": True,
             },
         )
+
+
+SUMMER_PEAK_DAY = pd.Timestamp("2030-07-20")
+WINTER_PEAK_DAY = pd.Timestamp("2030-01-15")
+
+
+def _residual_load_feature_frame():
+    """
+    A year of hourly features with one planted summer and one planted winter extreme.
+
+    The July day carries the annual peak load with neither solar nor wind, so it wins
+    *both* residual-load metrics outright; the January day is the runner-up on the wind
+    metric only. An unconfined search would therefore return the July day twice and tsam
+    would drop the duplicate -- the seasonal confinement is exactly what puts the wind
+    extreme on the January day instead.
+    """
+    hours = pd.date_range("2030-01-01 00:00", "2030-12-31 23:00", freq="h")
+    day = hours.normalize()
+    is_summer_peak = np.asarray(day == SUMMER_PEAK_DAY)
+    is_winter_peak = np.asarray(day == WINTER_PEAK_DAY)
+
+    hour_of_day = np.asarray(hours.hour)
+    shape = 1.0 + 0.2 * np.sin(2 * np.pi * hour_of_day / 24.0)
+    sun = np.clip(np.sin(np.pi * (hour_of_day - 6) / 12.0), 0.0, None)
+
+    load_scale = np.where(is_summer_peak, 1.0, np.where(is_winter_peak, 0.95, 0.5))
+    solar_scale = np.where(is_summer_peak, 0.0, 0.8)
+    wind_scale = np.where(is_summer_peak | is_winter_peak, 0.0, 0.5)
+
+    frame = pd.DataFrame(
+        {
+            LOAD_FEATURE: 10_000.0 * load_scale * shape,
+            SOLAR_FEATURE: solar_scale * sun,
+            WIND_FEATURE: wind_scale * shape,
+        },
+        index=hours,
+    )
+    frame.columns = pd.MultiIndex.from_tuples(frame.columns)
+    return frame
+
+
+def test_select_period_entries_brackets_the_year_with_one_extreme_per_season():
+    """A live tsam run must return the summer solar-residual day and the winter wind one.
+
+    ``number`` is 1 on purpose: the planted extremes are the most distinctive days in
+    the frame, so a larger cluster count makes them medoids in their own right and tsam
+    then drops them as extremes (see ``validate_period_counts``).
+    """
+    frame = _residual_load_feature_frame()
+
+    entries = select_period_entries(
+        frame,
+        frame.index,
+        {"number": 1, "period_length": 1, "include_extreme": True},
+    )
+
+    representative = [entry for entry in entries if entry["kind"] == "representative"]
+    extreme = [entry for entry in entries if entry["kind"] == "extreme"]
+    assert len(representative) == 1
+    # Extremes are appended in EXTREME_RANKING_COLUMNS order: the summer solar column
+    # first, then the winter wind column.
+    assert [entry["source_start"].normalize() for entry in extreme] == [
+        SUMMER_PEAK_DAY,
+        WINTER_PEAK_DAY,
+    ]
+    # Every source period is accounted for: 1 typical day + the two extreme days.
+    assert sum(entry["weightings"]["objective"].iloc[0] for entry in entries) == len(frame) / 24
+
+
+def test_select_period_entries_skips_extremes_when_the_switch_is_off():
+    """With include_extreme false the run is pure clustering: no extra periods."""
+    frame = _residual_load_feature_frame()
+
+    entries = select_period_entries(
+        frame,
+        frame.index,
+        {"number": 3, "period_length": 1, "include_extreme": False},
+    )
+
+    assert len(entries) == 3
+    assert all(entry["kind"] == "representative" for entry in entries)
 
 
 def test_get_extreme_period_ids_reads_the_labels_tsam_appended():
@@ -235,7 +384,7 @@ def test_validate_period_counts_warns_when_tsam_drops_an_extreme(caplog):
     cfg = {
         "number": 1,
         "period_length": 2 / 24,
-        "include_extreme": ["solar_min", "demand_max"],
+        "include_extreme": True,
     }
 
     with caplog.at_level("WARNING"):
