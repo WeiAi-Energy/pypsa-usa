@@ -67,13 +67,11 @@ next-most-extreme candidate, so a run can legitimately return fewer periods than
 
 Timezone
 --------
-ReEDS capacity factors are UTC; the EER demand h5 is US Central Standard
-Time (UTC-06:00). ``build_eer_demand.ReadEer`` performs the CST -> UTC roll
-inside each 8760-hour block, which is why the demand series is read through that
-class rather than from the h5 directly. Feeding a CST series into the feature
-frame would shift the load feature six hours out of phase with the renewable
-features and silently corrupt both the clustering and the extreme-period
-windows; ``build_national_feature_frame`` asserts index equality as a backstop.
+ReEDS capacity factors are UTC and EER demand is fixed US Central Standard Time
+(UTC-06:00). ``build_eer_demand.ReadEer`` converts EER's published timestamps
+to UTC, while the VRE reader uses each file's published ``time_index_<year>``.
+The clustering frame retains only their exact shared UTC hours rather than
+assuming that 8760 positional rows imply the same calendar.
 
 Snapshot labels
 ---------------
@@ -89,7 +87,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from _helpers import configure_logging, get_weather_year_snapshots
+from _helpers import configure_logging
 
 logger = logging.getLogger(__name__)
 
@@ -251,19 +249,6 @@ def _get_period_steps(period_hours, timestep_hours, period_name, label):
     return steps
 
 
-def _is_expected_leap_day_gap(previous: pd.Timestamp, current: pd.Timestamp) -> bool:
-    """Return true for the 25-hour gap created by removing 29 February."""
-    return (
-        previous.month == 2
-        and previous.day == 28
-        and previous.hour == 23
-        and current.month == 3
-        and current.day == 1
-        and current.hour == 0
-        and previous.is_leap_year
-    )
-
-
 def _build_contiguous_source_period_rows(source_index, steps_per_period, timestep_hours):
     """Build complete non-overlapping periods without crossing weather-year gaps."""
     source_index = pd.DatetimeIndex(source_index)
@@ -276,7 +261,7 @@ def _build_contiguous_source_period_rows(source_index, steps_per_period, timeste
     for position in range(1, len(source_index)):
         previous = source_index[position - 1]
         current = source_index[position]
-        if current - previous != expected_delta and not _is_expected_leap_day_gap(previous, current):
+        if current - previous != expected_delta:
             boundaries.append(position)
     boundaries.append(len(source_index))
 
@@ -695,6 +680,7 @@ def read_reeds_national_capacity_factor(carriers, reeds_vre_dir, weather_years):
         REEDS_TECH,
         SOLAR_INVERTER_LOADING_RATIO,
         national_available_generation,
+        read_cf_time_indexes,
     )
 
     def solar_transform(block):
@@ -728,6 +714,8 @@ def read_reeds_national_capacity_factor(carriers, reeds_vre_dir, weather_years):
 
             transform = solar_transform if carrier in SOLAR_CARRIERS else None
             cf_path = f"{reeds_vre_dir}/{cfg['cf']}"
+            # One open for every weather year: these CF tables are multi-gigabyte.
+            cf_time_indexes = read_cf_time_indexes(cf_path, weather_years)
             parts = []
             for weather_year in weather_years:
                 values = national_available_generation(
@@ -737,7 +725,7 @@ def read_reeds_national_capacity_factor(carriers, reeds_vre_dir, weather_years):
                     int(weather_year),
                     transform=transform,
                 )
-                index = get_weather_year_snapshots([int(weather_year)], drop_leap_day=True)
+                index = cf_time_indexes[int(weather_year)]
                 if len(values) != len(index):
                     raise ValueError(
                         f"ReEDS {carrier} {weather_year} returned {len(values)} hours; "
@@ -788,11 +776,8 @@ def build_national_feature_frame(carrier_profiles, demand_total):
         ``{"wind": ..., "solar": ...}`` capacity-weighted mean capacity factor,
         from ``read_reeds_national_capacity_factor``.
     demand_total : pandas.Series
-        Total national AC demand for the planning horizon, indexed by the raw
-        source timestamps. **Must already be converted to UTC** -- build it with
-        ``build_eer_demand.ReadEer``, which applies the CST->UTC roll. Passing a
-        CST series here silently shifts the load feature six hours out of phase
-        with the renewable features.
+        Total national AC demand for the planning horizon, indexed by actual UTC
+        source timestamps. Build it with ``build_eer_demand.ReadEer``.
 
     Returns
     -------
@@ -813,30 +798,37 @@ def build_national_feature_frame(carrier_profiles, demand_total):
         "load": load,
     }
 
-    # Hard alignment check: this is where a CST/UTC mix-up would otherwise slip
-    # through and quietly corrupt both the clustering and the extreme selection.
+    # EER is published in fixed CST and VRE in UTC.  Both omit Dec. 31 in leap
+    # years, so row counts cannot establish physical alignment.  Use only exact
+    # timestamp overlap, which also makes any unpaired boundary hours explicit.
     available = {name: profile for name, profile in profile_map.items() if profile is not None}
     if not available:
         raise ValueError(
             "No wind/solar generation or AC demand available for representative-period clustering.",
         )
-    reference_name, reference = next(iter(available.items()))
+    common_index = None
     for name, profile in available.items():
-        if not profile.index.equals(reference.index):
-            raise ValueError(
-                f"The '{name}' feature index does not match the '{reference_name}' feature index. "
-                "ReEDS profiles are UTC while EER demand is CST (UTC-06:00); build the demand "
-                "series with build_eer_demand.ReadEer so it is rolled to UTC first.",
+        common_index = profile.index if common_index is None else common_index.intersection(profile.index)
+    common_index = pd.DatetimeIndex(common_index).sort_values()
+    if common_index.empty:
+        raise ValueError("Demand and renewable profiles have no shared UTC timestamps.")
+    for name, profile in available.items():
+        excluded = len(profile.index.difference(common_index))
+        if excluded:
+            logger.info(
+                "Excluding %s %s source hours without a physical UTC match in every clustering feature.",
+                excluded,
+                name,
             )
 
     feature_map = {}
     for carrier_name, column in (("wind", WIND_FEATURE), ("solar", SOLAR_FEATURE)):
         if profile_map[carrier_name] is not None:
-            feature_map[column] = profile_map[carrier_name]
+            feature_map[column] = profile_map[carrier_name].reindex(common_index)
     if load is not None:
-        feature_map[LOAD_FEATURE] = load
+        feature_map[LOAD_FEATURE] = load.reindex(common_index)
 
-    features = pd.DataFrame(feature_map, index=reference.index)
+    features = pd.DataFrame(feature_map, index=common_index)
     features.columns = pd.MultiIndex.from_tuples(features.columns)
     features = features.replace([np.inf, -np.inf], np.nan).dropna(axis=1)
     logger.info(
@@ -1128,9 +1120,9 @@ def reindex_source_timeseries_to_snapshots(n, df, source_timesteps):
     missing = source_timesteps.difference(df.index)
     if not missing.empty:
         raise ValueError(
-            f"Source time series is missing {len(missing)} representative hours "
-            f"(first: {missing[0]}). Check that it uses the same weather-year calendar "
-            "as get_weather_year_snapshots(..., drop_leap_day=True).",
+                f"Source time series is missing {len(missing)} representative hours "
+            f"(first: {missing[0]}). Check that it uses the same published UTC "
+            "timestamps as the representative-period selection.",
         )
 
     sliced = df.loc[source_timesteps]

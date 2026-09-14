@@ -16,8 +16,9 @@ the stale ``.nc`` file, and rebuilds it for the current selection.
 Timezone
 --------
 ERA5 timestamps are UTC, and so are the ``source_timestep`` values in
-``snapshots.csv``: renewable profiles are natively UTC, and EER demand is rolled
-CST -> UTC by ``build_eer_demand.ReadEer`` before selection. Temperature is
+``snapshots.csv``: renewable profiles carry native UTC timestamps, and EER
+demand is converted from fixed CST using its published timestamp field before
+selection. Temperature is
 therefore sliced at the source hours **verbatim, with no shift**, and the script
 asserts every source hour is present in the cutout. Applying a local-time offset
 here would silently put the derate out of phase with load and wind/solar.

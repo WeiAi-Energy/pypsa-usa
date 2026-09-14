@@ -7,11 +7,12 @@ import pandas as pd
 import pytest
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-from _helpers import get_weather_year_snapshots
 from build_reeds_renewable_profiles import (
     CF_SCALE,
+    build_profile_dataset,
     national_available_generation,
     read_cf_for_sites,
+    read_cf_time_index,
     source_rows_by_weather_year,
 )
 from select_representative_periods import (
@@ -414,13 +415,16 @@ def test_serialize_representative_period_metadata_falls_back_to_bounds():
 
 
 def _write_cf_h5(path, gids, cf_by_gid, weather_year=2007):
-    """Write a minimal ReEDS CF table: /columns plus one /cf_profile_{year} block."""
+    """Write a minimal ReEDS CF table with its published time index."""
     import tables
 
     values = np.column_stack([np.asarray(cf_by_gid[gid], dtype=float) for gid in gids])
     with tables.open_file(str(path), "w") as h5:
         h5.create_array("/", "columns", np.asarray(gids, dtype=np.int64))
         h5.create_array("/", f"cf_profile_{weather_year}", np.rint(values / CF_SCALE).astype(np.int32))
+        # Match the shipped ReEDS convention: tz-aware UTC strings.
+        timestamps = pd.date_range(f"{weather_year}-01-01", periods=len(values), freq="h", tz="UTC")
+        h5.create_array("/", f"time_index_{weather_year}", np.asarray(timestamps.strftime("%Y-%m-%d %H:%M:%S%z"), dtype="S25"))
     return str(path)
 
 
@@ -473,13 +477,33 @@ def test_read_cf_for_sites_row_subset_matches_full_read(tmp_path):
     assert subset.index.tolist() == [1, 3]
     pd.testing.assert_frame_equal(subset, full.loc[[1, 3]])
 
+    timestamps = read_cf_time_index(path, 2007)
+    assert timestamps.tz is None
+    assert timestamps.equals(pd.date_range("2007-01-01", periods=4, freq="h"))
+
+
+def test_read_cf_time_index_rejects_a_non_utc_published_offset(tmp_path):
+    """A file published in local time must not be read as if it were UTC."""
+    import tables
+
+    path = str(tmp_path / "local.h5")
+    with tables.open_file(path, "w") as h5:
+        h5.create_array("/", "columns", np.asarray([1], dtype=np.int64))
+        h5.create_array("/", "cf_profile_2007", np.zeros((4, 1), dtype=np.int32))
+        stamps = pd.date_range("2007-01-01", periods=4, freq="h", tz="Etc/GMT+6")
+        h5.create_array("/", "time_index_2007", np.asarray(stamps.strftime("%Y-%m-%d %H:%M:%S%z"), dtype="S25"))
+
+    with pytest.raises(ValueError, match="not published in UTC"):
+        read_cf_time_index(path, 2007)
+
 
 def test_source_rows_by_weather_year_skips_untouched_years():
     """Only the weather years the windows land in should be opened."""
-    year_hours = get_weather_year_snapshots([2008], drop_leap_day=True)
+    year_hours = pd.date_range("2008-01-01", "2009-01-01", inclusive="left", freq="h")
+    year_hours = year_hours[~((year_hours.month == 12) & (year_hours.day == 31))]
     source = pd.DatetimeIndex([year_hours[0], year_hours[5], year_hours[8759]])
 
-    mapping = source_rows_by_weather_year(source, [2007, 2008, 2016])
+    mapping = source_rows_by_weather_year(source, {2007: pd.date_range("2007-01-01", periods=2, freq="h"), 2008: year_hours, 2016: pd.date_range("2016-01-01", periods=2, freq="h")})
 
     assert set(mapping) == {2008}
     rows, wanted = mapping[2008]
@@ -487,9 +511,37 @@ def test_source_rows_by_weather_year_skips_untouched_years():
     assert wanted.equals(pd.DatetimeIndex([year_hours[0], year_hours[5], year_hours[8759]]))
 
 
-def test_source_rows_by_weather_year_rejects_off_calendar_hours():
-    with pytest.raises(ValueError, match="weather-year calendar"):
-        source_rows_by_weather_year(pd.DatetimeIndex(["2008-02-29 00:00"]), [2008])
+def test_source_rows_by_weather_year_uses_the_published_leap_day_and_rejects_missing_december_31():
+    hours = pd.date_range("2008-01-01", "2009-01-01", inclusive="left", freq="h")
+    hours = hours[~((hours.month == 12) & (hours.day == 31))]
+    mapping = source_rows_by_weather_year(pd.DatetimeIndex(["2008-02-29 00:00"]), {2008: hours})
+    assert mapping[2008][0].tolist() == [1416]
+
+    with pytest.raises(ValueError, match="published ReEDS UTC indexes"):
+        source_rows_by_weather_year(pd.DatetimeIndex(["2008-12-31 00:00"]), {2008: hours})
+
+
+def test_build_profile_dataset_keeps_time_indexed_for_named_source_hours():
+    """Representative hours arrive named 'source_timestep'; time must stay indexed.
+
+    xarray names a coordinate's dimension after the pandas index, so a named
+    index used to create a stray dimension and leave ``time`` without an index.
+    ``to_pandas()`` then returned positional rows that matched no weather hour.
+    """
+    hours = pd.DatetimeIndex(
+        ["2009-12-07 06:00", "2009-12-07 07:00"],
+        name="source_timestep",
+    )
+    buses = pd.Index(["b0", "b1"], name="bus")
+    profile_df = pd.DataFrame([[0.1, 0.2], [0.3, 0.4]], index=hours, columns=buses)
+    series = pd.Series([1.0, 2.0], index=buses)
+
+    dataset = build_profile_dataset("solar", profile_df, buses, series, series, series)
+
+    assert set(dataset.sizes) == {"time", "bus"}
+    assert "time" in dataset.indexes
+    recovered = dataset["profile"].transpose("time", "bus").to_pandas()
+    assert pd.DatetimeIndex(recovered.index).equals(pd.DatetimeIndex(hours, name="time"))
 
 
 def test_build_national_feature_frame_assembles_three_features():
@@ -521,14 +573,16 @@ def test_build_national_feature_frame_drops_absent_carrier_groups():
     assert profiles["wind"] is None
 
 
-def test_build_national_feature_frame_rejects_demand_left_in_central_time():
-    """A CST demand series must not silently pass as UTC-aligned."""
+def test_build_national_feature_frame_keeps_only_exact_physical_timestamp_overlap():
+    """Naive but offset source indices are never aligned positionally."""
     hours = pd.date_range("2030-01-01 00:00", periods=8, freq="h")
     solar = pd.Series(np.linspace(0.0, 1.0, 8), index=hours)
     cst_demand = pd.Series(np.arange(8, dtype=float), index=hours - pd.Timedelta(hours=6))
 
-    with pytest.raises(ValueError, match="CST"):
-        build_national_feature_frame({"solar": solar}, cst_demand)
+    features, _ = build_national_feature_frame({"solar": solar}, cst_demand)
+
+    assert features.index.equals(hours[:2])
+    assert features[LOAD_FEATURE].tolist() == [6.0, 7.0]
 
 
 def test_build_plot_data_pads_periods_of_differing_length():

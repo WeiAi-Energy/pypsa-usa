@@ -8,7 +8,7 @@ import pandas as pd
 import rasterio
 import tables
 import xarray as xr
-from _helpers import configure_logging, get_weather_year_snapshots
+from _helpers import configure_logging
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +134,61 @@ def read_cf_for_sites(
     return pd.DataFrame(values * CF_SCALE, columns=present_gids, index=index)
 
 
+def _parse_cf_time_index(raw, cf_path: str, weather_year: int) -> pd.DatetimeIndex:
+    """Decode one published ``time_index_<year>`` block into naive UTC timestamps."""
+    try:
+        timestamps = pd.DatetimeIndex(
+            pd.to_datetime([value.decode() if isinstance(value, bytes) else str(value) for value in raw]),
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"ReEDS VRE timestamps in {cf_path} mix several UTC offsets; they must be "
+            "published in UTC.",
+        ) from exc
+    # ReEDS publishes tz-aware UTC ("2007-01-01 00:00:00+00:00"). The rest of the
+    # workflow carries naive UTC, so drop the marker -- but only after confirming
+    # the published offset really is zero, so a non-UTC file cannot slip through.
+    if timestamps.tz is not None:
+        as_utc = timestamps.tz_convert("UTC").tz_localize(None)
+        if not as_utc.equals(timestamps.tz_localize(None)):
+            raise ValueError(
+                f"ReEDS VRE timestamps in {cf_path} are not published in UTC "
+                f"(first: {timestamps[0]}).",
+            )
+        timestamps = as_utc
+    if not timestamps.is_unique or not timestamps.is_monotonic_increasing:
+        raise ValueError(f"ReEDS {weather_year} VRE timestamps must be unique and increasing.")
+    return timestamps
+
+
+def read_cf_time_indexes(cf_path: str, weather_years) -> dict[int, pd.DatetimeIndex]:
+    """Read the published UTC timestamps for several weather years in one file open.
+
+    The CF tables are multi-gigabyte, so opening one per weather year costs far
+    more than the timestamp blocks themselves are worth.
+    """
+    indexes = {}
+    with tables.open_file(cf_path, "r") as h5:
+        for weather_year in weather_years:
+            year = int(weather_year)
+            node_name = f"/time_index_{year}"
+            profile_name = f"/cf_profile_{year}"
+            if node_name not in h5:
+                raise ValueError(f"ReEDS profile {cf_path} has no {node_name} dataset.")
+            if profile_name not in h5:
+                raise ValueError(f"ReEDS profile {cf_path} has no weather year {year}.")
+            timestamps = _parse_cf_time_index(h5.get_node(node_name)[:], cf_path, year)
+            if len(timestamps) != h5.get_node(profile_name).shape[0]:
+                raise ValueError(f"ReEDS {year} timestamp/profile length mismatch in {cf_path}.")
+            indexes[year] = timestamps
+    return indexes
+
+
+def read_cf_time_index(cf_path: str, weather_year: int) -> pd.DatetimeIndex:
+    """Read the published UTC timestamps for one ReEDS weather-year profile."""
+    return read_cf_time_indexes(cf_path, [weather_year])[int(weather_year)]
+
+
 def national_available_generation(
     cf_path: str,
     gids: list[int],
@@ -181,7 +236,7 @@ def national_available_generation(
     return out
 
 
-def source_rows_by_weather_year(source_timesteps, years):
+def source_rows_by_weather_year(source_timesteps, weather_year_indexes):
     """
     Map representative source hours onto per-weather-year row positions.
 
@@ -189,21 +244,25 @@ def source_rows_by_weather_year(source_timesteps, years):
     representative windows actually touch, so untouched weather years are never
     opened.
     """
-    source_timesteps = pd.DatetimeIndex(source_timesteps)
+    source_timesteps = pd.DatetimeIndex(source_timesteps).unique().sort_values()
     mapping = {}
-    for year in years:
-        year_snapshots = get_weather_year_snapshots([year], drop_leap_day=True)
-        wanted = pd.DatetimeIndex(sorted(set(source_timesteps[source_timesteps.year == year])))
-        if wanted.empty:
-            continue
-        positions = year_snapshots.get_indexer(wanted)
-        if (positions < 0).any():
-            missing = wanted[positions < 0]
-            raise ValueError(
-                f"Representative source hours are not on the {year} weather-year calendar "
-                f"({len(missing)} missing, first {missing[0]}).",
-            )
-        mapping[year] = (positions, wanted)
+    matched = np.zeros(len(source_timesteps), dtype=bool)
+    for year, year_snapshots in weather_year_indexes.items():
+        positions = pd.DatetimeIndex(year_snapshots).get_indexer(source_timesteps)
+        present = positions >= 0
+        if (matched & present).any():
+            duplicate = source_timesteps[matched & present][0]
+            raise ValueError(f"Representative source hour {duplicate} occurs in multiple ReEDS years.")
+        if present.any():
+            mapping[int(year)] = (positions[present], source_timesteps[present])
+            matched |= present
+
+    if not matched.all():
+        missing = source_timesteps[~matched]
+        raise ValueError(
+            f"Representative source hours are absent from the published ReEDS UTC indexes "
+            f"({len(missing)} missing, first {missing[0]}).",
+        )
     return mapping
 
 
@@ -258,6 +317,39 @@ def aggregate_profile(
     return profile
 
 
+def build_profile_dataset(tech, profile_df, buses, p_nom_max, cost_trans, lcoe_cf) -> xr.Dataset:
+    """Assemble the per-bus profile dataset on an indexed, hourly ``time`` axis.
+
+    xarray takes a coordinate's dimension name from the pandas index's own
+    ``name``, not from the coords key. Representative source hours arrive named
+    "source_timestep", which would silently create a stray dimension and leave
+    ``time`` unindexed -- ``DataArray.to_pandas()`` in ``add_electricity`` then
+    falls back to a positional RangeIndex matching no weather hour at all. Naming
+    the axis here is what keeps that from happening.
+    """
+    profile_df = profile_df.rename_axis("time")
+    dataset = xr.Dataset(
+        {
+            "profile": (("time", "bus"), profile_df.to_numpy()),
+            "weight": ("bus", p_nom_max.reindex(buses).to_numpy()),
+            "p_nom_max": ("bus", p_nom_max.reindex(buses).to_numpy()),
+            "lcoe_cf": ("bus", lcoe_cf.reindex(buses).to_numpy()),
+            "average_distance": ("bus", np.zeros(len(buses))),
+            "cost_trans_usd_per_mw": ("bus", cost_trans.reindex(buses).to_numpy()),
+        },
+        coords={"time": profile_df.index, "bus": buses},
+    )
+    if "time" not in dataset.indexes:
+        raise ValueError(
+            f"The {tech} profile has no indexed 'time' coordinate "
+            f"(dimensions: {dict(dataset.sizes)}); downstream slicing would fall back "
+            "to positional rows.",
+        )
+    if tech.startswith("offwind"):
+        dataset["underwater_fraction"] = ("bus", np.zeros(len(buses)))
+    return dataset
+
+
 def main(snakemake) -> None:
     configure_logging(snakemake)
     tech = snakemake.wildcards.technology
@@ -285,6 +377,7 @@ def main(snakemake) -> None:
     p_nom_max, cost_trans, lcoe_cf = aggregate_static_site_data(joined)
     buses = p_nom_max.index
     cf_path = f"{snakemake.params.reeds_vre_dir}/{REEDS_TECH[tech]['cf']}"
+    weather_year_indexes = read_cf_time_indexes(cf_path, years)
 
     # With representative periods active, only the selected hours are built. The
     # selection ran upstream on national-aggregate features, so the per-bus
@@ -294,7 +387,7 @@ def main(snakemake) -> None:
         from select_representative_periods import read_representative_snapshots
 
         _, _, source_timesteps = read_representative_snapshots(representative_snapshots)
-        rows_by_year = source_rows_by_weather_year(source_timesteps, years)
+        rows_by_year = source_rows_by_weather_year(source_timesteps, weather_year_indexes)
         logger.info(
             "Building %s representative hours for %s across %s of %s weather years.",
             sum(len(rows) for rows, _ in rows_by_year.values()),
@@ -303,9 +396,7 @@ def main(snakemake) -> None:
             len(years),
         )
     else:
-        rows_by_year = {
-            year: (None, get_weather_year_snapshots([year], drop_leap_day=True)) for year in years
-        }
+        rows_by_year = {year: (None, index) for year, index in weather_year_indexes.items()}
 
     yearly_profiles = []
     for weather_year, (rows, year_snapshots) in rows_by_year.items():
@@ -320,20 +411,13 @@ def main(snakemake) -> None:
         profile.index = year_snapshots
         yearly_profiles.append(profile)
 
+    # xarray takes a coordinate's dimension name from the pandas index's own
+    # ``name``, not from the coords key. Representative source hours arrive
+    # named "source_timestep", which would create a stray dimension and leave
+    # ``time`` unindexed -- ``to_pandas()`` downstream then silently degrades to
+    # a positional RangeIndex that matches no weather hour at all.
     profile_df = pd.concat(yearly_profiles).sort_index()
-    dataset = xr.Dataset(
-        {
-            "profile": (("time", "bus"), profile_df.to_numpy()),
-            "weight": ("bus", p_nom_max.reindex(buses).to_numpy()),
-            "p_nom_max": ("bus", p_nom_max.reindex(buses).to_numpy()),
-            "lcoe_cf": ("bus", lcoe_cf.reindex(buses).to_numpy()),
-            "average_distance": ("bus", np.zeros(len(buses))),
-            "cost_trans_usd_per_mw": ("bus", cost_trans.reindex(buses).to_numpy()),
-        },
-        coords={"time": profile_df.index, "bus": buses},
-    )
-    if tech.startswith("offwind"):
-        dataset["underwater_fraction"] = ("bus", np.zeros(len(buses)))
+    dataset = build_profile_dataset(tech, profile_df, buses, p_nom_max, cost_trans, lcoe_cf)
     dataset.to_netcdf(snakemake.output.profile)
     logger.info("Wrote %s with %s hourly snapshots.", snakemake.output.profile, len(profile_df))
 

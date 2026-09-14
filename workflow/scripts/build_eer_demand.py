@@ -5,10 +5,9 @@ from typing import ClassVar
 
 import numpy as np
 import pandas as pd
-import pypsa
-from _helpers import configure_logging, get_weather_year_snapshots, read_network
-from select_representative_periods import read_representative_snapshots
+from _helpers import configure_logging, read_network
 from constants import CODE_2_STATE, STATE_2_CODE
+from select_representative_periods import read_representative_snapshots
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +20,7 @@ def state_code(value: object) -> str | None:
 
 
 class ReadEer:
-    """Read every configured EER weather year, shifting each year CST -> UTC."""
+    """Read EER demand on its published timestamps and convert fixed CST to UTC."""
 
     MODEL_YEARS: ClassVar[tuple[int, ...]] = (2021, 2025, 2030, 2035, 2040, 2045, 2050)
     WEATHER_YEARS: ClassVar[tuple[int, ...]] = (
@@ -60,27 +59,85 @@ class ReadEer:
     def _decode(value) -> str:
         return value.decode() if isinstance(value, bytes) else str(value)
 
-    def _read_segment(self, group, weather_year: int) -> pd.DataFrame:
-        start = self.WEATHER_YEARS.index(weather_year) * self.HOURS_PER_YEAR
-        stop = start + self.HOURS_PER_YEAR
+    def _timestamps(self, group) -> pd.DatetimeIndex:
+        """Return the published, naive-CST timestamps carried by one EER group."""
+        if not hasattr(group, "datetime"):
+            raise ValueError("EER group is missing its required datetime dataset.")
+        try:
+            timestamps = pd.DatetimeIndex(
+                pd.to_datetime([self._decode(value) for value in group.datetime[:]]),
+            )
+        except ValueError as exc:
+            # Mixed offsets mean the file follows US daylight time, not fixed CST.
+            raise ValueError(
+                "EER datetime values must be fixed CST (UTC-06:00) without daylight saving.",
+            ) from exc
+        # EER publishes tz-aware fixed CST ("2007-01-01 00:00:00-06:00"). Keep the
+        # CST wall clock here -- _read_segment picks weather years off the local
+        # calendar and applies the CST -> UTC shift itself -- but verify the offset
+        # is a constant -06:00, so a daylight-saving file cannot pass unnoticed.
+        if timestamps.tz is not None:
+            local = timestamps.tz_localize(None)
+            shifted = local + pd.Timedelta(hours=self.CST_TO_UTC_SHIFT)
+            if not timestamps.tz_convert("UTC").tz_localize(None).equals(shifted):
+                raise ValueError(
+                    "EER datetime values must be fixed CST (UTC-06:00) without daylight saving.",
+                )
+            timestamps = local
+        if not timestamps.is_monotonic_increasing or not timestamps.is_unique:
+            raise ValueError("EER datetime values must be unique and increasing.")
+        return timestamps
+
+    def _read_states(self, group, timestamps: pd.DatetimeIndex) -> dict[str, np.ndarray]:
+        """Read every state column once, whole.
+
+        Each column spans all 15 weather years, so reading it per weather year
+        would pull the same array off disk fifteen times over.
+        """
         states = [
             self._decode(column)
             for column in group.columns[:]
             if self._decode(column) != "datetime"
         ]
-        # Keep the roll inside each 8760-hour block.  Concatenating first would
-        # incorrectly exchange six hours between adjacent weather years.
-        data = {
-            state: np.roll(
-                getattr(group, state)[start:stop],
-                self.CST_TO_UTC_SHIFT,
+        columns = {}
+        for state in states:
+            values = np.asarray(getattr(group, state)[:])
+            if len(values) != len(timestamps):
+                raise ValueError("EER state profiles and datetime dataset have different lengths.")
+            columns[state] = values
+        return columns
+
+    def _read_segment(
+        self,
+        group,
+        weather_year: int,
+        timestamps: pd.DatetimeIndex | None = None,
+        columns: dict[str, np.ndarray] | None = None,
+    ) -> pd.DataFrame:
+        """Slice one weather year off its actual CST datetimes, converted to UTC.
+
+        ``timestamps`` and ``columns`` let ``read`` hoist both reads out of the
+        weather-year loop; passing neither reads them for this call alone.
+        """
+        timestamps = self._timestamps(group) if timestamps is None else pd.DatetimeIndex(timestamps)
+        rows = np.flatnonzero(timestamps.year == weather_year)
+        if len(rows) != self.HOURS_PER_YEAR:
+            raise ValueError(
+                f"EER weather year {weather_year} has {len(rows)} timestamps; expected "
+                f"{self.HOURS_PER_YEAR}. Use the published datetime field rather than positional rows.",
             )
-            for state in states
-        }
-        snapshots = get_weather_year_snapshots([weather_year], drop_leap_day=True)
-        return pd.DataFrame(data, index=snapshots)
+        if columns is None:
+            columns = self._read_states(group, timestamps)
+        data = {state: values[rows] for state, values in columns.items()}
+
+        # EER publishes fixed Central Standard Time (UTC-06:00), not US daylight
+        # time.  Add six hours to the actual timestamps; do not circularly roll
+        # individual weather-year arrays, which corrupts year boundaries.
+        utc_timestamps = timestamps[rows] + pd.Timedelta(hours=self.CST_TO_UTC_SHIFT)
+        return pd.DataFrame(data, index=utc_timestamps)
 
     def read(self) -> pd.DataFrame:
+        """Read all configured planning and weather years on UTC timestamps."""
         import tables
 
         periods = []
@@ -92,9 +149,16 @@ class ReadEer:
                     raise ValueError(
                         f"EER file has no model year {planning_horizon}.",
                     ) from exc
+                timestamps = self._timestamps(group)
+                columns = self._read_states(group, timestamps)
                 weather = pd.concat(
-                    [self._read_segment(group, year) for year in self.weather_years],
+                    [
+                        self._read_segment(group, year, timestamps, columns)
+                        for year in self.weather_years
+                    ],
                 )
+                if not weather.index.is_unique:
+                    raise ValueError("Converted EER UTC timestamps must be unique.")
                 weather.index = pd.MultiIndex.from_arrays(
                     [
                         np.repeat(planning_horizon, len(weather)),
