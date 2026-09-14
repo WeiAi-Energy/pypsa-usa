@@ -3,10 +3,11 @@ Representative-period selection: everything in one place.
 
 This module owns the whole representative-period story:
 
-* the tsam hierarchical-clustering selection itself, run on a small national-aggregate feature
-  frame (capacity-weighted mean wind CF, capacity-weighted mean solar CF, total
-  AC demand) computed straight from the raw ReEDS supply curves / CF tables and
-  the EER demand h5;
+* the tsam hierarchical-clustering selection itself, run on a per-state feature frame
+  (capacity-weighted mean wind CF, capacity-weighted mean solar CF, AC demand -- one
+  column per state) computed straight from the raw ReEDS supply curves / CF tables and
+  the EER demand h5, alongside the three national aggregates the extreme periods are
+  ranked on;
 * the snapshot definition it writes out (``snapshots.csv``, ``metadata.json``,
   ``profiles.png``) and the readers downstream rules use to consume it;
 * the diagnostic profile plots.
@@ -17,9 +18,35 @@ per-bus profile or network exists. ``build_renewable_profiles`` then builds only
 those hours, and every downstream rule attaches time series for those hours only,
 so the full 15-weather-year x 8760 h timeline is never materialised anywhere.
 
-The wind/solar features are aggregated over **every** site in the ReEDS supply
-curve with no spatial aggregation and no region filter, so this step depends on
-nothing but the raw data files.
+Spatial resolution and column weights
+-------------------------------------
+The wind/solar features are aggregated over **every** site in the ReEDS supply curve,
+grouped by the state the site sits in. A site's state comes from the county FIPS the
+interconnection tables already carry per ``sc_point_gid``, so no spatial join and no bus
+region is needed and this step still depends on nothing but static data files -- which
+matters, because it runs before any network exists. Demand needs no mapping at all: the
+EER h5 is published per state.
+
+Grouping is free on disk. ``grouped_available_generation`` already reads every site
+column of each row block, so the only change is the collapse at the end
+(``block @ W`` instead of ``block.dot(weights)``), and the national aggregate falls out
+as the row sum of the same pass.
+
+tsam min-max normalizes every column, which would give Rhode Island's wind profile the
+same pull as Texas'. Columns are therefore weighted by maximum capacity potential --
+supply-curve nameplate for wind and solar, mean AC demand for load. Note the **square
+root**: ``weightDict`` scales a column linearly but ``clusterMethod="hierarchical"`` is
+ward, which minimises *squared* Euclidean distance, so a column's pull on the clustering
+goes as ``weight**2``. Weights are ``sqrt(share)``, which makes the pull proportional to
+share and makes each feature family's weights satisfy ``sum(w**2) == 1`` -- so wind,
+solar and load contribute equally in total, exactly as the three unweighted national
+columns used to.
+
+``onwind`` and ``offwind`` stay merged into one capacity-weighted ``wind`` feature per
+state. Offshore is 42% of national supply-curve nameplate and dominates the wind column
+of 16 coastal states, so roughly half the wind weight rides on offshore shapes; that is
+deliberate, but it is also why the wind feature is the one to revisit first if the
+selected periods look wrong.
 
 Two pieces of the older in-network implementation are intentionally gone: the
 "force one spring + one fall representative period" seasonal constraint, and the
@@ -31,23 +58,27 @@ Extreme periods and weighting
 ``include_extreme`` is a plain on/off switch. When it is true, three extreme periods
 are requested -- one single-resource stress case per clustering feature:
 
-* **demand max**: the period with the highest mean AC demand;
-* **wind min**: the period with the lowest mean wind capacity factor;
-* **solar min**: the period with the lowest mean solar capacity factor.
+* **demand max**: the period with the highest mean *national* AC demand;
+* **wind min**: the period with the lowest mean *national* wind capacity factor;
+* **solar min**: the period with the lowest mean *national* solar capacity factor.
 
-Each is ranked on one *raw* clustering feature, so the three are the three physical
+Each is ranked on one raw national aggregate, so the three are the three physical
 stress cases the system has to survive on their own terms -- the peak-load block, the
 wind lull and the solar lull -- rather than one blended metric that can only ever
-return whichever stress the year happens to be worst at.
+return whichever stress the year happens to be worst at. They stay national even though
+the clustering is per state: a stress case is a system-wide event, and ranking on one
+state's lull would pick whichever state happens to be calmest, not the worst hour for
+the system.
 
-Because the ranking features are the very columns tsam already clusters on, they are
-handed straight to tsam's ``addMeanMax`` / ``addMeanMin`` and nothing is appended to
-the frame: there is no synthetic ranking column and no reweighting, so the clustering
-that picks the representative periods is untouched. tsam min-max normalizes every
-column internally, which is an affine map and therefore leaves these period rankings
-unchanged. A feature that is missing -- no wind carrier configured, say -- or
-degenerate (flat over the whole timeline, so it carries no ranking signal at all) is
-dropped with a warning rather than failing the run.
+tsam's ``addMeanMax`` / ``addMeanMin`` can only rank on columns of the frame it is
+handed, so the three national aggregates ride along *in* the clustering frame. They are
+given ``MIN_WEIGHT`` (1e-6) in ``weightDict`` -- four orders below the smallest state
+weight -- so they are invisible to the clustering distance while remaining available to
+rank on. That is safe because tsam ranks extremes on the weighted, normalized profiles
+and a positive constant scale is order-preserving, so a down-weighted national column
+picks exactly the period its raw counterpart would. A feature that is missing -- no wind
+carrier configured, say -- or degenerate (flat over the whole timeline, so it carries no
+ranking signal at all) is dropped with a warning rather than failing the run.
 
 tsam picks the period with the highest (or lowest) period mean per ranking feature, adds it as
 an *additional cluster center*, and re-checks every other period against it -- a
@@ -91,8 +122,10 @@ from _helpers import configure_logging
 
 logger = logging.getLogger(__name__)
 
-# Renewable carriers aggregated into each national clustering feature. Carriers in
-# the same group are combined by capacity into one mean-capacity-factor series.
+# Renewable carriers aggregated into each clustering feature. Carriers in the same
+# group are combined by capacity into one mean-capacity-factor series -- onshore and
+# offshore wind therefore share a single "wind" feature per state (see the module
+# docstring on what that costs in coastal states).
 WIND_CARRIERS = ("onwind", "offwind", "offwind_floating")
 SOLAR_CARRIERS = ("solar",)
 REEDS_FEATURE_GROUPS = {"wind": WIND_CARRIERS, "solar": SOLAR_CARRIERS}
@@ -100,6 +133,22 @@ REEDS_FEATURE_GROUPS = {"wind": WIND_CARRIERS, "solar": SOLAR_CARRIERS}
 WIND_FEATURE = ("Generator", "p_max_pu", "wind")
 SOLAR_FEATURE = ("Generator", "p_max_pu", "solar")
 LOAD_FEATURE = ("Load", "p_set", "ac_load")
+
+# Per-state columns reuse the national tuples with the state code appended to the last
+# level, so the frame keeps one flat 3-level MultiIndex that tsam can key a weightDict
+# and addMeanMax/addMeanMin off.
+_NATIONAL_FEATURES = {"wind": WIND_FEATURE, "solar": SOLAR_FEATURE, "load": LOAD_FEATURE}
+
+
+def state_feature(kind, state):
+    """Return the frame column for one state's ``kind`` ("wind"/"solar"/"load") feature."""
+    prefix = _NATIONAL_FEATURES[kind]
+    return (*prefix[:-1], f"{prefix[-1]}_{state}")
+
+
+# tsam clips any weightDict entry below this and prints a notice, so the national
+# ranking columns are pinned exactly at the floor rather than below it.
+NATIONAL_COLUMN_WEIGHT = 1e-6
 
 # The three extreme periods, one per clustering feature: the peak-load block, the wind
 # lull and the solar lull. Each is ranked on the *raw* feature, so each extreme is the
@@ -453,7 +502,7 @@ def serialize_representative_period_metadata(period_entries_by_label):
     return metadata
 
 
-def select_period_entries(feature_t_full, source_index_full, representative_periods_cfg):
+def select_period_entries(feature_t_full, source_index_full, representative_periods_cfg, weight_dict=None):
     """
     Select representative + extreme period entries for one source weather-year timeline.
 
@@ -468,12 +517,16 @@ def select_period_entries(feature_t_full, source_index_full, representative_peri
     Parameters
     ----------
     feature_t_full : pandas.DataFrame
-        Aggregate clustering features (weighted wind/solar CF, total AC load),
-        indexed by ``source_index_full``.
+        Clustering features (per-state weighted wind/solar CF and AC load, plus the
+        three national aggregates the extremes rank on), indexed by
+        ``source_index_full``.
     source_index_full : pandas.DatetimeIndex
         Full source timeline (e.g. concatenated 15 weather years).
     representative_periods_cfg : dict
         The ``clustering.temporal.representative_periods`` config block.
+    weight_dict : dict[tuple, float], optional
+        Per-column tsam ``weightDict``. Build it with ``build_clustering_weights``;
+        entries naming a column the frame does not carry are dropped.
 
     Returns
     -------
@@ -534,6 +587,12 @@ def select_period_entries(feature_t_full, source_index_full, representative_peri
         # and warn about its convergence -- on a series that is never used.
         rescaleClusterPeriods=False,
     )
+    if weight_dict:
+        # Only columns the frame actually carries: tsam raises on an unknown key, and
+        # build_feature_frame drops a column whose series never materialised.
+        tsam_kwargs["weightDict"] = {
+            column: float(weight) for column, weight in weight_dict.items() if column in feature_cluster.columns
+        }
     if mean_max_columns or mean_min_columns:
         tsam_kwargs.update(
             extremePeriodMethod="new_cluster_center",
@@ -596,6 +655,7 @@ def select_representative_snapshots(
     source_index_full,
     representative_periods_cfg,
     investment_periods,
+    weight_dict=None,
 ):
     """
     Run representative-period selection once and tile the result across investment horizons.
@@ -619,7 +679,7 @@ def select_representative_snapshots(
     """
     timestep_hours = (feature_t_full.index[1] - feature_t_full.index[0]).total_seconds() / 3600.0
     base_entries = select_period_entries(
-        feature_t_full, source_index_full, representative_periods_cfg,
+        feature_t_full, source_index_full, representative_periods_cfg, weight_dict=weight_dict,
     )
 
     period_entries_by_horizon = {}
@@ -644,20 +704,94 @@ def select_representative_snapshots(
 
 
 # --------------------------------------------------------------------------- #
-# National aggregate clustering features, built straight from the raw sources.
+# Per-state clustering features, built straight from the raw sources.
 # --------------------------------------------------------------------------- #
 
 
-def read_reeds_national_capacity_factor(carriers, reeds_vre_dir, weather_years):
+def read_site_states(interconnection_dir, counties_path, interconnection_file):
     """
-    Build the national wind/solar clustering features from the raw ReEDS files.
+    Map every ``sc_point_gid`` in one interconnection table onto its USPS state code.
+
+    The interconnection tables already carry a 5-digit county FIPS per site -- it is
+    what ``build_reeds_renewable_profiles.load_sites`` joins on -- so the state comes
+    out of a plain lookup rather than a spatial join against bus regions that do not
+    exist yet at this point in the workflow. It also gives offshore sites a state,
+    which a point-in-polygon join against onshore regions cannot.
+
+    Returns
+    -------
+    pandas.Series
+        USPS state code indexed by ``sc_point_gid``; sites whose FIPS matches no
+        county are absent, and the caller reports their capacity rather than
+        silently folding them into another state.
+    """
+    import geopandas as gpd
+    import tables
+
+    # Attributes only: the geometry is irrelevant here and parsing 3,234 county
+    # polygons to read two columns would be pure waste.
+    counties = gpd.read_file(counties_path, columns=["GEOID", "STUSPS"], ignore_geometry=True)
+    fips_to_state = pd.Series(counties.STUSPS.to_numpy(), index=counties.GEOID.astype(str))
+    fips_to_state = fips_to_state[~fips_to_state.index.duplicated()]
+
+    with tables.open_file(f"{interconnection_dir}/{interconnection_file}", "r") as h5:
+        gids = h5.get_node("/data/sc_point_gid")[:]
+        fips = [value.decode() if isinstance(value, bytes) else str(value) for value in h5.get_node("/data/FIPS")[:]]
+    site_fips = pd.Series(fips, index=pd.Index(gids, name="sc_point_gid"))
+    site_fips = site_fips.groupby(level=0).first()
+    return site_fips.map(fips_to_state).dropna()
+
+
+def build_clustering_weights(capacity_by_state):
+    """
+    Turn one feature family's per-state capacity potential into tsam column weights.
+
+    ``weightDict`` scales a column linearly, but ``clusterMethod="hierarchical"`` is
+    ward, which minimises *squared* Euclidean distance: a column's pull on the
+    clustering goes as ``weight**2``. The weight is therefore ``sqrt(share)``, which
+    makes the pull proportional to the state's share of the family's national total
+    and makes ``sum(w**2)`` come out at 1 -- so every family contributes the same
+    total pull no matter how many states it spans, matching what the three unweighted
+    national columns used to do.
+
+    Parameters
+    ----------
+    capacity_by_state : pandas.Series
+        Maximum capacity potential per state: supply-curve nameplate for wind and
+        solar, mean AC demand for load. Non-positive and missing entries drop out.
+
+    Returns
+    -------
+    pandas.Series
+        ``sqrt(share)`` indexed by state code; empty when nothing positive is left.
+    """
+    capacity = pd.Series(capacity_by_state, dtype="float64").dropna()
+    capacity = capacity[capacity > 0]
+    if capacity.empty:
+        return pd.Series(dtype="float64")
+    return np.sqrt(capacity / capacity.sum())
+
+
+def read_reeds_state_capacity_factor(
+    carriers,
+    reeds_vre_dir,
+    interconnection_dir,
+    counties_path,
+    weather_years,
+):
+    """
+    Build the per-state wind/solar clustering features from the raw ReEDS files.
 
     The feature is the capacity-weighted mean capacity factor,
-    ``sum_i(capacity_i * cf_i(t)) / sum_i(capacity_i)``, taken over **every** site
-    in the ReEDS supply curve -- no spatial aggregation, no region filter.
-    Selection runs before ``build_renewable_profiles``, so there are no per-bus
-    profile files to read yet, and this needs nothing but the supply curve and the
-    CF table.
+    ``sum_i(capacity_i * cf_i(t)) / sum_i(capacity_i)``, taken over every site in the
+    ReEDS supply curve and grouped by the state the site sits in. Selection runs before
+    ``build_renewable_profiles``, so there are no per-bus profile files to read yet, and
+    this needs nothing but the supply curve, the CF table, and the county FIPS the
+    interconnection table already carries.
+
+    The national aggregate the extreme periods rank on is the row sum of the same
+    grouped numerator over the summed denominator, so it costs no extra pass over the
+    multi-gigabyte CF tables and stays exactly consistent with the state columns.
 
     Carriers in the same feature group are combined by capacity, so numerator and
     denominator accumulate separately and are divided once at the end. Carriers
@@ -670,16 +804,19 @@ def read_reeds_national_capacity_factor(carriers, reeds_vre_dir, weather_years):
 
     Returns
     -------
-    dict[str, pandas.Series | None]
-        ``{"wind": ..., "solar": ...}`` mean capacity factor over the full
-        weather-year timeline; ``None`` for a group with no configured carriers.
+    dict[str, dict | None]
+        ``{"wind": ..., "solar": ...}``; ``None`` for a group with no configured
+        carriers, else ``{"states": DataFrame, "national": Series, "capacity":
+        Series}`` -- mean capacity factor per state over the full weather-year
+        timeline, the national mean, and the supply-curve nameplate per state that
+        ``build_clustering_weights`` turns into column weights.
     """
     # Imported lazily: build_reeds_renewable_profiles imports this module for
     # read_representative_snapshots, so a top-level import would be circular.
     from build_reeds_renewable_profiles import (
         REEDS_TECH,
         SOLAR_INVERTER_LOADING_RATIO,
-        national_available_generation,
+        grouped_available_generation,
         read_cf_time_indexes,
     )
 
@@ -687,10 +824,11 @@ def read_reeds_national_capacity_factor(carriers, reeds_vre_dir, weather_years):
         return np.clip(block * SOLAR_INVERTER_LOADING_RATIO, None, 1.0)
 
     carriers = set(carriers)
+    site_state_cache = {}
     profiles = {}
     for group, group_carriers in REEDS_FEATURE_GROUPS.items():
         numerator = None
-        total_capacity = 0.0
+        capacity_by_state = None
         seen_supply_curves = set()
         for carrier in group_carriers:
             if carrier not in carriers or carrier not in REEDS_TECH:
@@ -712,17 +850,39 @@ def read_reeds_national_capacity_factor(carriers, reeds_vre_dir, weather_years):
                 logger.warning("No positive %s site capacity in %s. Skipping it.", carrier, cfg["sc"])
                 continue
 
+            if cfg["interconnection"] not in site_state_cache:
+                site_state_cache[cfg["interconnection"]] = read_site_states(
+                    interconnection_dir, counties_path, cfg["interconnection"],
+                )
+            site_states = capacities.index.to_series().map(site_state_cache[cfg["interconnection"]])
+            unassigned = float(capacities[site_states.isna().to_numpy()].sum())
+            if unassigned > 0:
+                logger.warning(
+                    "%.0f MW of %s nameplate (%.2f%%) sits at sites whose county FIPS matches no "
+                    "state and is excluded from the clustering features.",
+                    unassigned,
+                    carrier,
+                    100 * unassigned / float(capacities.sum()),
+                )
+            carrier_capacity = capacities.groupby(site_states.to_numpy()).sum()
+            states = sorted(carrier_capacity.index)
+            if not states:
+                logger.warning("No %s site could be placed in a state. Skipping it.", carrier)
+                continue
+
             transform = solar_transform if carrier in SOLAR_CARRIERS else None
             cf_path = f"{reeds_vre_dir}/{cfg['cf']}"
             # One open for every weather year: these CF tables are multi-gigabyte.
             cf_time_indexes = read_cf_time_indexes(cf_path, weather_years)
             parts = []
             for weather_year in weather_years:
-                values = national_available_generation(
+                values = grouped_available_generation(
                     cf_path,
                     capacities.index.tolist(),
                     capacities,
                     int(weather_year),
+                    groups=site_states.to_numpy(),
+                    group_labels=states,
                     transform=transform,
                 )
                 index = cf_time_indexes[int(weather_year)]
@@ -731,89 +891,118 @@ def read_reeds_national_capacity_factor(carriers, reeds_vre_dir, weather_years):
                         f"ReEDS {carrier} {weather_year} returned {len(values)} hours; "
                         f"expected {len(index)}.",
                     )
-                parts.append(pd.Series(values, index=index, dtype="float64"))
+                values.index = index
+                parts.append(values)
 
-            series = pd.concat(parts)
+            frame = pd.concat(parts)
             logger.info(
-                "Aggregated %s ReEDS %s sites (%.0f MW nameplate); mean CF %.4f.",
+                "Aggregated %s ReEDS %s sites across %s states (%.0f MW nameplate); mean CF %.4f.",
                 len(capacities),
                 carrier,
-                float(capacities.sum()),
-                float(series.sum() / (len(series) * float(capacities.sum()))),
+                len(states),
+                float(carrier_capacity.sum()),
+                float(frame.to_numpy().sum() / (len(frame) * float(carrier_capacity.sum()))),
             )
             if numerator is None:
-                numerator = series
-            elif not series.index.equals(numerator.index):
+                numerator, capacity_by_state = frame, carrier_capacity
+            elif not frame.index.equals(numerator.index):
                 raise ValueError(
                     f"Carriers contributing to the '{group}' feature do not share an identical "
                     "time index; all must be built on the same weather-year calendar.",
                 )
             else:
-                numerator = numerator + series
-            total_capacity += float(capacities.sum())
+                # Merged onshore + offshore: numerator and denominator both accumulate
+                # per state, so the division at the end is the combined capacity-weighted
+                # mean, not a mean of means.
+                numerator = numerator.add(frame, fill_value=0.0)
+                capacity_by_state = capacity_by_state.add(carrier_capacity, fill_value=0.0)
 
-        if numerator is None or total_capacity <= 0:
+        if numerator is None or float(capacity_by_state.sum()) <= 0:
             profiles[group] = None
             continue
-        profiles[group] = numerator / total_capacity
+
+        capacity_by_state = capacity_by_state.reindex(numerator.columns).fillna(0.0)
+        state_cf = numerator.divide(capacity_by_state.replace(0.0, np.nan), axis="columns")
+        national_cf = numerator.sum(axis="columns") / float(capacity_by_state.sum())
+        profiles[group] = {
+            "states": state_cf,
+            "national": national_cf,
+            "capacity": capacity_by_state,
+        }
         logger.info(
-            "Combined %s feature: mean CF %.4f over %s hours (%.0f MW nameplate).",
+            "Combined %s feature: %s state columns, national mean CF %.4f over %s hours "
+            "(%.0f MW nameplate).",
             group,
-            float(profiles[group].mean()),
-            len(profiles[group]),
-            total_capacity,
+            state_cf.shape[1],
+            float(national_cf.mean()),
+            len(national_cf),
+            float(capacity_by_state.sum()),
         )
     return profiles
 
 
-def build_national_feature_frame(carrier_profiles, demand_total):
+def build_feature_frame(carrier_profiles, state_demand):
     """
-    Assemble the clustering feature frame from the national aggregate series.
+    Assemble the clustering feature frame and its tsam column weights.
+
+    The frame carries one column per state and feature family -- wind, solar, AC
+    demand -- plus the three national aggregates the extreme selectors rank on. State
+    columns are weighted by ``sqrt(share)`` of maximum capacity potential; the national
+    columns are pinned at ``NATIONAL_COLUMN_WEIGHT`` so they cannot pull on the
+    clustering (see the module docstring on why the square root, and why the national
+    columns have to be in the frame at all).
 
     Parameters
     ----------
-    carrier_profiles : dict[str, pandas.Series | None]
-        ``{"wind": ..., "solar": ...}`` capacity-weighted mean capacity factor,
-        from ``read_reeds_national_capacity_factor``.
-    demand_total : pandas.Series
-        Total national AC demand for the planning horizon, indexed by actual UTC
-        source timestamps. Build it with ``build_eer_demand.ReadEer``.
+    carrier_profiles : dict[str, dict | None]
+        ``{"wind": ..., "solar": ...}`` from ``read_reeds_state_capacity_factor``;
+        each value holds ``"states"``, ``"national"`` and ``"capacity"``.
+    state_demand : pandas.DataFrame
+        AC demand per state for the planning horizon, indexed by actual UTC source
+        timestamps. Build it with ``read_state_demand``.
 
     Returns
     -------
-    tuple[pandas.DataFrame, dict[str, pandas.Series | None]]
-        The feature frame (wind, solar, AC demand) and the individual aggregate
-        profiles keyed ``"wind"`` / ``"solar"`` / ``"load"``, which the diagnostic
-        plots reuse. Extreme periods are ranked directly on these columns (see
-        ``resolve_extreme_selectors``).
+    tuple[pandas.DataFrame, dict[str, pandas.Series | None], dict[tuple, float]]
+        The feature frame, the national profiles keyed ``"wind"`` / ``"solar"`` /
+        ``"load"`` that the diagnostic plots and the extreme selectors reuse, and the
+        tsam ``weightDict``.
     """
-    load = None
-    if demand_total is not None and len(demand_total):
-        load = pd.Series(pd.to_numeric(demand_total, errors="coerce"), dtype="float64")
-        load.index = pd.DatetimeIndex(load.index)
+    state_frames, national_profiles, capacity_potential = {}, {}, {}
+    for name in ("wind", "solar"):
+        group = carrier_profiles.get(name)
+        if not group:
+            national_profiles[name] = None
+            continue
+        state_frames[name] = group["states"]
+        national_profiles[name] = group["national"]
+        capacity_potential[name] = group["capacity"]
 
-    profile_map = {
-        "wind": carrier_profiles.get("wind"),
-        "solar": carrier_profiles.get("solar"),
-        "load": load,
-    }
+    national_profiles["load"] = None
+    if state_demand is not None and len(state_demand.columns) and len(state_demand):
+        demand = state_demand.apply(pd.to_numeric, errors="coerce").astype("float64")
+        demand.index = pd.DatetimeIndex(demand.index)
+        state_frames["load"] = demand
+        national_profiles["load"] = demand.sum(axis="columns")
+        # Mean AC demand is the load-side analogue of nameplate potential: the state's
+        # standing share of the system, not the one hour it happens to peak in.
+        capacity_potential["load"] = demand.mean(axis="rows")
 
     # EER is published in fixed CST and VRE in UTC.  Both omit Dec. 31 in leap
     # years, so row counts cannot establish physical alignment.  Use only exact
     # timestamp overlap, which also makes any unpaired boundary hours explicit.
-    available = {name: profile for name, profile in profile_map.items() if profile is not None}
-    if not available:
+    if not state_frames:
         raise ValueError(
             "No wind/solar generation or AC demand available for representative-period clustering.",
         )
     common_index = None
-    for name, profile in available.items():
-        common_index = profile.index if common_index is None else common_index.intersection(profile.index)
+    for frame in state_frames.values():
+        common_index = frame.index if common_index is None else common_index.intersection(frame.index)
     common_index = pd.DatetimeIndex(common_index).sort_values()
     if common_index.empty:
         raise ValueError("Demand and renewable profiles have no shared UTC timestamps.")
-    for name, profile in available.items():
-        excluded = len(profile.index.difference(common_index))
+    for name, frame in state_frames.items():
+        excluded = len(frame.index.difference(common_index))
         if excluded:
             logger.info(
                 "Excluding %s %s source hours without a physical UTC match in every clustering feature.",
@@ -821,22 +1010,72 @@ def build_national_feature_frame(carrier_profiles, demand_total):
                 name,
             )
 
-    feature_map = {}
-    for carrier_name, column in (("wind", WIND_FEATURE), ("solar", SOLAR_FEATURE)):
-        if profile_map[carrier_name] is not None:
-            feature_map[column] = profile_map[carrier_name].reindex(common_index)
-    if load is not None:
-        feature_map[LOAD_FEATURE] = load.reindex(common_index)
+    feature_map, weight_dict = {}, {}
+    for name, frame in state_frames.items():
+        weights = build_clustering_weights(capacity_potential[name])
+        for state in frame.columns:
+            if state not in weights.index:
+                logger.info(
+                    "Dropping the %s %s clustering column: no positive capacity potential.",
+                    state,
+                    name,
+                )
+                continue
+            column = state_feature(name, state)
+            feature_map[column] = frame[state].reindex(common_index)
+            weight_dict[column] = float(weights[state])
+
+    # The national aggregates ride along only so the extreme selectors have something
+    # to rank on; NATIONAL_COLUMN_WEIGHT keeps them out of the clustering distance.
+    for name, profile in national_profiles.items():
+        if profile is None:
+            continue
+        column = _NATIONAL_FEATURES[name]
+        feature_map[column] = profile.reindex(common_index)
+        weight_dict[column] = NATIONAL_COLUMN_WEIGHT
 
     features = pd.DataFrame(feature_map, index=common_index)
     features.columns = pd.MultiIndex.from_tuples(features.columns)
-    features = features.replace([np.inf, -np.inf], np.nan).dropna(axis=1)
+    features = features.replace([np.inf, -np.inf], np.nan)
+
+    # A column that never materialised is dropped, but loudly: at three national
+    # columns this was a no-op, at ~145 it silently decides what gets clustered.
+    incomplete = features.columns[features.isna().any()]
+    if len(incomplete):
+        logger.warning(
+            "Dropping %s clustering column(s) with missing hours: %s.",
+            len(incomplete),
+            ", ".join(str(column[-1]) for column in incomplete),
+        )
+        features = features.drop(columns=incomplete)
+    weight_dict = {column: weight for column, weight in weight_dict.items() if column in features.columns}
+    if features.empty or not len(features.columns):
+        raise ValueError("No clustering feature survived the shared-timestamp and completeness checks.")
+
+    state_columns = [column for column in features.columns if tuple(column) not in _NATIONAL_FEATURES.values()]
     logger.info(
-        "Built national clustering features %s over %s source snapshots.",
-        [tuple(column) for column in features.columns],
+        "Built clustering features over %s source snapshots: %s state columns + %s national "
+        "ranking columns.",
         len(features),
+        len(state_columns),
+        len(features.columns) - len(state_columns),
     )
-    return features, profile_map
+    for name in state_frames:
+        family = {
+            column: weight
+            for column, weight in weight_dict.items()
+            if column != _NATIONAL_FEATURES[name] and column[-1].startswith(f"{_NATIONAL_FEATURES[name][-1]}_")
+        }
+        if family:
+            logger.info(
+                "  %s: %s columns, weight %.4f-%.4f, sum(w^2)=%.3f.",
+                name,
+                len(family),
+                min(family.values()),
+                max(family.values()),
+                float(np.square(list(family.values())).sum()),
+            )
+    return features, national_profiles, weight_dict
 
 
 # --------------------------------------------------------------------------- #
@@ -1192,13 +1431,18 @@ SNAPSHOT_TABLE_COLUMNS = [
 ]
 
 
-def read_total_national_demand(
+def read_state_demand(
     demand_path: str,
     planning_horizon: int,
     weather_years,
-) -> pd.Series:
+) -> pd.DataFrame:
     """
-    Read total national AC demand for one planning horizon, rolled to UTC.
+    Read per-state AC demand for one planning horizon, rolled to UTC.
+
+    EER publishes one column per state, so the clustering resolution needs no mapping
+    here at all -- unlike the VRE side, which has to place supply-curve sites first.
+    The national total the extreme selectors rank on is the row sum, taken in
+    ``build_feature_frame``.
 
     Distribution losses are deliberately not applied: they are a uniform
     multiplier and therefore affect neither the clustering (tsam
@@ -1209,16 +1453,17 @@ def read_total_national_demand(
     from build_eer_demand import ReadEer
 
     demand = ReadEer(demand_path, [planning_horizon], weather_years).read()
-    demand = demand.loc[planning_horizon]
-    total = demand.sum(axis=1).astype("float64")
-    total.index = pd.DatetimeIndex(total.index)
+    demand = demand.loc[planning_horizon].astype("float64")
+    demand.index = pd.DatetimeIndex(demand.index)
+    demand = demand.reindex(sorted(demand.columns), axis="columns")
     logger.info(
-        "Read total national AC demand for %s: %s snapshots, mean %.1f MW.",
+        "Read AC demand for %s across %s states: %s snapshots, national mean %.1f MW.",
         planning_horizon,
-        len(total),
-        float(total.mean()),
+        demand.shape[1],
+        len(demand),
+        float(demand.sum(axis="columns").mean()),
     )
-    return total
+    return demand
 
 
 def build_snapshot_table(period_entries_by_horizon, snapshot_weightings, snapshots) -> pd.DataFrame:
@@ -1320,25 +1565,28 @@ def main(snakemake) -> None:
         )
     planning_horizon = planning_horizons[0]
 
-    carrier_profiles = read_reeds_national_capacity_factor(
+    carrier_profiles = read_reeds_state_capacity_factor(
         params.renewable_carriers,
         params.reeds_vre_dir,
+        params.reeds_interconnection_dir,
+        snakemake.input.counties,
         params.renewable_weather_years,
     )
 
-    demand_total = read_total_national_demand(
+    state_demand = read_state_demand(
         snakemake.input.electricity_demand,
         planning_horizon,
         params.renewable_weather_years,
     )
 
-    feature_t_full, profile_map = build_national_feature_frame(carrier_profiles, demand_total)
+    feature_t_full, profile_map, weight_dict = build_feature_frame(carrier_profiles, state_demand)
 
     snapshots, snapshot_weightings, period_entries_by_horizon, metadata = select_representative_snapshots(
         feature_t_full,
         feature_t_full.index,
         representative_periods,
         [planning_horizon],
+        weight_dict=weight_dict,
     )
 
     validate_period_counts(period_entries_by_horizon, representative_periods)

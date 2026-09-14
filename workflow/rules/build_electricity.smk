@@ -196,9 +196,16 @@ rule select_representative_periods:
         renewable_weather_years=config_provider("renewable_weather_years"),
         renewable_carriers=config_provider("electricity", "renewable_carriers"),
         reeds_vre_dir=DATA + "ReEDS_VRE",
+        reeds_interconnection_dir="repo_data/costs",
     input:
         reeds_vre_files=representative_periods_reeds_files,
         electricity_demand=eer_demand_file_for_wildcards,
+        # Clustering features are per state.  The interconnection tables carry the
+        # county FIPS of every supply-curve site and the county table turns that into
+        # a state code, so no bus region -- which does not exist this early -- is needed.
+        interconnection_land="repo_data/costs/interconnection_land.h5",
+        interconnection_offshore="repo_data/costs/interconnection_offshore.h5",
+        counties=DATA + "counties/cb_2020_us_county_500k.shp",
     output:
         snapshots=CASE_RESOURCES + "representative_periods/snapshots.csv",
         metadata=CASE_RESOURCES + "representative_periods/metadata.json",

@@ -22,7 +22,7 @@ FLOATING_DEPTH_M = 60.0  # <= this depth -> fixed offwind, else floating
 #
 # The clip is non-linear, so this must be applied *per site* before any spatial
 # aggregation -- scaling an already-averaged profile would overstate solar output.
-# That is why `national_available_generation` takes a `transform` callback.
+# That is why `grouped_available_generation` takes a `transform` callback.
 SOLAR_INVERTER_LOADING_RATIO = 1.34
 SUPPORTED_WEATHER_YEARS = (2007, 2008, 2009, 2010, 2011, 2012, 2013, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023)
 
@@ -189,6 +189,94 @@ def read_cf_time_index(cf_path: str, weather_year: int) -> pd.DatetimeIndex:
     return read_cf_time_indexes(cf_path, [weather_year])[int(weather_year)]
 
 
+def grouped_available_generation(
+    cf_path: str,
+    gids: list[int],
+    capacities,
+    weather_year: int,
+    groups=None,
+    group_labels=None,
+    transform=None,
+    row_block: int = 2048,
+) -> pd.DataFrame:
+    """
+    Return available generation, ``sum_i(capacity_i * cf_i(t))``, per site group.
+
+    This is the wind/solar clustering feature. ``groups`` labels each entry of
+    ``gids`` with the region it belongs to (a state, say); passing ``None``
+    collapses every site into one national column. Reads in row blocks and
+    collapses as it goes, so peak memory stays at one block rather than the whole
+    (8760 x n_sites) table.
+
+    Grouping costs nothing extra on disk: the block read already pulls every
+    requested site column, so only the collapse changes -- ``block.dot(weights)``
+    becomes ``block @ W`` against an (n_sites x n_groups) capacity matrix. The
+    national series is the row sum of the grouped result, so both resolutions come
+    out of a single pass over the multi-gigabyte CF table.
+
+    ``transform`` is applied to each block of *site-level* CF values before
+    summing, so non-linear per-site steps (solar's inverter loading ratio
+    followed by a clip at 1.0) land on the same side of the aggregation as they
+    do in ``main``.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One column per group, indexed by the profile's row positions. Sites whose
+        group is missing (NaN) are dropped from the aggregation, so the caller can
+        see the unassigned capacity rather than have it silently folded in.
+    """
+    capacities = pd.Series(capacities, dtype="float64")
+    with tables.open_file(cf_path, "r") as h5:
+        all_gids = h5.get_node("/columns")[:]
+        gid_to_column = {int(gid): index for index, gid in enumerate(all_gids)}
+        present = [(index, gid) for index, gid in enumerate(gids) if gid in gid_to_column]
+        if not present:
+            raise ValueError(f"None of the requested sites are present in {cf_path}.")
+        present_positions = [index for index, _ in present]
+        present_gids = [gid for _, gid in present]
+        columns = [gid_to_column[gid] for gid in present_gids]
+        site_capacity = capacities.reindex(present_gids).fillna(0.0).to_numpy(dtype=float)
+
+        if groups is None:
+            labels = list(group_labels) if group_labels is not None else ["national"]
+            if len(labels) != 1:
+                raise ValueError("group_labels must hold exactly one label when groups is None.")
+            site_group = np.zeros(len(present_gids), dtype=np.int64)
+        else:
+            groups = pd.Series(groups).to_numpy()[present_positions]
+            labels = (
+                list(group_labels)
+                if group_labels is not None
+                else sorted(pd.unique(groups[pd.notna(groups)]))
+            )
+            label_to_index = {label: index for index, label in enumerate(labels)}
+            site_group = np.array(
+                [label_to_index.get(group, -1) if pd.notna(group) else -1 for group in groups],
+                dtype=np.int64,
+            )
+
+        # Sites with no group drop out by carrying zero capacity into every column.
+        assigned = site_group >= 0
+        weight_matrix = np.zeros((len(present_gids), len(labels)), dtype=np.float64)
+        weight_matrix[np.flatnonzero(assigned), site_group[assigned]] = site_capacity[assigned]
+        if float(weight_matrix.sum()) <= 0:
+            raise ValueError(f"Requested sites in {cf_path} carry no positive capacity.")
+
+        node_name = f"/cf_profile_{weather_year}"
+        if node_name not in h5:
+            raise ValueError(f"ReEDS profile {cf_path} has no weather year {weather_year}.")
+        node = h5.get_node(node_name)
+        out = np.empty((node.shape[0], len(labels)), dtype=np.float64)
+        for start in range(0, node.shape[0], row_block):
+            stop = min(start + row_block, node.shape[0])
+            block = node[start:stop, :][:, columns].astype(np.float64) * CF_SCALE
+            if transform is not None:
+                block = transform(block)
+            out[start:stop] = block @ weight_matrix
+    return pd.DataFrame(out, columns=labels)
+
+
 def national_available_generation(
     cf_path: str,
     gids: list[int],
@@ -198,42 +286,18 @@ def national_available_generation(
     row_block: int = 2048,
 ) -> np.ndarray:
     """
-    Return total available generation, ``sum_i(capacity_i * cf_i(t))``, for one weather year.
+    Return total available generation summed over every requested site.
 
-    This is the wind/solar clustering feature: a single MW series per technology
-    summed over every ReEDS site, with no spatial aggregation. Reads in row
-    blocks and collapses as it goes, so peak memory stays at one block rather
-    than the whole (8760 x n_sites) table.
-
-    ``transform`` is applied to each block of *site-level* CF values before
-    summing, so non-linear per-site steps (solar's inverter loading ratio
-    followed by a clip at 1.0) land on the same side of the aggregation as they
-    do in ``main``.
+    Thin wrapper over ``grouped_available_generation`` with a single group.
     """
-    capacities = pd.Series(capacities, dtype="float64")
-    with tables.open_file(cf_path, "r") as h5:
-        all_gids = h5.get_node("/columns")[:]
-        gid_to_column = {int(gid): index for index, gid in enumerate(all_gids)}
-        present_gids = [gid for gid in gids if gid in gid_to_column]
-        if not present_gids:
-            raise ValueError(f"None of the requested sites are present in {cf_path}.")
-        columns = [gid_to_column[gid] for gid in present_gids]
-        weights = capacities.reindex(present_gids).fillna(0.0).to_numpy(dtype=float)
-        if float(weights.sum()) <= 0:
-            raise ValueError(f"Requested sites in {cf_path} carry no positive capacity.")
-
-        node_name = f"/cf_profile_{weather_year}"
-        if node_name not in h5:
-            raise ValueError(f"ReEDS profile {cf_path} has no weather year {weather_year}.")
-        node = h5.get_node(node_name)
-        out = np.empty(node.shape[0], dtype=np.float64)
-        for start in range(0, node.shape[0], row_block):
-            stop = min(start + row_block, node.shape[0])
-            block = node[start:stop, :][:, columns].astype(np.float64) * CF_SCALE
-            if transform is not None:
-                block = transform(block)
-            out[start:stop] = block.dot(weights)
-    return out
+    return grouped_available_generation(
+        cf_path,
+        gids,
+        capacities,
+        weather_year,
+        transform=transform,
+        row_block=row_block,
+    )["national"].to_numpy(dtype=np.float64)
 
 
 def source_rows_by_weather_year(source_timesteps, weather_year_indexes):
