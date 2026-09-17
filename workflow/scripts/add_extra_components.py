@@ -601,25 +601,96 @@ def new_build_carriers(extendable_carriers: Iterable[str]) -> list[str]:
 
 
 def remove_negligible_potential_generators(n: pypsa.Network, threshold: float = 1.0) -> None:
-    """Drop generators whose maximum capacity is below `threshold` MW (negligible buildable potential)."""
-    gens = n.generators[n.generators.p_nom_max < threshold]
+    """Drop generators below `threshold` MW, measured by whatever their capacity is.
+
+    A candidate is negligible when the capacity it could be built to,
+    ``p_nom_max``, is below the threshold. A generator whose capacity is not a
+    decision variable has no such potential: ``p_nom_max`` is never read for it
+    and is usually left at its default ``inf`` (every hydro unit, attached by
+    ``add_electricity.attach_breakthrough_renewable_plants``, is such a case),
+    so it is measured by the capacity it actually carries instead.
+
+    Without the second test a sub-MW fixed unit survives the whole workflow and
+    writes a dispatch limit ``p <= p_max_pu * p_nom`` into the LP whose right
+    hand side is three orders of magnitude below anything else in the model -
+    on the 2.5k-bus case a 0.17 MW hydro aggregate set the RHS range at
+    5.6e-03 - for a few MW of capacity that cannot move the solution.
+    """
+    extendable = n.generators.p_nom_extendable
+    by_potential = n.generators.p_nom_max < threshold
+    by_capacity = ~extendable & ~by_potential & (n.generators.p_nom < threshold)
+
+    gens = n.generators[by_potential | by_capacity]
     if gens.empty:
         return
-    with_existing = gens[gens.p_nom > 0]
-    if not with_existing.empty:
-        logger.warning(
-            "Removing %s generators with p_nom_max < %s MW that still carry existing capacity (total p_nom %.1f MW).",
-            len(with_existing),
+
+    potential_i = gens.index[by_potential.reindex(gens.index, fill_value=False)]
+    if len(potential_i):
+        with_existing = gens.loc[potential_i]
+        with_existing = with_existing[with_existing.p_nom > 0]
+        if not with_existing.empty:
+            logger.warning(
+                "Removing %s generators with p_nom_max < %s MW that still carry existing capacity (total p_nom %.1f MW).",
+                len(with_existing),
+                threshold,
+                with_existing.p_nom.sum(),
+            )
+        logger.info(
+            "Removing %s generators with p_nom_max < %s MW (%s).",
+            len(potential_i),
             threshold,
-            with_existing.p_nom.sum(),
+            sorted(gens.loc[potential_i].carrier.unique()),
         )
-    logger.info(
-        "Removing %s generators with p_nom_max < %s MW (%s).",
-        len(gens),
-        threshold,
-        sorted(gens.carrier.unique()),
-    )
+
+    capacity_i = gens.index[by_capacity.reindex(gens.index, fill_value=False)]
+    if len(capacity_i):
+        logger.info(
+            "Removing %s non-extendable generators with p_nom < %s MW, total p_nom %.1f MW (%s).",
+            len(capacity_i),
+            threshold,
+            gens.loc[capacity_i].p_nom.sum(),
+            sorted(gens.loc[capacity_i].carrier.unique()),
+        )
+
     n.mremove("Generator", gens.index)
+
+
+def zero_negligible_existing_capacity(n: pypsa.Network, threshold: float = 1.0) -> None:
+    """Zero the sub-`threshold` existing capacity of extendable generators, keeping the candidate.
+
+    Such a generator is not negligible - its ``p_nom_max`` is a real buildable
+    potential, often five orders of magnitude above the sliver of existing
+    capacity the clustering left on it - so unlike
+    :func:`remove_negligible_potential_generators` this does not delete it. What
+    is dropped is only the existing capacity: ``p_nom_min`` writes a floor
+    ``p_nom >= p_nom_min`` into the LP whose right hand side then sits at 1e-1
+    MW or below, and ``p_nom`` is the existing capacity that floor is derived
+    from. Both go to zero together, so the unit stays exactly what it already
+    effectively was, a pure new-build candidate.
+
+    Only units negligible by *both* measures are touched: a floor above the
+    threshold is a real commitment even when the plant behind it is small.
+    """
+    gens = n.generators
+    negligible = (
+        gens.p_nom_extendable
+        & (gens.p_nom < threshold)
+        & (gens.p_nom_min < threshold)
+        & ((gens.p_nom > 0) | (gens.p_nom_min > 0))
+    )
+    if not negligible.any():
+        return
+
+    index = gens.index[negligible]
+    logger.info(
+        "Zeroing the existing capacity of %s extendable generators below %s MW, "
+        "total p_nom %.1f MW (%s); their build-out potential is untouched.",
+        len(index),
+        threshold,
+        gens.loc[index, "p_nom"].sum(),
+        sorted(gens.loc[index].carrier.unique()),
+    )
+    n.generators.loc[index, ["p_nom", "p_nom_min"]] = 0.0
 
 
 def attach_phs_storageunits(n: pypsa.Network, elec_opts, costs: pd.DataFrame):
@@ -1237,6 +1308,7 @@ if __name__ == "__main__":
         trim_network(n, trim_network_config)
 
     remove_negligible_potential_generators(n)
+    zero_negligible_existing_capacity(n)
 
     n.consistency_check()
     n.meta = dict(snakemake.config, **dict(wildcards=dict(snakemake.wildcards)))

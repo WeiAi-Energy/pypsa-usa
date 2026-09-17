@@ -14,6 +14,8 @@ from add_extra_components import (
     carrier_new_build_buses,
     drop_coal_generators,
     new_build_carriers,
+    remove_negligible_potential_generators,
+    zero_negligible_existing_capacity,
 )
 from regional_cost import (
     SectorCosts,
@@ -238,6 +240,98 @@ def test_drop_coal_generators_removes_coal_and_its_ccs_variants_only():
     # Idempotent: a second call on a coal-free network is a no-op.
     drop_coal_generators(n)
     assert n.generators.index.tolist() == ["existing ocgt", "existing ccgt"]
+
+
+def test_remove_negligible_generators_measures_fixed_units_by_their_own_capacity():
+    """A fixed sub-MW unit has no buildable potential to be small in -- p_nom_max is inf."""
+    n = network_with_ac_buses()
+    # hydro, as add_electricity attaches it: fixed capacity, p_nom_max left at inf
+    n.add("Generator", "tiny hydro", bus="ac_1", carrier="hydro", p_nom=0.17, p_nom_extendable=False)
+    n.add("Generator", "idle hydro", bus="ac_1", carrier="hydro", p_nom=0.0, p_nom_extendable=False)
+    n.add("Generator", "real hydro", bus="ac_2", carrier="hydro", p_nom=120.0, p_nom_extendable=False)
+    # a candidate whose potential is negligible, the case the function already covered
+    n.add(
+        "Generator",
+        "spent solar site",
+        bus="ac_1",
+        carrier="solar",
+        p_nom=0.4,
+        p_nom_extendable=True,
+        p_nom_max=0.5,
+    )
+    # existing capacity below the threshold is no reason to drop a real candidate
+    n.add(
+        "Generator",
+        "small solar big site",
+        bus="ac_2",
+        carrier="solar",
+        p_nom=0.08,
+        p_nom_min=0.08,
+        p_nom_extendable=True,
+        p_nom_max=7.2e5,
+    )
+
+    remove_negligible_potential_generators(n)
+
+    assert n.generators.index.tolist() == ["real hydro", "small solar big site"]
+
+    # Idempotent: nothing left is negligible by either measure.
+    remove_negligible_potential_generators(n)
+    assert n.generators.index.tolist() == ["real hydro", "small solar big site"]
+
+
+def test_zero_negligible_existing_capacity_keeps_the_candidate_and_drops_only_its_floor():
+    n = network_with_ac_buses()
+    n.add(
+        "Generator",
+        "small solar big site",
+        bus="ac_1",
+        carrier="solar",
+        p_nom=0.08,
+        p_nom_min=0.08,
+        p_nom_extendable=True,
+        p_nom_max=7.2e5,
+    )
+    # a real commitment stays a commitment, however small the plant behind it
+    n.add(
+        "Generator",
+        "pinned solar",
+        bus="ac_1",
+        carrier="solar",
+        p_nom=0.5,
+        p_nom_min=50.0,
+        p_nom_extendable=True,
+        p_nom_max=1.0e4,
+    )
+    n.add(
+        "Generator",
+        "grown solar",
+        bus="ac_2",
+        carrier="solar",
+        p_nom=40.0,
+        p_nom_min=40.0,
+        p_nom_extendable=True,
+        p_nom_max=1.0e4,
+    )
+    n.add("Generator", "tiny fixed", bus="ac_2", carrier="hydro", p_nom=0.3, p_nom_extendable=False)
+
+    zero_negligible_existing_capacity(n)
+
+    # the candidate survives with its potential intact, only its existing capacity is gone
+    assert "small solar big site" in n.generators.index
+    assert n.generators.at["small solar big site", "p_nom"] == 0.0
+    assert n.generators.at["small solar big site", "p_nom_min"] == 0.0
+    assert n.generators.at["small solar big site", "p_nom_max"] == 7.2e5
+
+    assert n.generators.at["pinned solar", "p_nom_min"] == 50.0
+    assert n.generators.at["pinned solar", "p_nom"] == 0.5
+    assert n.generators.at["grown solar", "p_nom"] == 40.0
+    # fixed units are not this function's business -- they are removed outright
+    assert n.generators.at["tiny fixed", "p_nom"] == 0.3
+
+    # Idempotent: the zeroed unit carries no existing capacity to strip a second time.
+    zero_negligible_existing_capacity(n)
+    assert n.generators.at["small solar big site", "p_nom"] == 0.0
 
 
 def test_new_build_carriers_excludes_coal_ocgt_and_resource_profile_carriers():
