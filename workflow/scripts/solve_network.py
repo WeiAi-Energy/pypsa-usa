@@ -632,13 +632,19 @@ def _iterative_optimize_kwargs(cf_solving):
 
     Leaving an option unset is important: it lets the installed PyPSA version
     retain its own calibrated default instead of this workflow replacing it by
-    ``None``. The step control and the convergence test are calibrated inside
-    PyPSA against this workflow's own cases, so they are deliberately not
-    repeated here - only whether to damp at all is a choice this repo makes.
+    ``None``. The convergence test is calibrated inside PyPSA against this
+    workflow's own cases and is deliberately not repeated here; the strength of
+    the damping is a choice this repo makes, so the proximal weight and the
+    bounds of its adaptive rule are forwarded when they are configured.
     """
     return {
         name: cf_solving[name]
-        for name in ("proximal",)
+        for name in (
+            "proximal",
+            "proximal_weight",
+            "proximal_adaptive",
+            "proximal_ceiling",
+        )
         if cf_solving.get(name) is not None
     }
 
