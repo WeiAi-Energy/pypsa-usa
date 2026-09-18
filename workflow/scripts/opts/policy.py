@@ -2,6 +2,7 @@ import logging  # noqa: D100
 import numpy as np
 import pandas as pd
 import pypsa
+import xarray as xr
 from opts._helpers import (
     ceil_precision,
     filter_components,
@@ -40,6 +41,11 @@ RPS_DENOMINATOR_EXCLUDED_CARRIERS = {"load"}
 # to the ERM adequacy requirement (which is written on p_max_pu * p_nom, not on p).
 # That matches a clean-*energy* standard, which bars generation rather than capacity.
 FULL_PORTFOLIO_STANDARD_MIN_PCT = 0.999
+
+# Row scaling of the annual CO2 budget: accounts it in ktCO2, so the only ~1e8 right
+# hand side in the model drops to ~1e5. Same device as
+# ``global_constraints.TRANSMISSION_GLOBAL_CONSTRAINT_SCALE``.
+CO2_ROW_SCALE = 1e3
 
 
 def read_technology_capacity_targets(config):
@@ -459,7 +465,23 @@ def add_RPS_constraints(n, config, snakemake=None):
 
 
 def add_regional_co2limit(n, config):
-    """Adding regional regional CO2 Limits Specified in the config.yaml."""
+    """Adding regional regional CO2 Limits Specified in the config.yaml.
+
+    The budget is written as two rows per region and period rather than one, like
+    ``add_electrolysis_electricity_target_constraint`` writes its annual target. A
+    per-snapshot variable carries the region's emission rate in tCO2/h; the annual
+    row then sums that one variable over the snapshots.
+
+    As a single row the budget is the worst-conditioned row of the model: ~90k
+    non-zeros on the 10k-bus case, coefficients up to ~1.5e3 and a right hand side
+    at ~1e8. Split, the rate rows carry the bare intensity (O(1) tCO2/MWh_e)
+    against a zero right hand side, and the annual row has 20 terms. tCO2/h is the
+    unit that keeps the rate's own coefficient at one; kt or Mt would just move the
+    1e3 into a coefficient.
+
+    The annual row's scaling is recorded in ``n._global_constraint_scales``: divide
+    its shadow price by that factor to get a price per tonne.
+    """
     model_horizon = get_model_horizon(n.model)
     regional_co2_lims = pd.read_csv(
         config["electricity"]["regional_Co2_limits"],
@@ -491,11 +513,47 @@ def add_regional_co2limit(n, config):
             "efficiency",
             inds=region_gens_em.index,
         )  # mw_elect/mw_th
-        em_pu = region_gens_em.carrier.map(emissions) / efficiency  # tonnes_co2/mw_electrical
-        em_pu = em_pu.multiply(weightings.generators, axis=0).loc[planning_horizon].fillna(0)
+        period_snapshots = n.snapshots[n.snapshots.get_level_values(0) == planning_horizon]
+
+        # tonnes_co2/mw_electrical, without the snapshot weighting: that belongs on
+        # the annual row rather than on every coefficient of the rate rows.
+        em_pu = (
+            (region_gens_em.carrier.map(emissions) / efficiency)
+            .loc[period_snapshots, region_gens_em.index]
+            .fillna(0)
+        )
 
         # Emitting Gens
-        p_em = n.model["Generator-p"].loc[:, region_gens_em.index].sel(period=planning_horizon)
+        p_em = n.model["Generator-p"].loc[period_snapshots, region_gens_em.index]
+
+        period_weights = weightings.generators.loc[period_snapshots]
+
+        # Only bound the rate below where negative dispatch and CO2-removing
+        # carriers are both ruled out, which is what makes it non-negative.
+        p_min_pu = get_as_dense(n, "Generator", "p_min_pu", inds=region_gens_em.index)
+        rate_is_positive = bool((p_min_pu.to_numpy() >= 0).all() and (em_pu.to_numpy() >= 0).all())
+
+        constraint_name = f"RegionalCO2-{emmission_lim.name}_{planning_horizon}co2_limit"
+
+        # On the "snapshot" dim, not on "timestep": a second dimension indexing the
+        # same axis conflicts with the snapshot MultiIndex when linopy joins the
+        # variable groups. Same reason the electrolysis target renames its coords.
+        rate_coords = period_snapshots.copy()
+        rate_coords.name = "snapshot"
+        rate = n.model.add_variables(
+            lower=0.0 if rate_is_positive else -np.inf,
+            coords=[rate_coords],
+            name=f"{constraint_name}-rate",
+        )
+        # Coefficients are carried on the variable's own coords so the MultiIndex
+        # never has to be rebuilt from a DataFrame.
+        em_pu_da = xr.DataArray(em_pu.to_numpy(), dims=p_em.dims, coords=p_em.coords)
+        n.model.add_constraints(
+            (p_em * em_pu_da).sum("Generator") - rate,
+            "=",
+            0.0,
+            name=f"{constraint_name}-rate-definition",
+        )
 
         # CO2 Atmospheric Emissions
         if any(n.carriers.index.isin(["co2"])):
@@ -507,12 +565,23 @@ def add_regional_co2limit(n, config):
         else:
             end_co2_atm_storage = 0
 
-        lhs = (p_em * em_pu).sum() + end_co2_atm_storage
+        # A stock in tCO2, so it is scaled by the row like everything else on it.
+        weights_da = xr.DataArray(
+            period_weights.to_numpy() / CO2_ROW_SCALE, dims=rate.dims, coords=rate.coords
+        )
+        lhs = (rate * weights_da).sum() + end_co2_atm_storage / CO2_ROW_SCALE
         rhs = region_co2lim
         n.model.add_constraints(
-            lhs <= rhs,
-            name=f"RegionalCO2-{emmission_lim.name}_{planning_horizon}co2_limit",
+            lhs,
+            "<=",
+            rhs / CO2_ROW_SCALE,
+            name=constraint_name,
         )
+        scales = getattr(n, "_global_constraint_scales", None)
+        if scales is None:
+            scales = {}
+            n._global_constraint_scales = scales
+        scales[constraint_name] = CO2_ROW_SCALE
 
         logger.info(
             f"Adding regional Co2 Limit for {emmission_lim.name} in {planning_horizon} with limit {rhs}",
