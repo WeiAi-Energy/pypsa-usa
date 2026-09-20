@@ -1014,9 +1014,7 @@ def test_erm_energy_backing_uses_physical_hours_under_representative_periods():
         representative_metadata=_REPRESENTATIVE_THEN_EXTREME,
     )
 
-    # The reserve state lives on the extreme block only, so that is where the
-    # energy-backing rows are: the metadata puts it on the last two snapshots.
-    storage_unit_hours, store_link_hours = _energy_backing_hours(n, snapshots[2])
+    storage_unit_hours, store_link_hours = _energy_backing_hours(n, snapshots[0])
     assert storage_unit_hours == pytest.approx(1.0)
     assert store_link_hours == pytest.approx(1.0)
 
@@ -1026,31 +1024,27 @@ def _erm_snapshot_coverage(n, name):
     return list(n.model.constraints[name].labels.indexes["snapshot"])
 
 
-def test_erm_is_written_on_the_extreme_periods_only():
-    """Under representative periods the adequacy rows belong on the stress blocks."""
+def test_erm_is_written_on_all_representative_and_extreme_snapshots():
+    """Representative-period metadata does not narrow the ERM snapshot coverage."""
     n, snapshots = _energy_backed_erm_network(
         stores_weighting=5.0,
         representative_metadata=_REPRESENTATIVE_THEN_EXTREME,
     )
 
-    extreme = list(snapshots[2:])
-    assert _erm_snapshot_coverage(n, erm_requirement_name("CA_Z1")) == extreme
-    # The reserve state and its caps follow the requirement, rather than being built
-    # over the whole timeline and left unused outside it.
-    assert list(n.model.variables["StorageUnit-p_dispatch_ERM"].labels.indexes["snapshot"]) == extreme
-    assert _erm_snapshot_coverage(n, "StorageUnit-p_dispatch-soc-upper_ERM") == extreme
-    assert _erm_snapshot_coverage(n, "Link-p-store-upper_ERM") == extreme
+    expected = list(snapshots)
+    assert _erm_snapshot_coverage(n, erm_requirement_name("CA_Z1")) == expected
+    assert list(n.model.variables["StorageUnit-p_dispatch_ERM"].labels.indexes["snapshot"]) == expected
+    assert _erm_snapshot_coverage(n, "StorageUnit-p_dispatch-soc-upper_ERM") == expected
+    assert _erm_snapshot_coverage(n, "Link-p-store-upper_ERM") == expected
 
 
-def test_erm_falls_back_to_every_snapshot_without_an_extreme_period(caplog):
-    """No extreme block means the old coverage, not a silently dropped policy."""
+def test_erm_covers_every_snapshot_without_an_extreme_period():
+    """Representative-only metadata still produces one requirement per snapshot."""
     metadata = {"2030": {"periods": [{"period_id": 0, "kind": "representative", "steps": 4}]}}
 
-    with caplog.at_level("WARNING"):
-        n, snapshots = _energy_backed_erm_network(stores_weighting=5.0, representative_metadata=metadata)
+    n, snapshots = _energy_backed_erm_network(stores_weighting=5.0, representative_metadata=metadata)
 
     assert _erm_snapshot_coverage(n, erm_requirement_name("CA_Z1")) == list(snapshots)
-    assert "no period is marked extreme" in caplog.text
 
 
 def test_erm_covers_every_snapshot_on_a_chronological_timeline():
@@ -1077,8 +1071,8 @@ def test_dual_snapshot_index_keeps_a_narrowed_requirement_labelled():
     assert labelled.names == n.snapshots.names
 
 
-def test_erm_duals_cover_only_the_extreme_snapshots(reserve_margin_network):
-    """Solving with a narrowed requirement stores a correspondingly narrowed dual frame."""
+def test_erm_duals_cover_all_snapshots_with_representative_periods(reserve_margin_network):
+    """Representative-period metadata does not narrow the stored ERM dual frame."""
     n = reserve_margin_network.copy()
     period = n.snapshots.get_level_values(0)[0]
     half = len(n.snapshots) // 2
@@ -1106,5 +1100,5 @@ def test_erm_duals_cover_only_the_extreme_snapshots(reserve_margin_network):
     store_ERM_duals(n)
 
     assert list(n.erm_region_price.columns) == ["CA_Z1"]
-    assert list(n.erm_region_price.index) == list(n.snapshots[half:])
+    assert list(n.erm_region_price.index) == list(n.snapshots)
     assert not n.erm_region_price.isnull().values.any()
