@@ -684,7 +684,7 @@ def summarize_distribution(values: list[float], fmt: str = "%.4g") -> str:
 
 
 #: Length below which the two substations a Line joins are treated as one site.
-SHORT_BRANCH_LENGTH_KM = 0.5
+SHORT_BRANCH_LENGTH_KM = 0.2
 
 
 def contract_short_branches(
@@ -697,9 +697,9 @@ def contract_short_branches(
     :func:`reduce_low_degree_buses` performs: the two
     endpoints become one bus and the branch disappears, rather than a mid-point
     being eliminated and its two branches spliced into one corridor. Neither
-    pass subsumes the other -- most sub-500 m Lines on the 41k network have an
+    pass subsumes the other -- most sub-200 m Lines on the 41k network have an
     endpoint of degree three or more (up to nine), which the degree-1/2 rule
-    never reaches, while a degree-two bus between two 300 km Lines is a corridor
+    never reaches, while a degree-two bus between two 200 km Lines is a corridor
     to splice, not two sites to merge.
 
     The survivor *is* one of the two buses, so the absorbed one hands its

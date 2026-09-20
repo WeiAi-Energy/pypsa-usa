@@ -16,6 +16,12 @@ from sklearn.neighbors import BallTree
 logger = logging.getLogger(__name__)
 
 
+# Breakthrough Energy marks its own offshore substations with a sub id at or
+# above this. A grid rebuilt from HIFLD has no offshore substations at all and
+# numbers its sites from 100000, so the test must not fire there.
+BE_OFFSHORE_SUB_ID_MIN = 41012
+
+
 def haversine_np(lon1, lat1, lon2, lat2):
     """
     Calculate the great circle distance between two points on the earth
@@ -40,6 +46,7 @@ def add_buses_from_file(
     n: pypsa.Network,
     buses: gpd.GeoDataFrame,
     interconnect: str,
+    offshore_sub_id_min: int | None = BE_OFFSHORE_SUB_ID_MIN,
 ) -> pypsa.Network:
     if interconnect != "usa":
         buses = buses.query(
@@ -68,7 +75,8 @@ def add_buses_from_file(
         LAF_state=buses.LAF_state,
     )
 
-    n.buses.loc[n.buses.sub_id.astype(int) >= 41012, "substation_off"] = True  # mark offshore buses
+    if offshore_sub_id_min is not None:
+        n.buses.loc[n.buses.sub_id.astype(int) >= offshore_sub_id_min, "substation_off"] = True
     return n
 
 
@@ -229,12 +237,14 @@ def impute_remaining_branch_ratings(
     return branches
 
 
-def add_branches_from_file(n: pypsa.Network, fn_branches: str) -> pypsa.Network:
-    branches = pd.read_csv(
-        fn_branches,
-        dtype={"from_bus_id": str, "to_bus_id": str},
-        index_col=0,
-    ).query("from_bus_id in @n.buses.index and to_bus_id in @n.buses.index")
+def add_branches_from_file(n: pypsa.Network, branches: pd.DataFrame | str) -> pypsa.Network:
+    if isinstance(branches, str):
+        branches = pd.read_csv(
+            branches,
+            dtype={"from_bus_id": str, "to_bus_id": str},
+            index_col=0,
+        )
+    branches = branches.query("from_bus_id in @n.buses.index and to_bus_id in @n.buses.index")
     branches = impute_cross_substation_line_ratings(branches, n.buses)
     branches = impute_remaining_branch_ratings(branches, n.buses)
 
@@ -503,6 +513,29 @@ def identify_osw_poi(n: pypsa.Network) -> pypsa.Network:
     return n
 
 
+def assign_poi_from_file(n: pypsa.Network, fn_poi: str) -> pypsa.Network:
+    """Mark the offshore points of interconnection listed in ``fn_poi``.
+
+    The Breakthrough path finds its POIs by looking for onshore buses wired to
+    BE's own offshore substations, which a grid rebuilt from HIFLD does not have.
+    Those POI coordinates -- BE's 52 offshore-line landfalls plus the seven Texas
+    sites that were hard-coded -- were extracted from BE once and are matched here
+    to the nearest bus of whatever grid is in use.
+    """
+    poi = pd.read_csv(fn_poi)
+    poi = poi[poi.bus_id.isin(n.buses.index.astype(int))]
+    n.buses["poi_bus"] = False
+    n.buses["poi_sub"] = False
+    n.buses.loc[n.buses.index.astype(int).isin(poi.bus_id), "poi_bus"] = True
+    n.buses.loc[n.buses.sub_id.astype(int).isin(poi.sub_id), "poi_sub"] = True
+    logger.info(
+        "Marked %s bus(es) at %s substation(s) as offshore points of interconnection.",
+        int(n.buses.poi_bus.sum()),
+        int(n.buses.poi_sub.sum()),
+    )
+    return n
+
+
 def match_missing_buses(buses_to_match_to, missing_buses):
     """Match buses missing region assignment to their nearest bus."""
     missing_buses = missing_buses.copy()
@@ -589,46 +622,71 @@ def assign_missing_regions(n: pypsa.Network):
     # Match missing buses to their nearest neighbors
     missing = match_missing_buses(reference_buses, missing)
 
-    # Assign region attributes from matched buses to missing buses
+    # Fill only the attributes that are actually missing. Copying the whole block
+    # would overwrite good values: a bus that merely fell outside a county polygon
+    # would also take the neighbour's interconnect, which can move it across a seam
+    # in the labelling while its lines keep it in the other synchronous area.
     for attr in region_attrs:
-        if attr in n.buses.columns:  # Only assign if column exists
-            n.buses.loc[missing.index, attr] = reference_buses.loc[missing.bus_assignment, attr].values
+        if attr not in n.buses.columns:
+            continue
+        gap = missing.index[missing[attr].isna()]
+        if len(gap) == 0:
+            continue
+        n.buses.loc[gap, attr] = reference_buses.loc[missing.loc[gap, "bus_assignment"], attr].values
 
 
 def assign_reeds_memberships(n: pypsa.Network, fn_reeds_memberships: str):
-    """Assigns REeDS zone and balancing area memberships to buses."""
+    """Assigns REeDS zone and balancing area memberships to buses.
+
+    The zone is settled first, then everything that is a property *of the zone* is
+    read off the settled value. Taking the county mode of each field separately
+    would break the functional dependency the fields have on the zone, because a
+    county straddling a zone boundary can take its zone from one side and its
+    state from the other. That is not hypothetical: ReEDS zone p68 covers thirteen
+    Minnesota counties and a corner of Winneshiek County, Iowa, so the handful of
+    buses there ended up tagged zone p68 / state IA while the rest of p68 was
+    MN -- and clustering, which aggregates within a zone and requires the other
+    region labels to agree across the buses it merges, asserted out.
+    """
     reeds_memberships = pd.read_csv(fn_reeds_memberships, index_col=0)
+
+    # Settle the zone first. This is a fix for the few counties that are split
+    # between unaligned county GIS and ReEDS zone shapes.
+    n.buses["reeds_zone"] = n.buses.groupby("county")["reeds_zone"].transform(
+        lambda x: x.mode()[0],
+    )
+    # Then derive, so zone -> {BA, state, NERC region, transmission region/group}
+    # holds for every bus by construction. `reeds_ba` is a column of the ReEDS
+    # zone shapefile, so it is a property of the zone too and must be read off
+    # the settled zone rather than county-moded in its own right: county 38087
+    # straddles the SWPP/MISO seam, and taking its two modes separately gave it
+    # zone p35 (SWPP's) with BA MISO, which is what put two BAs inside p35.
+    zone_to_ba = n.buses.groupby("reeds_zone")["reeds_ba"].agg(lambda x: x.mode()[0])
+    n.buses["reeds_ba"] = n.buses.reeds_zone.map(zone_to_ba)
     n.buses["nerc_reg"] = n.buses.reeds_zone.map(reeds_memberships.nercr)
     n.buses["trans_reg"] = n.buses.reeds_zone.map(reeds_memberships.transreg)
     n.buses["trans_grp"] = n.buses.reeds_zone.map(reeds_memberships.transgrp)
     n.buses["reeds_state"] = n.buses.reeds_zone.map(reeds_memberships.st)
-
-    # Groupby county, and assign the most common reeds_zone, reeds_ba, reeds_state, nerc
-    # This is a fix for the few counties that are split between unaligned county GIS and Reeds Zone Shapes.
-    n.buses["reeds_zone"] = n.buses.groupby("county")["reeds_zone"].transform(
-        lambda x: x.mode()[0],
-    )
-    n.buses["reeds_ba"] = n.buses.groupby("county")["reeds_ba"].transform(
-        lambda x: x.mode()[0],
-    )
-    n.buses["reeds_state"] = n.buses.groupby("county")["reeds_state"].transform(
-        lambda x: x.mode()[0],
-    )
-    n.buses["nerc_reg"] = n.buses.groupby("county")["nerc_reg"].transform(
-        lambda x: x.mode()[0],
-    )
-    n.buses["trans_reg"] = n.buses.groupby("county")["trans_reg"].transform(
-        lambda x: x.mode()[0],
-    )
-    n.buses["trans_grp"] = n.buses.groupby("county")["trans_grp"].transform(
-        lambda x: x.mode()[0],
-    )
 
     # 45V hydrogen PTC region. It is a pure state-level grouping, so it is derived
     # from the county-corrected reeds_state above rather than from the raw zone
     # mapping. Non-US zones have no h2ptcreg and stay NaN.
     state_to_h2ptcreg = reeds_memberships.dropna(subset=["h2ptcreg"]).drop_duplicates("st").set_index("st")["h2ptcreg"]
     n.buses["h2ptcreg"] = n.buses.reeds_state.map(state_to_h2ptcreg)
+
+    # Clustering aggregates buses within a zone and requires every other region
+    # label to agree across the buses it merges, so each of these must be a
+    # function of the zone. Assert it here rather than let pypsa's `consense`
+    # raise deep inside get_clustering_from_busmap, where the message names two
+    # bus ids and nothing about where they came from.
+    for attribute in ("reeds_ba", "reeds_state", "nerc_reg", "trans_reg", "trans_grp"):
+        conflicting = n.buses.groupby("reeds_zone")[attribute].nunique()
+        conflicting = conflicting[conflicting > 1]
+        assert conflicting.empty, (
+            f"{attribute} is not a function of reeds_zone; zone(s) "
+            f"{list(conflicting.index)} carry more than one value. Clustering will "
+            "fail on this."
+        )
 
 
 def modify_breakthrough_substations(buslocs: pd.DataFrame):
@@ -792,7 +850,7 @@ def merge_colocated_substation_sites(n: pypsa.Network, coincident_sub_groups: li
         group = coincident_sub_groups[gid]
         canonical = min(group)
         # never fold an offshore substation into an onshore one, or vice versa
-        if (max(group) >= 41012) != (canonical >= 41012):
+        if (max(group) >= BE_OFFSHORE_SUB_ID_MIN) != (canonical >= BE_OFFSHORE_SUB_ID_MIN):
             continue
         merged_sites += 1
         for sub_id in group:
@@ -821,6 +879,11 @@ def main(snakemake):
 
     model_topology = snakemake.params.model_topology
     interconnect = snakemake.params.interconnect
+    # 'hifld' rebuilds the grid from the real HIFLD transmission layer and has no
+    # offshore substations of its own; 'tamu' is Breakthrough's synthetic grid,
+    # whose offshore substations are used to locate the points of interconnection
+    # and are then removed.
+    transmission_network = getattr(snakemake.params, "transmission_network", "tamu")
     # interconnect in raw data given with an uppercase first letter
     if interconnect != "usa":
         interconnect = interconnect[0].upper() + interconnect[1:]
@@ -841,6 +904,11 @@ def main(snakemake):
 
     # merge bus data with geometry data
     df_bus = pd.read_csv(snakemake.input["buses"], index_col=0)
+    df_branches = pd.read_csv(
+        snakemake.input["lines"],
+        dtype={"from_bus_id": str, "to_bus_id": str},
+        index_col=0,
+    )
     df_bus = assign_sub_id(df_bus, buslocs)
     gdf_bus = assign_bus_location(df_bus, buslocs)
 
@@ -886,15 +954,23 @@ def main(snakemake):
     gdf_bus = gdf_bus.reset_index().drop_duplicates(subset="bus_id", keep="first").set_index("bus_id")
 
     # add buses, transformers, lines and links
-    n = add_buses_from_file(n, gdf_bus, interconnect=interconnect)
-    n = add_branches_from_file(n, snakemake.input["lines"])
+    n = add_buses_from_file(
+        n,
+        gdf_bus,
+        interconnect=interconnect,
+        offshore_sub_id_min=None if transmission_network == "hifld" else BE_OFFSHORE_SUB_ID_MIN,
+    )
+    n = add_branches_from_file(n, df_branches)
     n = add_dclines(n, snakemake.input["links"])
 
     # identify offshore points of interconnection, and remove unncess components from BE network
-    n = identify_osw_poi(n)
-    if interconnect == "Texas" or interconnect == "usa":
-        n = assign_texas_poi(n)
-    n = remove_breakthrough_offshore(n)
+    if transmission_network != "hifld":
+        n = identify_osw_poi(n)
+        if interconnect == "Texas" or interconnect == "usa":
+            n = assign_texas_poi(n)
+        n = remove_breakthrough_offshore(n)
+    else:
+        n = assign_poi_from_file(n, snakemake.input["offshore_poi"])
     assign_missing_regions(n)
 
     # build offshore network configuration

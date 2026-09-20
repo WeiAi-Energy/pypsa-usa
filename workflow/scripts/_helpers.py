@@ -315,11 +315,18 @@ def recompute_link_transmission_costs(n: pypsa.Network) -> None:
     )
 
 
+#: Transmission networks that are AC power-flow models rather than transport
+#: models. They differ only in the source of the grid -- 'tamu' is Breakthrough's
+#: synthetic one, 'hifld' is rebuilt from the real HIFLD layer -- so every
+#: formulation decision keyed on this is the same for both.
+POWER_FLOW_NETWORKS = ("tamu", "hifld")
+
+
 def is_transport_model(transmission_network):
-    if transmission_network != "tamu":
+    if transmission_network not in POWER_FLOW_NETWORKS:
         raise ValueError(
-            "This workflow only supports the non-transport TAMU power-flow model; "
-            f"received {transmission_network!r}.",
+            "This workflow only supports the non-transport power-flow models "
+            f"{POWER_FLOW_NETWORKS}; received {transmission_network!r}.",
         )
     return False
 

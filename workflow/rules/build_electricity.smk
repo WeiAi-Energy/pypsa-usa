@@ -3,6 +3,24 @@
 from itertools import chain
 
 
+def base_grid_file(name):
+    """Path of one base-grid table, for whichever grid transmission_network selects.
+
+    'hifld' rebuilds the grid from the real HIFLD transmission layer (see
+    build_hifld_grid); 'tamu' uses Breakthrough's synthetic grid as shipped.
+    'offshore_poi' has no Breakthrough counterpart -- the TAMU path derives its
+    offshore points of interconnection from Breakthrough's own offshore
+    substations -- so it resolves to the HIFLD file either way and the TAMU path
+    simply does not read it.
+    """
+    source = config.get("model_topology", {}).get("transmission_network", "hifld")
+    if source == "hifld":
+        return RESOURCES + f"hifld_network/{name}.csv"
+    if name == "offshore_poi":
+        return RESOURCES + "hifld_network/offshore_poi.csv"
+    return DATA + f"breakthrough_network/base_grid/{name}.csv"
+
+
 rule build_shapes:
     params:
         interconnect=get_interconnect(),
@@ -33,6 +51,42 @@ rule build_shapes:
         "../scripts/build_shapes.py"
 
 
+# The Breakthrough Energy / TAMU corridors are synthetic ("a fictitious
+# configuration", in its authors' words), so the base grid can instead be built
+# from the real HIFLD transmission layer, borrowing only BE's per-voltage-class
+# typical values for the electrical parameters. Selected with
+# model_topology: transmission_network: hifld.
+rule build_hifld_grid:
+    input:
+        hifld_lines="repo_data/transmission/hifld_lines.csv.gz",
+        county_population="repo_data/county_population_2023.csv",
+        offshore_poi="repo_data/transmission/offshore_poi_sites.csv",
+        county_shapes=RESOURCES + "Geospatial/county_shapes.geojson",
+        state_shapes=RESOURCES + "Geospatial/state_boundaries.geojson",
+        be_bus=DATA + "breakthrough_network/base_grid/bus.csv",
+        be_branch=DATA + "breakthrough_network/base_grid/branch.csv",
+        be_bus2sub=DATA + "breakthrough_network/base_grid/bus2sub.csv",
+        be_sub=DATA + "breakthrough_network/base_grid/sub.csv",
+        be_dcline=DATA + "breakthrough_network/base_grid/dcline.csv",
+        be_plant=DATA + "breakthrough_network/base_grid/plant.csv",
+    output:
+        bus=RESOURCES + "hifld_network/bus.csv",
+        branch=RESOURCES + "hifld_network/branch.csv",
+        bus2sub=RESOURCES + "hifld_network/bus2sub.csv",
+        sub=RESOURCES + "hifld_network/sub.csv",
+        dcline=RESOURCES + "hifld_network/dcline.csv",
+        plant=RESOURCES + "hifld_network/plant.csv",
+        poi=RESOURCES + "hifld_network/offshore_poi.csv",
+    log:
+        "logs/build_hifld_grid.log",
+    threads: 1
+    resources:
+        mem_mb=16000,
+        walltime=config_provider("walltime", "build_hifld_grid", default="01:00:00"),
+    script:
+        "../scripts/build_hifld_grid.py"
+
+
 rule build_base_network:
     params:
         interconnect=get_interconnect(),
@@ -42,12 +96,16 @@ rule build_base_network:
             "model_topology", "topological_boundaries"
         ),
         length_factor=config["lines"]["length_factor"],
+        transmission_network=config_provider(
+            "model_topology", "transmission_network", default="hifld"
+        ),
     input:
-        buses=DATA + "breakthrough_network/base_grid/bus.csv",
-        lines=DATA + "breakthrough_network/base_grid/branch.csv",
-        links=DATA + "breakthrough_network/base_grid/dcline.csv",
-        bus2sub=DATA + "breakthrough_network/base_grid/bus2sub.csv",
-        sub=DATA + "breakthrough_network/base_grid/sub.csv",
+        buses=base_grid_file("bus"),
+        lines=base_grid_file("branch"),
+        links=base_grid_file("dcline"),
+        bus2sub=base_grid_file("bus2sub"),
+        sub=base_grid_file("sub"),
+        offshore_poi=base_grid_file("offshore_poi"),
         onshore_shapes=RESOURCES + "Geospatial/onshore_shapes.geojson",
         offshore_shapes=RESOURCES + "Geospatial/offshore_shapes.geojson",
         state_shapes=RESOURCES + "Geospatial/state_boundaries.geojson",
@@ -369,7 +427,7 @@ rule add_electricity:
         county_shapes=RESOURCES + "Geospatial/county_shapes.geojson",
         reeds_shapes=RESOURCES + "Geospatial/reeds_shapes.geojson",
         powerplants=RESOURCES + "powerplants.csv",
-        plants_breakthrough=DATA + "breakthrough_network/base_grid/plant.csv",
+        plants_breakthrough=base_grid_file("plant"),
         hydro_breakthrough=DATA + "breakthrough_network/base_grid/hydro.csv",
         bus2sub=RESOURCES + "bus2sub.csv",
     output:
