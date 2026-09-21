@@ -257,8 +257,11 @@ if __name__ == "__main__":
     # https://docs.nrel.gov/docs/fy21osti/78195.pdf
     # WACC & Lifetime: https://emp.lbl.gov/publications/improving-estimates-transmission
     # Subsea costs: Purvins et al. (2018): https://doi.org/10.1016/j.jclepro.2018.03.095
-    # FOM assumed at 1% of capex per year for all transmission assets
-    TRANSMISSION_FOM_PCT = 0.01
+    # No FOM on any transmission asset -- lines and converter stations alike are
+    # charged capital recovery only. That matches the SSSC and phase-shifter cost terms
+    # in `prepare_network`, which are pure annuities, so a line, a converter and a
+    # device installed on a line are all compared on the same basis.
+    TRANSMISSION_FOM_PCT = 0.0
     hvdc_inverter_pair_capex_per_kw = 416  # MTEP24
 
     # AC line and DC line capex are no longer national scalars: they are resolved per

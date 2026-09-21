@@ -103,19 +103,6 @@ def _get_sssc_annualized_capex_per_mw(config):
     )
 
 
-def _get_phase_shifting_transformer_annualized_capex_per_mw(config):
-    """Calculate annualized phase-shifting-transformer capex per MW from config."""
-    pst_costs = config["phase_shifting_transformer"]
-    return (
-        calculate_annuity(
-            pst_costs["cost_recovery_period_years"],
-            pst_costs["wacc_real"],
-        )
-        * pst_costs["capex_per_kw"]
-        * 1e3
-    )
-
-
 def _get_line_x_conversion_candidates(
     n: pypsa.Network,
     tree_buses: pd.Index,
