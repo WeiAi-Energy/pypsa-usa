@@ -632,11 +632,10 @@ def test_iterative_optimize_kwargs_forwards_only_what_is_configured():
     assert solve_network_module._iterative_optimize_kwargs({}) == {}
     assert solve_network_module._iterative_optimize_kwargs({"proximal": None}) == {}
 
-    # Only whether to damp at all is this repo's choice. The weight, the rule
-    # that moves it and the convergence test are calibrated inside PyPSA
-    # against these very cases, so a value set here would override a tuned
-    # default with an untuned one. ``max_iterations`` is not in this set
-    # either - ``_run_standard_optimize`` passes it separately.
+    # The damping strength is this repo's choice and config.default.yaml exposes
+    # it, so a configured proximal_* value is forwarded. The convergence test is
+    # calibrated inside PyPSA and is not, and ``max_iterations`` is not in this
+    # set either - ``_run_standard_optimize`` passes it separately.
     forwarded = solve_network_module._iterative_optimize_kwargs(
         {
             "proximal": True,
@@ -647,7 +646,15 @@ def test_iterative_optimize_kwargs_forwards_only_what_is_configured():
             "max_iterations": 20,
         },
     )
-    assert forwarded == {"proximal": True}
+    assert forwarded == {
+        "proximal": True,
+        "proximal_weight": 0.1,
+        "proximal_ceiling": 8,
+    }
+    # An unconfigured weight stays out, so PyPSA keeps its own default.
+    assert solve_network_module._iterative_optimize_kwargs(
+        {"proximal": True, "proximal_weight": None},
+    ) == {"proximal": True}
     assert solve_network_module._iterative_optimize_kwargs({"proximal": False}) == {
         "proximal": False
     }
@@ -670,8 +677,17 @@ def test_run_standard_optimize_passes_the_proximal_switch_through(monkeypatch):
 
     assert (status, condition) == ("ok", "optimal")
     assert captured["proximal"] is True
-    # the step control and the convergence criterion are PyPSA's, not
-    # something this repo sets
-    assert "proximal_weight" not in captured
+    # The damping strength is configurable here; the convergence criterion is
+    # PyPSA's and is never set by this repo.
+    assert captured["proximal_weight"] == 0.1
     assert "cost_threshold" not in captured
     assert "cost_window" not in captured
+
+    captured.clear()
+    solve_network_module._run_standard_optimize(
+        SimpleNamespace(optimize=FakeOptimize()),
+        rolling_horizon=False,
+        skip_iterations=False,
+        cf_solving={"scheme": "slp", "proximal": True},
+    )
+    assert "proximal_weight" not in captured

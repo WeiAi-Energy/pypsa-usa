@@ -15,7 +15,6 @@ from prepare_network import (
     _apply_bidirectional_transmission_link_volume_correction,
     _get_line_x_conversion_candidates,
     _get_line_x_conversion_config,
-    _get_phase_shifting_transformer_annualized_capex_per_mw,
     _get_sssc_annualized_capex_per_mw,
     _infer_timestep_hours,
     _rescale_representative_metadata_steps,
@@ -134,20 +133,6 @@ def test_line_x_conversion_candidates_exclude_tree_connected_lines():
     assert excluded_tree_lines == 1
 
 
-def test_phase_shifting_transformer_annualized_capex_per_mw_uses_config():
-    annualized = _get_phase_shifting_transformer_annualized_capex_per_mw(
-        {
-            "phase_shifting_transformer": {
-                "capex_per_kw": 40,
-                "cost_recovery_period_years": 60,
-                "wacc_real": 0.044,
-            },
-        },
-    )
-
-    assert annualized == pytest.approx(calculate_annuity(60, 0.044) * 40 * 1e3)
-
-
 def test_sssc_annualized_capex_per_mw_reads_line_x_config():
     annualized = _get_sssc_annualized_capex_per_mw(
         {
@@ -167,6 +152,7 @@ def test_set_line_nom_max_disables_line_expansion_when_extension_limit_is_zero()
         lines=pd.DataFrame(
             {
                 "s_nom": [100.0],
+                "s_nom_min": [100.0],
                 "s_nom_max": [500.0],
                 "s_nom_extendable": [True],
             },
@@ -175,6 +161,7 @@ def test_set_line_nom_max_disables_line_expansion_when_extension_limit_is_zero()
         line_xs=pd.DataFrame(
             {
                 "s_nom": [80.0],
+                "s_nom_min": [80.0],
                 "s_nom_max": [400.0],
                 "s_nom_extendable": [True],
             },
@@ -204,6 +191,7 @@ def test_set_line_nom_max_disables_dc_link_expansion_when_extension_limit_is_zer
         lines=pd.DataFrame(
             {
                 "s_nom": [100.0],
+                "s_nom_min": [100.0],
                 "s_nom_max": [500.0],
                 "s_nom_extendable": [True],
             },
