@@ -14,6 +14,7 @@ import solve_network as solve_network_module
 from solve_network import (
     add_electrolysis_electricity_target_constraint,
     h2ptcreg_hydrogen_shares,
+    store_electrolysis_duals,
 )
 HYDROGEN_DEMAND_SHARE = (
     Path(__file__).parents[2] / "repo_data" / "ReEDS_Constraints" / "hydrogen_demand_share.csv"
@@ -164,37 +165,25 @@ def test_add_electrolysis_constraint_splits_electricity_target_across_h2ptcreg_r
         "California": "b2 flexible electrolysis",
     }
 
+    # No auxiliary rate variable: the target is a single row per region and period.
+    assert not [name for name in n.model.variables if "power_rate" in name]
+    assert not [name for name in n.model.constraints if name.endswith("-definition")]
+
     for period, hours in ((2030, hours_2030), (2040, hours_2040)):
         for region, link in region_links.items():
-            rate_labels = (
-                n.model.variables[f"FlexibleElectrolysis-power_rate-{region}-{period}"]
-                .labels.to_numpy()
-                .reshape(-1)
-            )
             expected_vars = link_p.sel(
                 snapshot=[(period, ts) for ts in hours],
                 Link=[link],
             ).values.reshape(-1)
 
-            # The fleet is aggregated per snapshot, one row per snapshot, so the
-            # annual row never carries a term per link and snapshot.
-            definition = n.model.constraints[
-                f"FlexibleElectrolysis-power_rate-{region}-{period}-definition"
-            ]
-            assert set(np.asarray(definition.sign).ravel().tolist()) == {"="}
-            assert np.asarray(definition.rhs).ravel().tolist() == pytest.approx([0.0] * 3)
-            assert np.asarray(definition.coeffs).ravel().tolist() == pytest.approx(
-                [1.0, -1.0] * 3,
-            )
-            assert np.asarray(definition.vars).ravel().tolist() == [
-                label for pair in zip(rate_labels, expected_vars) for label in pair
-            ]
-
+            # One term per link and snapshot, on the weighting in GWh_e.
             constraint = n.model.constraints[f"FlexibleElectrolysis-annual_electricity-{region}-{period}"]
             assert constraint.rhs.item() == pytest.approx(expected_rhs[region] * 1e3)
             assert constraint.sign.item() == "="
-            assert constraint.coeffs.to_numpy().tolist() == pytest.approx([2920.0 / 1e3] * 3)
-            assert constraint.vars.to_numpy().tolist() == rate_labels.tolist()
+            assert constraint.coeffs.to_numpy().reshape(-1).tolist() == pytest.approx(
+                [2920.0 / 1e3] * 3,
+            )
+            assert constraint.vars.to_numpy().reshape(-1).tolist() == expected_vars.tolist()
 
     assert sum(expected_rhs.values()) == pytest.approx(1512.0)
 
@@ -265,18 +254,10 @@ def test_add_electrolysis_constraint_pools_electricity_target_nationally():
     assert constraint.rhs.item() == pytest.approx(1512.0 * 1e3)
     assert constraint.sign.item() == "="
 
-    rate_labels = (
-        n.model.variables["FlexibleElectrolysis-power_rate-nation-2030"]
-        .labels.to_numpy()
-        .reshape(-1)
-    )
+    # No auxiliary rate variable: the whole fleet sits on the one annual row.
+    assert not [name for name in n.model.variables if "power_rate" in name]
+    assert not [name for name in n.model.constraints if name.endswith("-definition")]
 
-    # The annual row sums the per-snapshot aggregate, one term per snapshot.
-    assert constraint.coeffs.to_numpy().tolist() == pytest.approx([2920.0 / 1e3] * 3)
-    assert constraint.vars.to_numpy().tolist() == rate_labels.tolist()
-
-    # The whole fleet enters through the aggregation rows instead.
-    definition = n.model.constraints["FlexibleElectrolysis-power_rate-nation-2030-definition"]
     expected_vars = (
         n.model.variables["Link-p"]
         .labels.sel(
@@ -285,12 +266,11 @@ def test_add_electrolysis_constraint_pools_electricity_target_nationally():
         )
         .values.reshape(-1)
     )
-    assert np.asarray(definition.rhs).ravel().tolist() == pytest.approx([0.0] * 3)
-    assert np.asarray(definition.coeffs).ravel().tolist() == pytest.approx(
-        [1.0, -1.0, -1.0] * 3,
+    assert constraint.coeffs.to_numpy().reshape(-1).tolist() == pytest.approx(
+        [2920.0 / 1e3] * 6,
     )
-    assert sorted(np.asarray(definition.vars).ravel().tolist()) == sorted(
-        rate_labels.tolist() + expected_vars.tolist(),
+    assert sorted(constraint.vars.to_numpy().reshape(-1).tolist()) == sorted(
+        expected_vars.tolist(),
     )
 
     # Capacity adequacy follows from Link-p <= p_nom, so no separate
@@ -322,8 +302,8 @@ def test_add_electrolysis_constraint_target_is_electricity_not_hydrogen():
     # input per unit of hydrogen.
     constraint = n.model.constraints["FlexibleElectrolysis-annual_electricity-nation-2030"]
     assert constraint.rhs.item() == pytest.approx(1000.0 * 1e3)
-    definition = n.model.constraints["FlexibleElectrolysis-power_rate-nation-2030-definition"]
-    assert np.asarray(definition.coeffs).ravel().tolist() == pytest.approx([1.0, -1.0, -1.0] * 3)
+    # p enters on the snapshot weighting alone -- no efficiency, no hydrogen factor.
+    assert constraint.coeffs.to_numpy().reshape(-1).tolist() == pytest.approx([2920.0 / 1e3] * 6)
 
 
 def test_add_electrolysis_constraint_rejects_accounting_region_network_mismatch():
@@ -400,27 +380,78 @@ def test_electrolysis_representative_periods_use_single_annual_equality():
     assert not [name for name in n.model.variables if "hydrogen_budget" in name]
     assert not [name for name in n.model.constraints if "-block_" in name]
 
+    # No auxiliary rate variable either: one row carrying every link and snapshot.
+    assert not [name for name in n.model.variables if "power_rate" in name]
+    assert not [name for name in n.model.constraints if name.endswith("-definition")]
+
     annual = n.model.constraints[
         "FlexibleElectrolysis-annual_electricity-Texas-2030"
     ]
-    rate_labels = (
-        n.model.variables["FlexibleElectrolysis-power_rate-Texas-2030"]
-        .labels.to_numpy()
-        .reshape(-1)
-    )
-    assert annual.vars.to_numpy().reshape(-1).tolist() == rate_labels.tolist()
+    link_p_labels = n.model["Link-p"].labels.to_numpy().reshape(-1)
+    assert annual.vars.to_numpy().reshape(-1).tolist() == link_p_labels.tolist()
     assert annual.coeffs.to_numpy().reshape(-1).tolist() == pytest.approx([2190.0 / 1e3] * 4)
     assert annual.rhs.item() == pytest.approx(target_twh * 1e3)
 
-    # The links reach the target only through the per-snapshot aggregation rows.
-    definition = n.model.constraints["FlexibleElectrolysis-power_rate-Texas-2030-definition"]
-    link_p_labels = n.model["Link-p"].labels.to_numpy().reshape(-1)
-    assert np.asarray(definition.coeffs).ravel().tolist() == pytest.approx(
-        [1.0, -1.0] * 4,
+
+def test_store_electrolysis_duals_recovers_the_marginal_cost(monkeypatch):
+    """The stored price is per MWh_e and does not depend on the row scale."""
+    hours = pd.date_range("2030-01-01 00:00", "2030-01-01 02:00", freq="h")
+    snapshots = pd.MultiIndex.from_tuples(
+        [(2030, ts) for ts in hours],
+        names=["period", "timestep"],
     )
-    assert np.asarray(definition.vars).ravel().tolist() == [
-        label for pair in zip(rate_labels, link_p_labels) for label in pair
-    ]
+    config = {
+        "flexible_electrolysis": {
+            "enable": True,
+            "annual_electricity_twh": 1.0,
+            "accounting_region": "nation",
+        },
+    }
+
+    def price_at(scale):
+        n = pypsa.Network()
+        n.set_snapshots(snapshots)
+        n.set_investment_periods(periods=[2030])
+        for carrier in ("AC", "gen", "load", "H2", "electrolysis"):
+            n.add("Carrier", carrier)
+        n.add("Bus", "b", carrier="AC")
+        n.add("Bus", "nation flexible electrolysis H2", carrier="H2")
+        # The only way to serve the target, at a known marginal cost.
+        n.add("Generator", "g", bus="b", carrier="gen", p_nom=1e6, marginal_cost=7.0)
+        n.add("Load", "l", bus="b", carrier="load", p_set=pd.Series(0.0, index=snapshots))
+        n.add(
+            "Link",
+            "b flexible electrolysis",
+            bus0="b",
+            bus1="nation flexible electrolysis H2",
+            carrier="electrolysis",
+            p_nom=0.0,
+            p_nom_extendable=True,
+            efficiency=0.0,
+        )
+        # Both columns: the row uses ``generators``, the objective ``objective``.
+        n.snapshot_weightings.loc[:, :] = 2920.0
+
+        monkeypatch.setattr(solve_network_module, "ELECTROLYSIS_ROW_SCALE", scale)
+        n.optimize(
+            solver_name="highs",
+            multi_investment_periods=True,
+            extra_functionality=lambda n, sns: add_electrolysis_electricity_target_constraint(
+                n, sns, config, str(HYDROGEN_DEMAND_SHARE),
+            ),
+        )
+        store_electrolysis_duals(n)
+        assert hasattr(n, "electrolysis_electricity_price"), "No electrolysis price was stored"
+        assert list(n.electrolysis_electricity_price.index) == [
+            "FlexibleElectrolysis-annual_electricity-nation-2030",
+        ]
+        return n.electrolysis_electricity_price.iloc[0]
+
+    # Every extra MWh_e is served by the 7/MWh generator, so that is the price.
+    unscaled = price_at(1.0)
+    assert abs(unscaled) == pytest.approx(7.0, rel=1e-6)
+    # Multiplying instead of dividing would separate these by 1e6.
+    assert price_at(1e3) == pytest.approx(unscaled, rel=1e-6)
 
 
 def _line_x_network():

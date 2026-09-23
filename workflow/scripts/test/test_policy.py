@@ -170,6 +170,33 @@ def test_add_regional_co2limit(policy_network, co2_config):
         assert constraint_emissions <= limit + epsilon, f"Emissions in region {row.name} exceed limit of {limit}"
 
 
+def test_store_regional_co2_duals_is_invariant_to_the_row_scale(policy_network, co2_config, monkeypatch):
+    """The stored carbon price divides the row scale back out, so it is unaffected by it."""
+    from opts import policy
+
+    def price_at(scale):
+        n = policy_network.copy()
+        monkeypatch.setattr(policy, "CO2_ROW_SCALE", scale)
+        n.optimize(
+            solver_name="highs",
+            multi_investment_periods=True,
+            extra_functionality=lambda n, _: policy.add_regional_co2limit(n, co2_config),
+        )
+        policy.store_regional_co2_duals(n)
+        assert hasattr(n, "regional_co2_price"), "No carbon price was stored"
+        assert not n.regional_co2_price.empty
+        return n.regional_co2_price
+
+    # A wrong direction (multiplying instead of dividing) would separate these by 1e6.
+    unscaled = price_at(1.0)
+    scaled = price_at(1e3)
+    assert list(scaled.index) == list(unscaled.index)
+    assert scaled.to_numpy() == pytest.approx(unscaled.to_numpy(), rel=1e-6)
+    # A binding budget prices carbon; the sign follows PyPSA's convention for a
+    # ``<=`` global limit, so the carbon price is ``-mu``.
+    assert (unscaled < 0).all()
+
+
 def test_add_regional_co2limit_clustered(clustered_policy_network, co2_config):
     """Test that regional CO2 limits are correctly added to a time-clustered network."""
     from opts.policy import add_regional_co2limit

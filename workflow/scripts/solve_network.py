@@ -39,10 +39,14 @@ from _helpers import (
 from opts._helpers import patch_linopy_multiindex_assign
 from opts.bidirectional_link import add_bidirectional_link_constraints
 from opts.policy import (
+    ELECTROLYSIS_ROW_SCALE,
     add_post_2032_gas_average_power_limit,
     add_regional_co2limit,
     add_RPS_constraints,
     add_technology_capacity_target_constraints,
+    record_row_scale,
+    row_scale,
+    store_regional_co2_duals,
 )
 from opts.representative_periods import (
     add_representative_period_storage_constraints,
@@ -204,12 +208,15 @@ def add_electrolysis_electricity_target_constraint(
     accounting buses balance trivially; the constraint therefore acts on the link
     electricity withdrawal ``p0`` directly.
 
-    The target is written as two rows per region and period rather than one. A
-    per-snapshot variable ``power_rate`` carries the region's instantaneous fleet
-    withdrawal in MW_e; the annual row then sums that one variable over the
-    snapshots. This keeps the annual row sparse and both rows well scaled -- the
-    annual row sits on the snapshot weightings divided by ``1e3``, since the
-    target is configured in TWh but accounted in GWh.
+    One row per region and period, accounted in GWh_e: the snapshot weightings
+    divided by ``ELECTROLYSIS_ROW_SCALE``, which keeps the coefficients at O(1) and
+    the right hand side near 1e5.
+
+    Not split into per-snapshot rate rows, even though the row carries 200k
+    non-zeros on test_10k. Measured, splitting cost 3.5% Factor NZ and 6.9% Factor
+    Ops -- same finding as ``add_regional_co2limit``.
+
+    ``store_electrolysis_duals`` divides the scale back out of the shadow price.
     """
     flex_config = config.get("flexible_electrolysis", {})
     if not flex_config.get("enable", False):
@@ -337,33 +344,22 @@ def add_electrolysis_electricity_target_constraint(
                         f"the {float(target_twh):.6g} TWh_e target.",
                     )
 
-            # Aggregate the fleet per snapshot before summing over the year. Written
-            # directly, the annual row carries one term per link and snapshot -- 144k
-            # non-zeros for a nationwide fleet -- and a row that dense ties every
-            # Link-p column into one row of the barrier's normal equations. The
-            # aggregation is exact (associativity of the sum), so ``rate`` adds no
-            # degree of freedom: it is the region's instantaneous fleet withdrawal
-            # in MW_e, pinned by its own equality.
-            #
-            # Slicing a snapshot MultiIndex drops its name, which linopy needs to
-            # key the dimension off and match the Link-p snapshot axis.
-            rate_coords = period_snapshots.copy()
-            rate_coords.name = "snapshot"
-            rate = n.model.add_variables(
-                lower=0.0,
-                coords=[rate_coords],
-                name=f"FlexibleElectrolysis-power_rate-{region}{label}",
+            # Weightings carried on the variable's own coords: slicing a snapshot
+            # MultiIndex drops its name, which linopy needs to key the dimension off.
+            region_p = link_p.loc[period_snapshots, region_links]
+            weights_da = xr.DataArray(
+                period_weights.to_numpy() / ELECTROLYSIS_ROW_SCALE,
+                dims=("snapshot",),
+                coords={"snapshot": region_p.coords["snapshot"]},
             )
+            constraint_name = f"FlexibleElectrolysis-annual_electricity-{region}{label}"
             n.model.add_constraints(
-                rate - link_p.loc[period_snapshots, region_links].sum("Link"),
+                (region_p * weights_da).sum(),
                 "=",
-                0.0,
-                name=f"FlexibleElectrolysis-power_rate-{region}{label}-definition",
+                float(target_twh) * 1e6 / ELECTROLYSIS_ROW_SCALE,
+                name=constraint_name,
             )
-            n.model.add_constraints(
-                rate.mul(period_weights / 1e3).sum() == float(target_twh) * 1e3,
-                name=f"FlexibleElectrolysis-annual_electricity-{region}{label}",
-            )
+            record_row_scale(n, constraint_name, ELECTROLYSIS_ROW_SCALE)
 
     logger.info(
         "Applied per-%s annual electrolysis electricity targets (%.1f TWh_e total) across "
@@ -372,6 +368,38 @@ def add_electrolysis_electricity_target_constraint(
         total_target_twh,
         len(region_targets),
         ", ".join(f"{r} {t:.1f} TWh_e" for r, t in region_targets.items()),
+    )
+
+
+def store_electrolysis_duals(n):
+    """
+    Store the target's shadow price in ``n.electrolysis_electricity_price``.
+
+    A ``pd.Series`` in currency per MWh_e, indexed by constraint name: what one more
+    MWh of required electrolyser withdrawal costs. An equality, so the sign follows
+    the solver's convention. The row scale is divided back out.
+    """
+    prefix = "FlexibleElectrolysis-annual_electricity-"
+    names = [name for name in n.model.constraints if name.startswith(prefix)]
+    if not names:
+        return
+
+    prices = {}
+    for name in names:
+        constraint = n.model.constraints[name]
+        dual = getattr(constraint, "dual", None)
+        if dual is None:
+            logger.warning("No dual available for %s; skipping its electricity price.", name)
+            continue
+        prices[name] = float(np.asarray(dual).reshape(-1)[0]) / row_scale(n, name)
+
+    if not prices:
+        return
+    n.electrolysis_electricity_price = pd.Series(prices, name="electrolysis_price")
+    logger.info(
+        "Stored %d electrolysis electricity price(s): %s.",
+        len(prices),
+        ", ".join(f"{k} {v:.4g}/MWh_e" for k, v in prices.items()),
     )
 
 
@@ -866,6 +894,10 @@ if __name__ == "__main__":
 
     if "ERM" in opts:
         store_ERM_duals(n)
+    # assign_duals places neither row, and both are written row-scaled.
+    if "REM" in opts:
+        store_regional_co2_duals(n)
+    store_electrolysis_duals(n)
 
     existing_meta = getattr(n, "meta", {})
     if not isinstance(existing_meta, dict):
