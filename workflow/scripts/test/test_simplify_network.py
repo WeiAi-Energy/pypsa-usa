@@ -1,3 +1,4 @@
+import logging
 import os
 import sys
 from functools import reduce
@@ -20,7 +21,12 @@ from simplify_network import (
     planning_horizon,
     retired_by,
     identity_busmap,
+    parse_low_degree_reduction,
     reduce_low_degree_buses,
+    blend_pooled_line_ratings,
+    merged_series_rating,
+    parse_line_rating,
+    target_count_aggregation_strategies,
 )
 
 
@@ -61,7 +67,8 @@ def _network_with_degree_two_bus():
     return n
 
 
-def test_low_degree_bus_splits_capacity_and_averages_generator_attributes():
+def _split_plant_network():
+    """One plant on the degree-two bus, and one of the same carrier at a target."""
     n = _network_with_degree_two_bus()
     n.add(
         "Generator",
@@ -89,6 +96,12 @@ def test_low_degree_bus_splits_capacity_and_averages_generator_attributes():
         {"middle": [0.4, 0.8], "at_a": [0.8, 0.4]},
         index=n.snapshots,
     )
+    return n
+
+
+def test_low_degree_bus_splits_capacity_and_averages_generator_attributes():
+    """Each Kron half pools into the same-carrier fleet at its target."""
+    n = _split_plant_network()
 
     reduced, _ = reduce_low_degree_buses(n)
 
@@ -96,8 +109,10 @@ def test_low_degree_bus_splits_capacity_and_averages_generator_attributes():
     assert reduced.buses.at["a", "Pd"] == 60.0
     assert reduced.buses.at["b", "Pd"] == 20.0
 
-    at_a = reduced.generators.query("bus == 'a'").iloc[0]
-    at_b = reduced.generators.query("bus == 'b'").iloc[0]
+    at_a = reduced.generators.query("bus == 'a'")
+    at_b = reduced.generators.query("bus == 'b'")
+    assert len(at_a) == len(at_b) == 1
+    at_a, at_b = at_a.iloc[0], at_b.iloc[0]
     assert at_a.p_nom == 100.0
     assert at_a.p_nom_max == 175.0
     assert at_b.p_nom == 25.0
@@ -109,9 +124,112 @@ def test_low_degree_bus_splits_capacity_and_averages_generator_attributes():
     np.testing.assert_allclose(reduced.generators_t.p_max_pu[at_b.name], [0.4, 0.8])
 
 
-def test_series_merge_sums_length_and_capital_cost():
-    """A merged corridor costs what both of its segments cost and is rated at the
-    narrower of the two."""
+def test_stub_relocation_still_pools_the_generators_it_lands_on_one_bus():
+    """A stub moves its plant intact, and it pools at the one bus, capacity-weighted."""
+    n = _split_plant_network()
+    n.lines.loc["line_1", "bus1"] = "a"  # both of m's Lines lead to a: a stub
+    n.generators.loc["middle", "p_nom"] = 75.0
+    n.generators.loc["middle", "p_nom_max"] = 150.0
+
+    reduced, _ = reduce_low_degree_buses(n)
+
+    at_a = reduced.generators.query("bus == 'a'")
+    assert len(at_a) == 1
+    merged = at_a.iloc[0]
+    assert merged.p_nom == 100.0
+    assert merged.p_nom_max == 175.0
+    np.testing.assert_allclose(merged.efficiency, 0.85)
+    np.testing.assert_allclose(merged.capital_cost, 5.0)
+    np.testing.assert_allclose(merged.marginal_cost, 3.0)
+    np.testing.assert_allclose(reduced.generators_t.p_max_pu[merged.name], [0.5, 0.7])
+
+
+def test_low_degree_bus_splits_storage_units_by_the_kron_factor():
+    """A battery is split exactly as a plant is, energy and stored charge included."""
+    n = _network_with_degree_two_bus()
+    n.add(
+        "StorageUnit",
+        "batt",
+        bus="m",
+        carrier="battery",
+        p_nom=100.0,
+        max_hours=4.0,
+        state_of_charge_initial=200.0,
+    )
+
+    reduced, _ = reduce_low_degree_buses(n)
+
+    units = reduced.storage_units
+    assert set(units.index) == {"batt", "batt__split_b"}
+    np.testing.assert_allclose(units.at["batt", "p_nom"], 75.0)
+    np.testing.assert_allclose(units.at["batt__split_b", "p_nom"], 25.0)
+    # `max_hours` is intensive, so the energy capacity follows the power split,
+    # and the charge already in the reservoir is split with it.
+    np.testing.assert_allclose(units.max_hours, 4.0)
+    np.testing.assert_allclose(units.at["batt", "state_of_charge_initial"], 150.0)
+    np.testing.assert_allclose(units.at["batt__split_b", "state_of_charge_initial"], 50.0)
+
+
+def test_cascading_elimination_compounds_the_kron_split():
+    """A chain of degree-two buses splits the same plant once per pass.
+
+    The factors compound, so the plant's capacity still lands in the exact Kron
+    ratio however deep the chain -- and pieces that the chain brings back onto one
+    bus pool again. Both elimination orders give the same answer, as Kron requires.
+    """
+    n = pypsa.Network()
+    n.set_snapshots(pd.date_range("2030-01-01", periods=2, freq="h"))
+    for bus in ("m1", "m2", "a", "b", "c", "d"):
+        n.add("Bus", bus)
+    edges = [
+        ("m1", "a", 1.0),
+        ("m1", "m2", 1.0),
+        ("m2", "b", 2.0),
+        ("a", "b", 2.0),
+        ("a", "c", 2.0),
+        ("a", "d", 2.0),
+        ("b", "c", 2.0),
+        ("b", "d", 2.0),
+        ("c", "d", 2.0),
+    ]
+    n.lines = pd.DataFrame(
+        {
+            "bus0": [edge[0] for edge in edges],
+            "bus1": [edge[1] for edge in edges],
+            "x": [edge[2] for edge in edges],
+            "r": 0.1,
+            "s_nom": 100.0,
+            "s_nom_min": 0.0,
+            "s_nom_max": 200.0,
+            "length": 1.0,
+            "type": "",
+            "carrier": "AC",
+        },
+        index=[f"line_{i}" for i in range(len(edges))],
+    )
+    n.buses["Pd"] = 0.0
+    n.add("Generator", "chained", bus="m1", carrier="solar", p_nom=100.0)
+
+    reduced, _ = reduce_low_degree_buses(n)
+
+    assert {"m1", "m2"}.isdisjoint(reduced.buses.index)
+    clones = reduced.generators
+    assert len(clones) == 2
+    by_bus = clones.set_index("bus")
+    np.testing.assert_allclose(by_bus.at["a", "p_nom"], 75.0)
+    np.testing.assert_allclose(by_bus.at["b", "p_nom"], 25.0)
+
+
+@pytest.mark.parametrize(
+    "kwargs, s_nom",
+    [
+        ({}, (7.0 * 100.0 + 21.0 * 60.0) / 28.0),  # default: cost-weighted mean
+        ({"series_rating": "min"}, 60.0),  # the narrower section
+    ],
+)
+def test_series_merge_sums_length_and_capital_cost(kwargs, s_nom):
+    """A merged corridor costs what both of its segments cost; its rating follows
+    ``series_rating``."""
     n = _network_with_degree_two_bus()
     # $/MW proportional to length, as `update_transmission_costs` builds it.
     n.lines["capital_cost"] = n.lines.length * 7.0
@@ -119,13 +237,13 @@ def test_series_merge_sums_length_and_capital_cost():
     n.lines.loc["line_1", "capital_cost"] = 21.0
     n.lines.loc["line_1", "s_nom"] = 60.0
 
-    reduced, _ = reduce_low_degree_buses(n)
+    reduced, _ = reduce_low_degree_buses(n, **kwargs)
 
     merged = reduced.lines.loc["line_0"]
     assert {merged.bus0, merged.bus1} == {"a", "b"}
     np.testing.assert_allclose(merged.x, 4.0)  # 1 + 3
     np.testing.assert_allclose(merged.r, 0.2)  # 0.1 + 0.1
-    np.testing.assert_allclose(merged.s_nom, 60.0)  # the narrower section
+    np.testing.assert_allclose(merged.s_nom, s_nom)
     np.testing.assert_allclose(merged.length, 4.0)  # 1 + 3
     np.testing.assert_allclose(merged.capital_cost, 28.0)  # 7 + 21
 
@@ -387,6 +505,132 @@ def test_target_bus_count_busmap_feeds_the_standard_clustering_wrapper():
     # Region membership has to survive onto the clustered buses: cluster_regions
     # and the downstream policy constraints key off it.
     assert set(clustered.buses.reeds_zone) == {"west", "east"}
+
+
+def _bundle_between_two_clusters():
+    """Two circuits A0-B0 and A1-B1 with unequal x*s, plus internal Lines."""
+    n = _network_from_edges(
+        [("a0", "b0", 1.0), ("a1", "b1", 4.0), ("a0", "a1", 1.0), ("b0", "b1", 1.0)],
+        ["a0", "a1", "b0", "b1"],
+    )
+    n.lines.loc["line_1", ["s_nom", "s_nom_max"]] = [300.0, 400.0]
+    busmap = pd.Series({"a0": "A", "a1": "A", "b0": "B", "b1": "B"})
+    return n, busmap
+
+
+@pytest.mark.parametrize(
+    "line_rating, s_nom, s_nom_max",
+    [
+        # b = (1, 1/4); min(s/b) = min(100, 1200) -> 1.25 * 100
+        ("parallel_bottleneck", 125.0, 250.0),
+        ("sum", 400.0, 600.0),
+    ],
+)
+def test_target_count_line_rating_sets_the_pooled_bundle_rating(line_rating, s_nom, s_nom_max):
+    n, busmap = _bundle_between_two_clusters()
+    strategies = target_count_aggregation_strategies({}, line_rating)
+    lines = clustering_from_busmap(
+        n, busmap, line_length_factor=1.0, aggregation_strategies=strategies,
+    ).network.lines
+    assert len(lines) == 1
+    np.testing.assert_allclose(lines.s_nom.iloc[0], s_nom)
+    np.testing.assert_allclose(lines.s_nom_max.iloc[0], s_nom_max)
+    # The reactance is the parallel combination either way: 1 / (1 + 1/4).
+    np.testing.assert_allclose(lines.x.iloc[0], 0.8)
+
+
+def _unequal_series_chain():
+    """a - m - b with segments rated 100 and 300 and costed 1 and 3."""
+    n = _network_with_degree_two_bus()
+    n.lines["capital_cost"] = 1.0
+    n.lines.loc["line_0", ["s_nom", "capital_cost"]] = [100.0, 1.0]  # m-a
+    n.lines.loc["line_1", ["s_nom", "capital_cost"]] = [300.0, 3.0]  # m-b
+    n.lines["s_nom_max"] = np.inf
+    return n
+
+
+@pytest.mark.parametrize(
+    "rule, s_nom",
+    [("min", 100.0), ("cost_weighted", (1 * 100 + 3 * 300) / 4)],
+)
+def test_series_rating_sets_the_merged_corridor_rating(rule, s_nom):
+    reduced, _ = reduce_low_degree_buses(_unequal_series_chain(), series_rating=rule)
+    # The merged corridor inherits the first name in sort order; the K4 core's
+    # own a-b Line (line_2) stands beside it untouched.
+    merged = reduced.lines.loc["line_0"]
+    assert {merged.bus0, merged.bus1} == {"a", "b"}
+    np.testing.assert_allclose(merged.s_nom, s_nom)
+    # Summed either way: widening the corridor past both segments costs both.
+    np.testing.assert_allclose(merged.capital_cost, 4.0)
+    assert np.isinf(merged.s_nom_max)
+    np.testing.assert_allclose(reduced.lines.at["line_2", "s_nom"], 100.0)
+
+
+def test_cost_weighted_series_rating_composes_across_passes():
+    """Merging a merged segment again gives the cost-weighted mean of all three."""
+    seg = lambda s, c: pd.Series({"s_nom": s, "capital_cost": c, "length": 1.0})
+    first = merged_series_rating(seg(100.0, 1.0), seg(300.0, 3.0), "cost_weighted")
+    second = merged_series_rating(seg(first, 4.0), seg(50.0, 2.0), "cost_weighted")
+    np.testing.assert_allclose(second, (100 * 1 + 300 * 3 + 50 * 2) / 6)
+    with pytest.raises(ValueError):
+        merged_series_rating(seg(1.0, 1.0), seg(1.0, 1.0), "mean")
+
+
+def test_unpooled_line_rating_keeps_every_inter_cluster_circuit():
+    n, busmap = _bundle_between_two_clusters()
+    clustered = clustering_from_busmap(
+        n, busmap, line_length_factor=1.0,
+        aggregation_strategies=target_count_aggregation_strategies({}, "unpooled"),
+        pool_parallel_lines=False,
+    ).network
+    lines = clustered.lines.sort_values("x")
+    # Both A-B circuits survive as they were; the two internal Lines are gone.
+    assert len(lines) == 2
+    assert set(map(frozenset, zip(lines.bus0, lines.bus1))) == {frozenset({"A", "B"})}
+    np.testing.assert_allclose(lines.x, [1.0, 4.0])
+    np.testing.assert_allclose(lines.s_nom, [100.0, 300.0])
+    assert "_unpooled_line" not in clustered.lines.columns
+    assert "_unpooled_line" not in n.lines.columns
+
+
+def test_fractional_line_rating_blends_bottleneck_toward_sum():
+    n, busmap = _bundle_between_two_clusters()
+    n.lines.loc["line_2", "s_nom_max"] = np.inf  # an unbounded internal Line
+    clustering = clustering_from_busmap(
+        n, busmap, line_length_factor=1.0,
+        aggregation_strategies=target_count_aggregation_strategies({}, 0.5),
+    )
+    blend_pooled_line_ratings(clustering.network, n.lines, clustering.linemap, 0.5)
+    lines = clustering.network.lines
+    assert len(lines) == 1
+    # Halfway between the bottleneck (125, 250) and the sum (400, 600).
+    np.testing.assert_allclose(lines.s_nom.iloc[0], 262.5)
+    np.testing.assert_allclose(lines.s_nom_max.iloc[0], 425.0)
+
+
+@pytest.mark.parametrize(
+    "value, parsed",
+    [(0, "parallel_bottleneck"), (1.0, "sum"), ("0.5", 0.5), (0.25, 0.25), ("sum", "sum"),
+     ("unpooled", "unpooled")],
+)
+def test_parse_line_rating(value, parsed):
+    assert parse_line_rating(value) == parsed
+
+
+@pytest.mark.parametrize("value", [1.5, -0.1, "max", None])
+def test_parse_line_rating_rejects_anything_else(value):
+    with pytest.raises(ValueError):
+        parse_line_rating(value)
+
+
+def test_target_count_line_rating_leaves_the_callers_strategies_alone():
+    base = {"lines": {"s_nom": "parallel_bottleneck"}, "generators": {"lifetime": "mean"}}
+    strategies = target_count_aggregation_strategies(base, "sum")
+    assert strategies["lines"]["s_nom"] == "sum"
+    assert base["lines"]["s_nom"] == "parallel_bottleneck"
+    assert strategies["generators"] == {"lifetime": "mean"}
+    with pytest.raises(ValueError):
+        target_count_aggregation_strategies(base, "max")
 
 
 def test_identity_busmap_leaves_the_network_untouched():
@@ -677,6 +921,7 @@ def test_substation_aggregation_splits_retired_plant_too():
 def test_colocated_merge_keeps_retired_plant_apart_and_averages_the_dates():
     """A relocation that lands both kinds on one bus must not pool them."""
     n = _network_with_degree_two_bus()
+    n.lines.loc["line_1", "bus1"] = "a"  # a stub, so m's plant moves intact
     n.set_snapshots(pd.date_range("2030-01-01", periods=2, freq="h"))
     n.investment_periods = [2030, 2040, 2050]
     n.add("Generator", "old_m", bus="m", carrier="coal", p_nom=100.0, build_year=1975, lifetime=70)
@@ -685,17 +930,16 @@ def test_colocated_merge_keeps_retired_plant_apart_and_averages_the_dates():
 
     reduced, _ = reduce_low_degree_buses(n)
 
-    # The Kron split sends 3/4 of each unit on `m` to `a`. The 1975 block
-    # retires in 2045, so it stays out of the group the 1995 and 2005 units
-    # merge into, even though all three now sit on one bus.
+    # The 1975 block retires in 2045, so it stays out of the group the 1995 and
+    # 2005 units merge into, even though all three now sit on one bus.
     at_a = reduced.generators.query("bus == 'a'")
     assert len(at_a) == 2
     retiring = at_a[at_a.build_year < 1990]
     merged = at_a[at_a.build_year > 1990]
-    assert float(retiring.p_nom.iloc[0]) == pytest.approx(75.0)
-    assert float(merged.p_nom.iloc[0]) == pytest.approx(375.0)
-    # 75 MW of 1995 plant and 300 MW of 2005 plant.
-    assert int(merged.build_year.iloc[0]) == 2003
+    assert float(retiring.p_nom.iloc[0]) == pytest.approx(100.0)
+    assert float(merged.p_nom.iloc[0]) == pytest.approx(400.0)
+    # 100 MW of 1995 plant and 300 MW of 2005 plant.
+    assert int(merged.build_year.iloc[0]) == 2002
     assert float(merged.lifetime.iloc[0]) == pytest.approx(70.0)
 
     assert _active_capacity(reduced) == {2030: 500.0, 2040: 500.0, 2050: 400.0}
@@ -750,3 +994,436 @@ def test_single_planning_year_yields_at_most_two_existing_generators_per_carrier
     assert set(clustered.generators.carrier) == {"coal"}
     assert _active_capacity(clustered) == {2050: 300.0}
     assert clustered.generators.p_nom.sum() == pytest.approx(n.generators.p_nom.sum())
+
+
+# ---------------------------------------------------------------------------
+# lossless vs degree1and2
+#
+# The two levels share every line of `reduce_low_degree_buses` but the test for
+# which degree-2 buses may go, so what follows pins that test: which buses each
+# level is allowed to take, that `lossless` reaches a fixed point on its own, and
+# that neither of the two approximations `lossless` exists to avoid -- a series
+# merge that writes off rating, and a Kron split of a dispatchable asset -- can
+# happen under it.
+# ---------------------------------------------------------------------------
+
+
+def _k4_edges():
+    """Six Lines over a, b, c, d: every bus at degree 3, so none is reducible."""
+    return [
+        ("a", "b", 2.0),
+        ("a", "c", 2.0),
+        ("a", "d", 2.0),
+        ("b", "c", 2.0),
+        ("b", "d", 2.0),
+        ("c", "d", 2.0),
+    ]
+
+
+def _network_from_edges(edges, buses):
+    n = pypsa.Network()
+    for bus in buses:
+        n.add("Bus", bus)
+    n.lines = pd.DataFrame(
+        {
+            "bus0": [edge[0] for edge in edges],
+            "bus1": [edge[1] for edge in edges],
+            "x": [edge[2] for edge in edges],
+            "r": 0.1,
+            "s_nom": 100.0,
+            "s_nom_min": 0.0,
+            "s_nom_max": 200.0,
+            "length": 1.0,
+            "type": "",
+            "carrier": "AC",
+        },
+        index=[f"line_{i}" for i in range(len(edges))],
+    )
+    n.buses["Pd"] = 0.0
+    return n
+
+
+def _stub_chain_on_a_k4(depth=1):
+    """A chain of ``depth`` buses hanging off `a` of a K4 core, each carrying 10 MW.
+
+    Only the tip of the chain starts at degree 1; every bus behind it starts at
+    degree 2, equally rated and empty, so under ``lossless`` it may go either as a
+    series merge or as a stub once the bus in front of it is gone. Either way the
+    whole chain ends up at `a`, which takes a job for the fixed-point loop.
+    """
+    chain = ["a"] + [f"s{i}" for i in range(1, depth + 1)]
+    edges = _k4_edges() + [(chain[i], chain[i + 1], 1.0) for i in range(depth)]
+    n = _network_from_edges(edges, ("a", "b", "c", "d", *chain[1:]))
+    n.buses.loc[chain[1:], "Pd"] = 10.0
+    return n
+
+
+def _double_stub_network():
+    """`m` reaches only `a`, but by two Lines rather than one."""
+    n = _network_with_degree_two_bus()
+    n.lines.loc["line_1", "bus1"] = "a"
+    return n
+
+
+def _mixed_low_degree_network():
+    """One degree-1 stub and one degree-2 bus on the same core.
+
+    `s` hangs off `c`, which has three Lines of its own, so removing `s` leaves the
+    core untouched and the two levels differ by exactly the degree-2 bus `m`,
+    whose two Lines are rated 100 and 150 MW -- a merge would write off 50.
+    """
+    n = _network_with_degree_two_bus()
+    n.lines.loc["line_1", "s_nom"] = 150.0
+    n.add("Bus", "s")
+    n.buses.loc["s", "Pd"] = 40.0
+    n.lines.loc["line_stub"] = n.lines.loc["line_0"].copy()
+    n.lines.loc["line_stub", ["bus0", "bus1"]] = ["c", "s"]
+    return n
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("degree1and2", "degree1and2"),
+        ("lossless", "lossless"),
+        ("none", None),
+        # The booleans the key took before the split. `true` has to keep meaning
+        # degree1and2 -- the only behaviour it ever selected -- or a config written
+        # against it would silently export a different network.
+        (True, "degree1and2"),
+        (False, None),
+        (None, None),
+        ("true", "degree1and2"),
+        ("false", None),
+        # YAML reads an unquoted no/off as False; the quoted forms land alongside.
+        ("no", None),
+        ("off", None),
+        ("yes", "degree1and2"),
+        # Case and surrounding space are not part of the mode name.
+        ("LOSSLESS", "lossless"),
+        ("  degree1and2\t", "degree1and2"),
+    ],
+)
+def test_parse_low_degree_reduction_maps_every_accepted_spelling(value, expected):
+    assert parse_low_degree_reduction(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["degree1", "degree2", "degree_1", "degree 1", "1", 2, "", "maybe"],
+)
+def test_parse_low_degree_reduction_rejects_anything_else(value):
+    """A typo must not fall back to a default -- nor may the retired ``degree1``,
+    whose stubs-only behaviour ``lossless`` replaced.
+
+    Every mode runs without error and produces a network, so a silent fallback
+    would swap the exported topology with nothing in the log to say so.
+    """
+    with pytest.raises(ValueError, match="low_degree_reduction"):
+        parse_low_degree_reduction(value)
+
+
+@pytest.mark.parametrize("level", [1, 2, None, "none", "degree1", "LOSSLESS", " lossless"])
+def test_reduce_low_degree_buses_rejects_an_unsupported_level(level):
+    """Only the two exact level names; the lenient spellings are the config
+    parser's job, and switching the pass off is the caller's."""
+    with pytest.raises(ValueError, match="level"):
+        reduce_low_degree_buses(_network_with_degree_two_bus(), level=level)
+
+
+def test_lossless_clears_a_stub_chain_and_the_weight_all_reaches_its_root():
+    """Two buses deep, so the fixed point has to run twice to reach the far one.
+
+    Whether `s1` goes as a series merge (its Lines are equally rated and it holds
+    nothing dispatchable) or as a stub once `s2` is gone, 10 + 10 ends up at `a`.
+    """
+    n = _stub_chain_on_a_k4(depth=2)
+
+    reduced, busmap = reduce_low_degree_buses(n, level="lossless")
+
+    assert set(reduced.buses.index) == {"a", "b", "c", "d"}
+    assert busmap.at["s1"] == "a"
+    assert busmap.at["s2"] == "a"
+    assert reduced.buses.at["a", "Pd"] == pytest.approx(20.0)
+    # The core is untouched: only the two chain Lines went.
+    assert set(reduced.lines.index) == {f"line_{i}" for i in range(6)}
+
+
+def test_lossless_splices_out_an_equally_rated_empty_degree_two_bus():
+    """Both of `m`'s Lines are rated 100 MW and it holds only demand weight.
+
+    The corridor keeps 100 MW, so nothing is written off; `m`'s 80 MW is a fixed
+    injection whose Kron split -- 3/4 to `a` behind x=1, 1/4 to `b` behind x=3 --
+    is exact. This is precisely what degree1and2 would do to the same bus.
+    """
+    lossless, lossless_busmap = reduce_low_degree_buses(_network_with_degree_two_bus(), level="lossless")
+    both, both_busmap = reduce_low_degree_buses(_network_with_degree_two_bus(), level="degree1and2")
+
+    assert "m" not in lossless.buses.index
+    assert lossless_busmap.at["m"] == "a"
+    assert lossless.buses.at["a", "Pd"] == pytest.approx(60.0)
+    assert lossless.buses.at["b", "Pd"] == pytest.approx(20.0)
+    merged = lossless.lines.loc["line_0"]
+    assert {merged.bus0, merged.bus1} == {"a", "b"}
+    np.testing.assert_allclose(merged.x, 4.0)
+    np.testing.assert_allclose(merged.s_nom, 100.0)
+    assert "line_1" not in lossless.lines.index
+
+    pd.testing.assert_frame_equal(lossless.lines.sort_index(), both.lines.sort_index())
+    pd.testing.assert_series_equal(lossless_busmap, both_busmap)
+
+
+def test_lossless_leaves_an_unequally_rated_degree_two_bus_alone():
+    """Merging 100 MW with 150 MW would rate the corridor at 100 and write off 50,
+    so under lossless `m` and both its segments stay as built."""
+    n = _network_with_degree_two_bus()
+    n.lines.loc["line_1", "s_nom"] = 150.0
+    lines_before = set(n.lines.index)
+
+    reduced, busmap = reduce_low_degree_buses(n, level="lossless")
+
+    assert "m" in reduced.buses.index
+    assert (busmap == busmap.index).all()
+    assert reduced.buses.at["m", "Pd"] == pytest.approx(80.0)
+    assert reduced.buses.at["a", "Pd"] == pytest.approx(0.0)
+    assert set(reduced.lines.index) == lines_before
+    np.testing.assert_allclose(reduced.lines.at["line_0", "x"], 1.0)
+    np.testing.assert_allclose(reduced.lines.at["line_1", "x"], 3.0)
+
+
+@pytest.mark.parametrize(
+    ("column", "value", "default"),
+    [("s_nom_max", 300.0, 200.0), ("s_max_pu", 0.5, 1.0), ("s_nom_extendable", True, False)],
+)
+def test_lossless_requires_every_rating_attribute_to_match(column, value, default):
+    """Equal `s_nom` alone is not enough: the merge takes the minimum of the
+    expansion bound too, and a mismatched `s_max_pu` or extendability would change
+    what the corridor may carry or build."""
+    n = _network_with_degree_two_bus()
+    if column not in n.lines.columns:
+        n.lines[column] = default
+    n.lines.loc["line_1", column] = value
+
+    reduced, _ = reduce_low_degree_buses(n, level="lossless")
+
+    assert "m" in reduced.buses.index
+
+
+def test_lossless_tolerates_float_noise_in_the_rating():
+    n = _network_with_degree_two_bus()
+    n.lines.loc["line_1", "s_nom"] = 100.0 * (1 + 1e-9)
+
+    reduced, _ = reduce_low_degree_buses(n, level="lossless")
+
+    assert "m" not in reduced.buses.index
+
+
+def test_lossless_never_splits_a_plant_across_two_buses():
+    """The other approximation lossless exists to avoid.
+
+    Under degree1and2 this plant is cloned onto `a` and `b` in the Kron ratio,
+    and the two halves then dispatch independently. Under lossless it is one
+    plant on its own bus, as it was built -- even though the two Lines at `m` are
+    equally rated.
+    """
+    n = _split_plant_network()
+
+    reduced, _ = reduce_low_degree_buses(n, level="lossless")
+
+    assert "m" in reduced.buses.index
+    assert set(reduced.generators.index) == {"middle", "at_a"}
+    assert reduced.generators.at["middle", "bus"] == "m"
+    np.testing.assert_allclose(reduced.generators.at["middle", "p_nom"], 100.0)
+    np.testing.assert_allclose(reduced.generators.at["middle", "p_nom_max"], 200.0)
+
+
+def test_lossless_never_splits_a_storage_unit():
+    n = _network_with_degree_two_bus()
+    n.add("StorageUnit", "batt", bus="m", carrier="battery", p_nom=100.0, max_hours=4.0)
+
+    reduced, _ = reduce_low_degree_buses(n, level="lossless")
+
+    assert "m" in reduced.buses.index
+    assert list(reduced.storage_units.index) == ["batt"]
+    assert reduced.storage_units.at["batt", "bus"] == "m"
+
+
+def test_lossless_never_relocates_a_link():
+    """A Link is one converter pair with one site; moving it wholesale to the
+    nearer neighbour is not lossless, so a bus holding either end stays."""
+    n = _network_with_degree_two_bus()
+    n.add("Bus", "far")
+    n.add("Link", "dc", bus0="m", bus1="far", p_nom=50.0, carrier="DC")
+
+    reduced, _ = reduce_low_degree_buses(n, level="lossless")
+
+    assert "m" in reduced.buses.index
+    assert reduced.links.at["dc", "bus0"] == "m"
+
+
+def test_lossless_splits_a_load_by_the_kron_factor():
+    """A Load is a fixed injection, so it does not block the merge and its Kron
+    split is exact: 3/4 of it lands at `a` behind x=1, 1/4 at `b` behind x=3."""
+    n = _network_with_degree_two_bus()
+    n.add("Load", "demand", bus="m", p_set=40.0)
+
+    reduced, _ = reduce_low_degree_buses(n, level="lossless")
+
+    assert "m" not in reduced.buses.index
+    by_bus = reduced.loads.groupby("bus").p_set.sum()
+    assert by_bus.at["a"] == pytest.approx(30.0)
+    assert by_bus.at["b"] == pytest.approx(10.0)
+
+
+def test_lossless_collapses_an_equally_rated_chain_to_a_fixed_point():
+    """`a - m1 - m2 - m3 - b`, every segment 100 MW and every middle bus empty:
+    the chain is spliced a pair at a time over several passes and ends as one
+    corridor whose reactance is the sum of its four segments."""
+    edges = _k4_edges() + [
+        ("a", "m1", 1.0),
+        ("m1", "m2", 2.0),
+        ("m2", "m3", 3.0),
+        ("m3", "b", 4.0),
+    ]
+    n = _network_from_edges(edges, ("a", "b", "c", "d", "m1", "m2", "m3"))
+    n.buses.loc[["m1", "m2", "m3"], "Pd"] = 10.0
+
+    reduced, busmap = reduce_low_degree_buses(n, level="lossless")
+
+    assert set(reduced.buses.index) == {"a", "b", "c", "d"}
+    assert set(busmap.loc[["m1", "m2", "m3"]]) <= {"a", "b"}
+    corridor = reduced.lines.loc[~reduced.lines.index.isin([f"line_{i}" for i in range(6)])]
+    assert len(corridor) == 1
+    np.testing.assert_allclose(corridor.x.iloc[0], 10.0)
+    np.testing.assert_allclose(corridor.s_nom.iloc[0], 100.0)
+    assert reduced.buses.Pd.sum() == pytest.approx(30.0)
+
+
+def test_lossless_leaves_a_double_stub_standing():
+    """`m` is a radial dead end reached only through `a`. degree1and2 folds it in
+    as a stub; lossless leaves it, which keeps what lossless removes a subset of
+    what degree1and2 removes and restricted to the two cases its name covers.
+    """
+    kept, busmap = reduce_low_degree_buses(_double_stub_network(), level="lossless")
+    assert "m" in kept.buses.index
+    assert (busmap == busmap.index).all()
+    assert kept.buses.at["m", "Pd"] == pytest.approx(80.0)
+    assert {"line_0", "line_1"} <= set(kept.lines.index)
+
+    folded, folded_busmap = reduce_low_degree_buses(_double_stub_network(), level="degree1and2")
+    assert "m" not in folded.buses.index
+    assert folded_busmap.at["m"] == "a"
+    assert folded.buses.at["a", "Pd"] == pytest.approx(80.0)
+
+
+def test_lossless_removes_a_strict_subset_of_what_degree1and2_removes():
+    """Why this is one three-valued key and not two independent switches: the
+    levels are nested, so no combination of them could mean anything new."""
+    ones, _ = reduce_low_degree_buses(_mixed_low_degree_network(), level="lossless")
+    both, _ = reduce_low_degree_buses(_mixed_low_degree_network(), level="degree1and2")
+
+    assert set(both.buses.index) < set(ones.buses.index)
+    # `s` is the stub both take; `m`, unequally rated, only degree1and2 reaches.
+    assert set(ones.buses.index) == {"a", "b", "c", "d", "m"}
+    assert set(both.buses.index) == {"a", "b", "c", "d"}
+
+
+def test_default_level_is_still_degree1and2():
+    """Callers that predate the split have to keep the network they had."""
+    default, default_busmap = reduce_low_degree_buses(_mixed_low_degree_network())
+    explicit, explicit_busmap = reduce_low_degree_buses(
+        _mixed_low_degree_network(),
+        level="degree1and2",
+    )
+
+    assert set(default.buses.index) == set(explicit.buses.index)
+    pd.testing.assert_series_equal(default_busmap, explicit_busmap)
+
+
+def test_lossless_still_refuses_to_fold_a_stub_across_a_zone():
+    """The zone guard sits on the shared path and needs its own check under this
+    level.
+
+    Folding `s1` into `a` would move its 10 MW out of `east`, which every
+    ReEDS-facing constraint downstream is written against.
+    """
+    n = _stub_chain_on_a_k4(depth=1)
+    n.buses["reeds_zone"] = "west"
+    n.buses.loc["s1", "reeds_zone"] = "east"
+
+    reduced, busmap = reduce_low_degree_buses(n, level="lossless")
+
+    assert "s1" in reduced.buses.index
+    assert busmap.at["s1"] == "s1"
+    assert reduced.buses.at["s1", "Pd"] == pytest.approx(10.0)
+    assert reduced.buses.at["a", "Pd"] == pytest.approx(0.0)
+
+
+def test_lossless_skips_the_heterogeneity_line_when_it_merged_nothing(caplog):
+    """With no series merge the metric has no groups and comes out NaN, which in a
+    log reads as a broken measurement rather than an absent one. The level is
+    named in the line that does go out, so the log says which one ran."""
+    with caplog.at_level(logging.INFO, logger="simplify_network"):
+        reduce_low_degree_buses(_mixed_low_degree_network(), level="lossless")
+
+    assert "Series s_nom heterogeneity" not in caplog.text
+    assert "Reduced low-degree buses (lossless)" in caplog.text
+    assert "1 with unequally rated Lines" in caplog.text
+
+
+def test_lossless_reports_zero_heterogeneity_for_its_merges(caplog):
+    """Every string lossless collapses pools equal ratings, so the metric it logs
+    is a check that has to read exactly 0."""
+    with caplog.at_level(logging.INFO, logger="simplify_network"):
+        reduce_low_degree_buses(_network_with_degree_two_bus(), level="lossless")
+
+    assert "Series s_nom heterogeneity = 0.0000" in caplog.text
+
+
+def test_degree1and2_mode_still_reports_the_series_heterogeneity(caplog):
+    """The counterpart of the above: gating that log must not switch it off for the
+    mode that does have something to report."""
+    with caplog.at_level(logging.INFO, logger="simplify_network"):
+        reduce_low_degree_buses(_mixed_low_degree_network(), level="degree1and2")
+
+    assert "Series s_nom heterogeneity" in caplog.text
+    assert "Reduced low-degree buses (degree1and2)" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("config_value", "surviving"),
+    [
+        ("degree1and2", {"a", "b", "c", "d"}),
+        ("lossless", {"a", "b", "c", "d", "m"}),
+        ("none", {"a", "b", "c", "d", "m", "s"}),
+        # the spellings a config written before the split would carry
+        (True, {"a", "b", "c", "d"}),
+        (False, {"a", "b", "c", "d", "m", "s"}),
+    ],
+)
+def test_the_config_value_reaches_the_network_it_names(config_value, surviving):
+    """The join `simplify_network.__main__` makes, over one network that holds a
+    case for each mode to disagree about.
+
+    The busmap is checked alongside, for all three modes and not just the two that
+    reduce: it has to stay total over the original buses and land inside the
+    survivors, or the region dissolve and the exported ``busmap.csv`` -- which
+    compose it with the contraction and target-count maps -- would lose the
+    substations it is keyed by. A disabled pass hands back the identity for
+    exactly that reason.
+    """
+    n = _mixed_low_degree_network()
+    original = set(n.buses.index)
+
+    level = parse_low_degree_reduction(config_value)
+    if level is None:
+        reduced, busmap = n, identity_busmap(n)
+    else:
+        reduced, busmap = reduce_low_degree_buses(n, level=level)
+
+    assert set(reduced.buses.index) == surviving
+    assert set(busmap.index) == original
+    assert set(busmap) <= surviving
+    # Every bus that went is accounted for, and every survivor maps to itself.
+    for bus in surviving:
+        assert busmap.at[bus] == bus

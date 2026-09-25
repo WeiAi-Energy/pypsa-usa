@@ -451,8 +451,9 @@ rule simplify_network:
             "clustering", "aggregation_strategies", default={}
         ),
         low_degree_reduction=config_provider(
-            "clustering", "low_degree_reduction", default=True
+            "clustering", "low_degree_reduction", default="degree1and2"
         ),
+        series_rating=config_provider("clustering", "series_rating", default="cost_weighted"),
         target_count=config_provider("clustering", "target_count"),
         length_factor=config_provider("lines", "length_factor"),
         topological_boundaries=config_provider(

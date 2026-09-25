@@ -84,6 +84,65 @@ PROTECTED_ZONE_COLUMN = "reeds_zone"
 #: zone data relaxes the guard instead of freezing the reduction.
 MISSING_ZONE_LABEL = "__missing_zone__"
 
+#: The levels :func:`reduce_low_degree_buses` accepts as ``level``, mildest
+#: first. They are nested rather than independent -- ``degree1and2`` removes
+#: everything ``lossless`` removes and then some -- so together with ``none``
+#: they form one three-valued ``clustering: low_degree_reduction`` key rather
+#: than two switches that could be set to contradict each other.
+LOW_DEGREE_REDUCTION_LEVELS = ("lossless", "degree1and2")
+
+#: Relative tolerance within which the two segments at a degree-2 bus count as
+#: equally rated for the ``lossless`` level. Loose enough to absorb float noise
+#: from the substation aggregation, tight enough that no real headroom is lost.
+LOSSLESS_RATING_RTOL = 1e-6
+
+#: One-port components whose presence on a degree-2 bus rules out a lossless
+#: series merge: eliminating the bus would split a dispatchable asset between
+#: two neighbours, which is only equivalent while the halves inject in lockstep.
+#: Loads are fixed injections, so their Kron split is exact and they do not block.
+LOSSLESS_BLOCKING_ONE_PORTS = ("Generator", "StorageUnit", "Store")
+
+
+def parse_low_degree_reduction(value: object) -> str | None:
+    """Resolve ``clustering: low_degree_reduction`` to a reduction level.
+
+    Returns ``"lossless"`` or ``"degree1and2"``, which
+    :func:`reduce_low_degree_buses` takes as its ``level``, or ``None`` when the
+    pass is switched off (``none``/``false``). What each level does to the
+    network is set out there.
+
+    The booleans this key used to take are still accepted, ``true`` mapping to
+    ``degree1and2`` -- the only behaviour it ever selected -- so a config written
+    before the split still produces the network it used to. Note that YAML reads
+    an unquoted ``no``/``off`` as ``False``, which lands on the same disabled
+    branch as ``none``, and that ``degree1and2`` must not be quoted away into
+    something else: anything unrecognised raises rather than silently falling
+    back to a default, because guessing here would swap the exported topology
+    without a word in the log.
+    """
+    if value is None or value is False:
+        return None
+    if value is True:
+        return "degree1and2"
+    key = str(value).strip().lower()
+    if key in LOW_DEGREE_REDUCTION_LEVELS:
+        return key
+    if key in ("none", "false", "off", "no"):
+        return None
+    if key in ("true", "on", "yes"):
+        return "degree1and2"
+    if key == "degree1":
+        raise ValueError(
+            "clustering: low_degree_reduction = 'degree1' (stubs only) has been "
+            "replaced by 'lossless', which also folds in stubs but additionally "
+            "splices out degree-2 buses whose two Lines are equally rated and which "
+            "hold no Generator, StorageUnit, Store or Link."
+        )
+    raise ValueError(
+        f"clustering: low_degree_reduction = {value!r} is not a mode. Use one of "
+        f"{list(LOW_DEGREE_REDUCTION_LEVELS)}, none or false."
+    )
+
 
 def convert_to_per_unit(df):
     # Calculating base values per component
@@ -520,7 +579,24 @@ def merge_colocated_generators(n: pypsa.Network, moved: set) -> int:
     return len(touched)
 
 
-NOMINAL_POWER_COLUMNS = ("p_nom", "p_nom_min", "p_nom_max")
+#: Static attributes that scale with the asset, and so with its Kron share. The
+#: power ratings cover Generators and StorageUnits; the energy ones matter for a
+#: StorageUnit's stored charge and for a Store, whose ``e_nom`` would otherwise be
+#: handed to both clones in full.
+EXTENSIVE_STATIC_COLUMNS = (
+    "p_nom",
+    "p_nom_min",
+    "p_nom_max",
+    "e_nom",
+    "e_nom_min",
+    "e_nom_max",
+    "state_of_charge_initial",
+    "e_initial",
+    # Static set-points, the counterparts of the `p_set`/`q_set` series below.
+    # Without them a split Load is cloned whole onto both targets and doubles.
+    "p_set",
+    "q_set",
+)
 EXTENSIVE_TIME_SERIES = {"p", "q", "p_set", "q_set", "inflow"}
 
 
@@ -536,6 +612,16 @@ def split_one_port_components(
     unchanged.  Clones keep the original carrier and intensive attributes so
     the capacity-weighted aggregation in this module
     computes their correct combined value.
+
+    Each clone then pools into the same-carrier fleet at its target and
+    dispatches freely, so the two halves of a plant are not held to the Kron
+    ratio at solve time. Tracking them instead -- tagging each clone with the
+    plant it came from, keeping it out of every later pooling and locking the
+    halves to one per-unit dispatch and capacity split in the LP -- was tried and
+    dropped: on test_5k it barely moved the SSSC cost saving (8.31 B$, 2.28%,
+    tracked against 8.62 B$, 2.32%, pooled). It did lower both cases' absolute
+    cost by about 7 B$, through the renewable site resolution it kept (54k
+    against 15k generators), not through the lockstep.
     """
     moved_generators: set = set()
     for component in n.one_port_components:
@@ -558,7 +644,7 @@ def split_one_port_components(
                         suffix += 1
                     df.loc[asset_name] = original
                 df.at[asset_name, "bus"] = target
-                for column in NOMINAL_POWER_COLUMNS:
+                for column in EXTENSIVE_STATIC_COLUMNS:
                     if column in df.columns:
                         value = pd.to_numeric(pd.Series([original[column]]), errors="coerce").iloc[0]
                         if pd.notna(value):
@@ -874,14 +960,82 @@ def contract_short_branches(
     return n, busmap
 
 
-def reduce_low_degree_buses(n: pypsa.Network) -> tuple[pypsa.Network, pd.Series]:
-    """
-    Iteratively eliminate every bus of degree 1 or 2.
+#: How a degree-2 series merge rates the corridor it builds, as
+#: ``clustering: series_rating`` selects. ``capital_cost`` is summed either way,
+#: because raising the corridor once every segment binds means widening them all.
+#: ``cost_weighted`` is the default. On the 5k HIFLD case, with ``sum`` pooling,
+#: it brings the SSSC saving to 7.26 B$ against 6.67 at 27k (7.73 under ``min``).
+#:
+#: * ``min`` -- the narrowest segment. Exact for the thermal limit, but the true
+#:   expansion cost ``C(S) = sum_i c_i (S - s_i)^+`` is convex piecewise linear,
+#:   and pricing it at ``sum_i c_i`` from the narrowest segment on overcharges
+#:   every expansion by up to ``sum_i c_i (s_i - s_min)``.
+#: * ``cost_weighted`` -- ``sum_i c_i s_i / sum_i c_i``, the rating at which the
+#:   single-slope cost ``sum_i c_i (S - S_c)`` is the asymptote of ``C``: it never
+#:   overcharges, and is exact for any expansion past the widest segment. The
+#:   price is free headroom worth ``C(S_c)`` below it. Pairwise merges compose
+#:   exactly, since each merged segment carries its own summed cost. Weighted by
+#:   ``capital_cost`` rather than length because cost per km is not uniform.
+SERIES_RATINGS = ("min", "cost_weighted")
 
-    Runs to a fixed point, so the result holds no bus with fewer than three
-    incident Lines: eliminating a bus can drop a neighbour to degree 2 or 1, so
-    each pass re-examines the whole graph from scratch and the loop stops only
-    once a full pass eliminates nothing.
+
+def merged_series_rating(row1: pd.Series, row2: pd.Series, rule: str) -> float:
+    """``s_nom`` of the corridor a series merge builds from two segments."""
+    if rule not in SERIES_RATINGS:
+        raise ValueError(f"series_rating must be one of {list(SERIES_RATINGS)}, got {rule!r}.")
+    s1, s2 = float(row1["s_nom"]), float(row2["s_nom"])
+    if rule == "min":
+        return min(s1, s2)
+    c1 = float(row1.get("capital_cost", np.nan))
+    c2 = float(row2.get("capital_cost", np.nan))
+    if not (np.isfinite(c1) and np.isfinite(c2) and c1 + c2 > 0 and c1 >= 0 and c2 >= 0):
+        # No usable cost: fall back to length, then to an even split.
+        c1 = float(row1.get("length", np.nan))
+        c2 = float(row2.get("length", np.nan))
+        if not (np.isfinite(c1) and np.isfinite(c2) and c1 + c2 > 0):
+            c1 = c2 = 1.0
+    return (c1 * s1 + c2 * s2) / (c1 + c2)
+
+
+def reduce_low_degree_buses(
+    n: pypsa.Network,
+    level: str = "degree1and2",
+    series_rating: str = "cost_weighted",
+) -> tuple[pypsa.Network, pd.Series]:
+    """
+    Iteratively eliminate low-degree buses, to a fixed point.
+
+    ``level`` is the whole of the difference between the two modes
+    ``clustering: low_degree_reduction`` offers, which
+    :func:`parse_low_degree_reduction` resolves it to:
+
+    * ``"degree1and2"`` -- every bus with one or two incident Lines goes.
+    * ``"lossless"`` -- every degree-1 stub, plus every degree-2 bus that
+      can be spliced out without writing anything off. A degree-2 bus qualifies
+      when its two Lines lead to distinct neighbours, carry the same ``s_nom``
+      (and ``s_nom_min``/``s_nom_max``/``s_max_pu``/``s_nom_extendable``, within
+      :data:`LOSSLESS_RATING_RTOL`), and the bus holds no
+      :data:`LOSSLESS_BLOCKING_ONE_PORTS` asset and no Link endpoint. Then:
+
+      - the series corridor's ``min`` rating equals both segments' rating, so no
+        headroom is lost, and its summed ``capital_cost`` prices expansion
+        exactly as widening both segments would;
+      - the bus carries no dispatchable injection, so no plant is cloned
+        across two buses whose halves would then dispatch independently;
+      - demand weight and Load components are fixed injections, and their Kron
+        split between the two neighbours is exact for every flow in the rest of
+        the network.
+
+      A degree-2 bus that fails any of these survives, as does a double stub
+      (both Lines to one neighbour), so the set ``lossless`` removes is a strict
+      subset of what ``degree1and2`` removes. The ``s_nom`` heterogeneity
+      diagnostic is still reported and should read 0 -- anything else means an
+      unequal pair slipped through.
+
+    Runs to a fixed point: eliminating a bus can drop a neighbour to degree 2 or
+    1, and a stub fold or a series merge can hand a neighbour a Generator or
+    Link that disqualifies it, so each pass re-examines the whole graph from
+    scratch and the loop stops only once a full pass eliminates nothing.
 
     **Two Lines sharing a bus pair are deliberately left standing**, so the result
     *does* hold such pairs -- collapsing a triangle creates one every time. Pooling
@@ -895,12 +1049,15 @@ def reduce_low_degree_buses(n: pypsa.Network) -> tuple[pypsa.Network, pd.Series]
     2 rather than letting them fall to 1. See
     ``docs/notes/topology-reduction-and-sssc.md``.
 
-    Three cases arise for a low-degree bus:
+    Three cases arise for a low-degree bus; under ``lossless`` the series merge
+    only for a qualifying bus and the double stub not at all:
 
     * **degree 2, distinct neighbours** -- the two segments combine in series.
-      ``r``/``x``/``length``/``capital_cost`` add; ``s_nom`` (and
-      ``s_nom_min``/``max``) take the *minimum*, since a corridor's transfer
-      capability is set by its narrowest section, not the sum of its parts.
+      ``r``/``x``/``length``/``capital_cost`` add. ``s_nom`` follows
+      ``series_rating`` (:data:`SERIES_RATINGS`): the cost-weighted mean of the
+      segments by default, which prices expansion exactly once every segment
+      binds, or the *minimum*, the narrowest section's thermal limit.
+      ``s_nom_min``/``s_nom_max`` take the minimum either way.
       ``capital_cost`` is a per-MW figure proportional to length, so raising the
       merged corridor's rating by 1 MW means widening *both* segments and costs
       the sum. Leaving it at one segment's value would survive the final
@@ -936,7 +1093,9 @@ def reduce_low_degree_buses(n: pypsa.Network) -> tuple[pypsa.Network, pd.Series]
     * One-port components split between the two neighbours by the same Kron
       factor.  Their nominal capacity is split, while efficiency, costs and
       per-unit availability remain intensive values and are capacity-weighted
-      when same-carrier generators arrive at one bus.
+      when same-carrier generators arrive at one bus. The halves then dispatch
+      independently; :func:`split_one_port_components` says why they are not
+      held to the Kron ratio.
     * Links relocate wholesale to whichever neighbour received the larger Kron
       share (the single neighbour, for a degree-1 bus) -- unlike one-port
       assets, a Link is one converter pair with one rating and is never split
@@ -970,13 +1129,44 @@ def reduce_low_degree_buses(n: pypsa.Network) -> tuple[pypsa.Network, pd.Series]
     has to be pushed through this map, so it is composed across passes rather
     than discarded.
     """
+    if level not in LOW_DEGREE_REDUCTION_LEVELS:
+        raise ValueError(
+            f"level must be one of {list(LOW_DEGREE_REDUCTION_LEVELS)}, got {level!r}."
+        )
+
     busmap = pd.Series(n.buses.index, index=n.buses.index, name="busmap")
     if n.lines.empty:
         return n, busmap
 
+    if series_rating not in SERIES_RATINGS:
+        raise ValueError(f"series_rating must be one of {list(SERIES_RATINGS)}, got {series_rating!r}.")
+    lossless_only = level == "lossless"
     split_cols = [c for c in EXTENSIVE_BUS_ATTRS if c in n.buses.columns]
     min_cols = [c for c in ("s_nom", "s_nom_min", "s_nom_max") if c in n.lines.columns]
     sum_cols = [c for c in ("length", "capital_cost") if c in n.lines.columns]
+    # What has to match across the two segments for a lossless series merge.
+    rating_cols = min_cols + [c for c in ("s_max_pu",) if c in n.lines.columns]
+    flag_cols = [c for c in ("s_nom_extendable",) if c in n.lines.columns]
+
+    def equally_rated(row1, row2) -> bool:
+        for col in rating_cols:
+            v1, v2 = float(row1[col]), float(row2[col])
+            if not (v1 == v2 or np.isclose(v1, v2, rtol=LOSSLESS_RATING_RTOL, atol=0.0)):
+                return False
+        return all(bool(row1[col]) == bool(row2[col]) for col in flag_cols)
+
+    def occupied_buses() -> set:
+        """Buses holding a Link endpoint or an asset a series merge would clone."""
+        occupied: set = set()
+        for component in LOSSLESS_BLOCKING_ONE_PORTS:
+            df = n.df(component)
+            if not df.empty and "bus" in df.columns:
+                occupied.update(df.bus)
+        if not n.links.empty:
+            for col in n.links.columns:
+                if col.startswith("bus"):
+                    occupied.update(b for b in n.links[col] if isinstance(b, str) and b)
+        return occupied
 
     series_merged = stubs_removed = loops_removed = 0
     link_endpoints_relocated = 0
@@ -991,6 +1181,8 @@ def reduce_low_degree_buses(n: pypsa.Network) -> tuple[pypsa.Network, pd.Series]
     # `collapsed_strings` once it can grow no further.
     segment_ratings: dict[str, list[float]] = {}
     collapsed_strings: list[list[float]] = []
+    # Only a series merge pools ratings. Under `lossless` every one it makes pools
+    # equal ratings, so the metric is kept there too as a check that reads 0.
     track_series = "s_nom" in min_cols
 
     def close_string(name: str) -> None:
@@ -1011,6 +1203,7 @@ def reduce_low_degree_buses(n: pypsa.Network) -> tuple[pypsa.Network, pd.Series]
     else:
         bus_zone = zones.to_dict()
     blocked_by_zone = 0
+    kept_degree2: dict = {}
 
     while True:
         lines = n.lines
@@ -1032,6 +1225,10 @@ def reduce_low_degree_buses(n: pypsa.Network) -> tuple[pypsa.Network, pd.Series]
         new_lines: list = []
         assignments: dict = {}
         reassigned = {col: {} for col in split_cols}
+        # Recomputed every pass: the previous pass may have handed a neighbour a
+        # plant or a Link, or relocated one away.
+        occupied = occupied_buses() if lossless_only else set()
+        kept_degree2 = {"double_stub": 0, "unequal_rating": 0, "occupied": 0}
 
         def hand_over(bus, targets):
             """Give ``bus``'s extensive attributes to ``targets``: (bus, share) pairs."""
@@ -1048,6 +1245,19 @@ def reduce_low_degree_buses(n: pypsa.Network) -> tuple[pypsa.Network, pd.Series]
             neighbours = {b for _, b in edges}
             if consumed & neighbours:
                 continue  # a neighbour is going away this pass; retry next pass
+
+            # `lossless` only splices out a degree-2 bus when doing so writes
+            # nothing off. See the docstring.
+            if lossless_only and len(edges) == 2:
+                if len(neighbours) == 1:
+                    kept_degree2["double_stub"] += 1
+                    continue
+                if not equally_rated(lines.loc[edges[0][0]], lines.loc[edges[1][0]]):
+                    kept_degree2["unequal_rating"] += 1
+                    continue
+                if bus in occupied:
+                    kept_degree2["occupied"] += 1
+                    continue
 
             # The bus's contents are about to be handed to every neighbour, so
             # every neighbour has to sit in the bus's own zone. See the docstring.
@@ -1092,6 +1302,14 @@ def reduce_low_degree_buses(n: pypsa.Network) -> tuple[pypsa.Network, pd.Series]
                 merged[col] = row1[col] + row2[col]
             for col in min_cols:
                 merged[col] = min(row1[col], row2[col])
+            if series_rating != "min" and "s_nom" in merged.index:
+                # See SERIES_RATINGS. Only s_nom moves; s_nom_min and s_nom_max
+                # keep the narrowest segment's, lifted to s_nom where needed.
+                merged["s_nom"] = merged_series_rating(row1, row2, series_rating)
+                if "s_nom_max" in merged.index:
+                    merged["s_nom_max"] = max(merged["s_nom_max"], merged["s_nom"])
+                if "s_nom_min" in merged.index:
+                    merged["s_nom_min"] = min(merged["s_nom_min"], merged["s_nom"])
 
             # Kron split: the neighbour behind x1 takes x2 / (x1 + x2). Equal
             # halves are the only sane fallback for a degenerate zero-reactance
@@ -1182,8 +1400,10 @@ def reduce_low_degree_buses(n: pypsa.Network) -> tuple[pypsa.Network, pd.Series]
     )
     parallel_left = int((duplicated.value_counts() - 1).clip(lower=0).sum())
     logger.info(
-        "Reduced low-degree buses: %s series merges, %s stubs folded in, %s self-loops "
-        "dropped, %s Link endpoints relocated. %s Lines left sharing a bus pair.",
+        "Reduced low-degree buses (%s): %s series merges, %s stubs folded in, %s "
+        "self-loops dropped, %s Link endpoints relocated. %s Lines left sharing a "
+        "bus pair.",
+        level,
         series_merged,
         stubs_removed,
         loops_removed,
@@ -1194,17 +1414,30 @@ def reduce_low_degree_buses(n: pypsa.Network) -> tuple[pypsa.Network, pd.Series]
     for name in list(segment_ratings):
         close_string(name)
 
-    series = merge_heterogeneity(collapsed_strings)
-    logger.info(
-        "Series s_nom heterogeneity = %.4f -- sum(std(s_nom) * segments) / sum(s_nom) "
-        "over %s collapsed strings spanning %s segments. 0 means every string pooled "
-        "equally rated segments and lost no headroom to its narrowest one. "
-        "Per-string contribution: %s.",
-        series.ratio,
-        series.groups,
-        series.members,
-        summarize_distribution(series.coefficients_of_variation, "%.4f"),
-    )
+    if lossless_only:
+        # Counted on the fixed-point pass, which consumed nothing, so these are
+        # exactly the degree-2 buses the result still holds (zone-blocked ones
+        # are in the guard's own count below).
+        logger.info(
+            "Lossless level left degree-2 buses standing: %s with unequally rated "
+            "Lines, %s holding a Generator/StorageUnit/Store or Link endpoint, %s "
+            "double stubs.",
+            kept_degree2.get("unequal_rating", 0),
+            kept_degree2.get("occupied", 0),
+            kept_degree2.get("double_stub", 0),
+        )
+    if track_series and (series_merged or not lossless_only):
+        series = merge_heterogeneity(collapsed_strings)
+        logger.info(
+            "Series s_nom heterogeneity = %.4f -- sum(std(s_nom) * segments) / "
+            "sum(s_nom) over %s collapsed strings spanning %s segments. 0 means every "
+            "string pooled equally rated segments and lost no headroom to its "
+            "narrowest one. Per-string contribution: %s.",
+            series.ratio,
+            series.groups,
+            series.members,
+            summarize_distribution(series.coefficients_of_variation, "%.4f"),
+        )
     if zones is not None:
         surviving_zones = bus_zone_labels(n)
         logger.info(
@@ -1285,9 +1518,111 @@ def apply_wind_solar_cf_aggregation_weights(
     # the split of `split_retired_generators` on the right side of the horizon.
     for attribute in ("build_year", "lifetime"):
         generator_strategies.setdefault(attribute, "capacity_weighted_average")
+
     return generator_strategies
 
 
+
+
+#: How target-count clustering rates the Line it pools out of the circuits two
+#: clusters share, as ``clustering: target_count: line_rating`` selects. ``sum``
+#: is the default; on the 5k HIFLD case the bottleneck overstated the SSSC saving
+#: by 29% against 27k (8.62 vs 6.67 B$), ``sum`` by 16%.
+#:
+#: * ``parallel_bottleneck`` -- pypsa's default, ``sum_i b_i * min_i(s_i / b_i)``:
+#:   the circuits split flow by susceptance and the first to saturate caps the
+#:   bundle. Exact for circuits joining the same two buses, which is what
+#:   ``aggregate_to_substations`` pools and why that stage keeps it.
+#: * ``sum`` -- ``sum_i s_i``. Circuits between two *clusters* end on different
+#:   buses inside them, so the unreduced LP steers their split through where it
+#:   injects; the pooled Line cannot, and the bottleneck rating fixes that split
+#:   at its worst case. With free injection over the two clusters' own subgraph
+#:   the bundle reaches the sum in 77% of congested bundles (median 1.00) --
+#:   internal Lines almost never bind -- so the sum is the capability the
+#:   topology itself supports. Applied to ``s_nom``, ``s_nom_min`` and
+#:   ``s_nom_max`` alike.
+#:
+#: A number ``z`` in ``(0, 1)`` rates the bundle at
+#: ``bottleneck + z * (sum - bottleneck)``, see :func:`blend_pooled_line_ratings`.
+#:
+#: ``unpooled`` does not pool at all: each circuit joining two clusters stays its
+#: own Line, so an SSSC can be sited on, and rebalance, every one of them.
+TARGET_COUNT_LINE_RATINGS = ("parallel_bottleneck", "sum", "unpooled")
+
+#: Temporary Line column that makes every circuit its own aggregation group.
+UNPOOLED_LINE_KEY = "_unpooled_line"
+
+#: The rating columns a ``line_rating`` choice applies to.
+POOLED_LINE_RATING_COLUMNS = ("s_nom", "s_nom_min", "s_nom_max")
+
+
+def parse_line_rating(value) -> str | float:
+    """``clustering: target_count: line_rating`` as a strategy name or a blend weight.
+
+    ``0`` and ``1`` collapse to the two named ratings they coincide with, so a
+    fractional weight is always strictly inside ``(0, 1)``.
+    """
+    if isinstance(value, str) and value in TARGET_COUNT_LINE_RATINGS:
+        return value
+    try:
+        weight = float(value)
+    except (TypeError, ValueError):
+        weight = None
+    if weight is None or not 0.0 <= weight <= 1.0:
+        raise ValueError(
+            f"clustering: target_count: line_rating must be one of "
+            f"{list(TARGET_COUNT_LINE_RATINGS)} or a number in [0, 1], got {value!r}."
+        )
+    if weight == 0.0:
+        return "parallel_bottleneck"
+    if weight == 1.0:
+        return "sum"
+    return weight
+
+
+def target_count_aggregation_strategies(aggregation_strategies, line_rating) -> dict:
+    """The aggregation strategies target-count clustering runs with.
+
+    Only the Line rating columns differ from what the substation stage uses, and
+    only under ``line_rating="sum"``. A fractional ``line_rating`` clusters with
+    the bottleneck and is blended afterwards by :func:`blend_pooled_line_ratings`.
+    See :data:`TARGET_COUNT_LINE_RATINGS`.
+    """
+    line_rating = parse_line_rating(line_rating)
+    strategies = {key: dict(value) for key, value in dict(aggregation_strategies).items()}
+    if line_rating == "sum":
+        lines = strategies.setdefault("lines", {})
+        for column in POOLED_LINE_RATING_COLUMNS:
+            lines[column] = "sum"
+    return strategies
+
+
+def blend_pooled_line_ratings(
+    clustered: pypsa.Network,
+    original_lines: pd.DataFrame,
+    linemap: pd.Series,
+    weight: float,
+) -> None:
+    """Move each pooled Line's rating ``weight`` of the way from bottleneck to sum.
+
+    ``clustered`` must have been aggregated with ``parallel_bottleneck``, which
+    never exceeds the plain sum, so the result lies between the two. An infinite
+    sum (an unbounded ``s_nom_max``) stays infinite. Lines pooled from a single
+    circuit are untouched: their bottleneck already is their sum.
+    """
+    lines = clustered.lines
+    for column in POOLED_LINE_RATING_COLUMNS:
+        if column not in lines.columns or column not in original_lines.columns:
+            continue
+        pooled = (
+            pd.to_numeric(original_lines[column], errors="coerce")
+            .groupby(linemap.reindex(original_lines.index))
+            .apply(pd.Series.sum)
+            .reindex(lines.index)
+        )
+        bottleneck = pd.to_numeric(lines[column], errors="coerce")
+        blended = bottleneck + weight * (pooled - bottleneck)
+        lines[column] = blended.where(np.isfinite(pooled), pooled).fillna(bottleneck)
 
 
 def clustering_from_busmap(
@@ -1296,6 +1631,7 @@ def clustering_from_busmap(
     line_length_factor: float,
     aggregate_carriers=None,
     aggregation_strategies=dict(),
+    pool_parallel_lines: bool = True,
 ):
     """Aggregate a network with the repository-standard component strategies.
 
@@ -1305,8 +1641,17 @@ def clustering_from_busmap(
     different from the one the lengths were built with. Lines ignore it: their length is
     an ``s_nom``-weighted mean over the circuits they replace, and their ``x``/``r``/
     ``capital_cost`` are combined without any length rescaling.
+
+    With ``pool_parallel_lines=False`` every circuit joining two clusters stays
+    its own Line, with its own reactance, rating and cost; only the circuits
+    inside one cluster disappear. Each circuit is its own group, so the rating
+    strategy has nothing to pool.
     """
     line_strategies = aggregation_strategies.get("lines", dict())
+    line_groupers = []
+    if not pool_parallel_lines:
+        n.lines[UNPOOLED_LINE_KEY] = n.lines.index.astype(str)
+        line_groupers = [UNPOOLED_LINE_KEY]
     generator_strategies = apply_wind_solar_cf_aggregation_weights(
         n,
         aggregation_strategies.get("generators", dict()),
@@ -1332,8 +1677,14 @@ def clustering_from_busmap(
             bus_strategies=bus_strategies,
             one_port_strategies=one_port_strategies,
             scale_link_capital_costs=False,
+            custom_line_groupers=line_groupers,
         )
     restore_retired_carriers(clustering.network, horizon)
+    if not pool_parallel_lines:
+        n.lines = n.lines.drop(columns=UNPOOLED_LINE_KEY)
+        clustering.network.lines = clustering.network.lines.drop(
+            columns=UNPOOLED_LINE_KEY, errors="ignore",
+        )
     return clustering
 
 
@@ -1992,7 +2343,9 @@ if __name__ == "__main__":
     configure_logging(snakemake)
     params = snakemake.params
     topological_boundaries = snakemake.params.topological_boundaries
-    low_degree_reduction = bool(getattr(params, "low_degree_reduction", True))
+    low_degree_level = parse_low_degree_reduction(
+        getattr(params, "low_degree_reduction", "degree1and2")
+    )
 
     # Components are attached before topology reduction.  `read_network` keeps
     # the pickle hand-off's custom columns and generator time series intact.
@@ -2057,16 +2410,25 @@ if __name__ == "__main__":
     # target-count pass had just drawn (see the note at the end of this block).
     n, contraction_busmap = contract_short_branches(n)
 
-    if low_degree_reduction:
-        n, reduction_busmap = reduce_low_degree_buses(n)
-    else:
+    if low_degree_level is None:
         logger.info("Low-degree reduction disabled; leaving degree-1/2 buses in place.")
         reduction_busmap = identity_busmap(n)
+        low_degree_caption = "Low-degree reduction disabled"
+    else:
+        series_rating = str(getattr(params, "series_rating", "cost_weighted"))
+        logger.info("Degree-2 series merges rate corridors by %s.", series_rating)
+        n, reduction_busmap = reduce_low_degree_buses(
+            n, level=low_degree_level, series_rating=series_rating,
+        )
+        low_degree_caption = (
+            "After low-degree reduction "
+            f"({low_degree_level})"
+        )
     plot_network_topology(
         n,
         snakemake.output.network_map_after_low_degree,
         snakemake.wildcards,
-        "After low-degree reduction" if low_degree_reduction else "Low-degree reduction disabled",
+        low_degree_caption,
         snakemake.input.state_boundaries,
         topology_central_longitude,
         topology_line_width_reference,
@@ -2087,13 +2449,20 @@ if __name__ == "__main__":
             topological_boundary=topological_boundaries,
         )
         all_carriers = set(n.generators.carrier).union(set(n.storage_units.carrier))
+        line_rating = parse_line_rating(target.get("line_rating", "sum"))
+        logger.info("Target-count clustering rates pooled Lines by %s.", line_rating)
         clustering = clustering_from_busmap(
             n,
             busmap,
             aggregate_carriers=all_carriers,
             line_length_factor=params.length_factor,
-            aggregation_strategies=params.aggregation_strategies,
+            aggregation_strategies=target_count_aggregation_strategies(
+                params.aggregation_strategies, line_rating,
+            ),
+            pool_parallel_lines=line_rating != "unpooled",
         )
+        if isinstance(line_rating, float):
+            blend_pooled_line_ratings(clustering.network, n.lines, clustering.linemap, line_rating)
         n = clustering.network
         target_busmap = clustering.busmap
     else:
