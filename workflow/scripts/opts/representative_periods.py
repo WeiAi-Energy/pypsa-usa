@@ -480,3 +480,176 @@ def add_representative_period_storage_constraints(n, config, snapshots):
         su_constraints,
         store_constraints,
     )
+
+
+PERIOD_SPLIT_PREFIX = "period_split_"
+PERIOD_BLOCK_DIM = "period_block"
+
+
+def _snapshot_block_ids(n, config, snapshots):
+    """
+    Representative period of each snapshot, numbered across investment periods.
+
+    The blocks are the ones the storage cyclic constraints close over, read from the
+    per-block ``steps`` in the network metadata, so two periods that happen to share a
+    weighting are still told apart. Snapshots no block covers get ``-1``. Returns
+    ``None`` when representative periods are not active.
+    """
+    rep_cfg = representative_periods_config(config)
+    if not rep_cfg.get("enable", False):
+        return None
+    snapshot_index = _to_multiindex_snapshots(snapshots)
+    if snapshot_index is None or snapshot_index.nlevels < 2:
+        return None
+
+    blocks = _get_representative_blocks(
+        snapshot_index,
+        _get_period_hours(rep_cfg),
+        metadata=_get_representative_period_metadata(n),
+    )
+    ids = np.full(len(snapshot_index), -1, dtype=np.int64)
+    block_id = 0
+    for entries in blocks.values():
+        for entry in entries:
+            ids[snapshot_index.get_indexer(entry["snapshots"])] = block_id
+            block_id += 1
+    return pd.Series(ids, index=snapshot_index)
+
+
+def _block_terms(constraint, block_of, slot):
+    """
+    Locate, in one snapshot-indexed constraint, the terms on a splittable variable.
+
+    Returns the constraint's variable labels together with, per term, the
+    representative period of its row (``b``), the slot of its variable among the
+    splittable ones (``s``) and whether the term is on a splittable variable, with a
+    nonzero coefficient, in an active row of a covered snapshot (``hit``). Zero
+    coefficients (``p_min_pu = 0`` rows, say) never reach the solver, so they
+    neither call for a copy nor get moved.
+    """
+    variables = constraint.vars
+    labels = variables.values
+    term_axis = variables.dims.index(constraint.term_dim)
+    snapshot_axis = variables.dims.index("snapshot")
+
+    row_block = block_of.reindex(constraint.indexes["snapshot"]).fillna(-1).to_numpy(dtype=np.int64)
+    shape = [1] * labels.ndim
+    shape[snapshot_axis] = row_block.size
+    b = np.broadcast_to(row_block.reshape(shape), labels.shape)
+
+    row_dims = [d for d in variables.dims if d != constraint.term_dim]
+    active = np.expand_dims(constraint.labels.transpose(*row_dims).values >= 0, term_axis)
+
+    s = np.where(labels >= 0, slot[np.maximum(labels, 0)], -1)
+    coeffs = constraint.coeffs.transpose(*variables.dims).values
+    hit = (s >= 0) & (b >= 0) & active & (coeffs != 0)
+    return labels, b, s, hit
+
+
+def split_capacity_by_representative_period(n, config, snapshots):
+    """
+    Give every representative period its own copy of each snapshot-independent variable.
+
+    Capacity variables (``p_nom``, ``s_nom``, ``sssc_nom``, ...) appear in the
+    per-snapshot rows of every representative period. In the barrier's normal
+    equations each such column is a clique across all periods, and the Cholesky
+    separator has to hold those rows; the fill grows superlinearly with the number of
+    snapshots. The periods are otherwise independent (storage closes cyclically
+    inside each one), so the capacity columns are the only thing tying them together.
+
+    For each variable without a ``snapshot`` dimension that the rows of two or more
+    periods reference, this adds a copy per period, points that period's rows at the
+    copy, and ties each copy to the original with ``copy - original == 0``. The LP
+    is equivalent and every original variable, constraint name and dual is kept.
+    Rows without a ``snapshot`` dimension (global constraints, the proximal term,
+    bounds) keep the original.
+
+    Must run after every other constraint is in place. Gurobi's aggregator
+    (``Aggregate``) would substitute the copies straight back, so it has to be 0.
+
+    Returns the number of copies added.
+    """
+    block_of = _snapshot_block_ids(n, config, snapshots)
+    if block_of is None:
+        return 0
+    n_blocks = int(block_of.max()) + 1
+    if n_blocks < 2:
+        return 0
+
+    m = n.model
+    candidates = [name for name in m.variables if "snapshot" not in m.variables[name].dims]
+    if not candidates:
+        return 0
+
+    slot = np.full(m._xCounter, -1, dtype=np.int64)
+    candidate_labels = []
+    for name in candidates:
+        labels = m.variables[name].labels.values.ravel()
+        candidate_labels.append(labels[labels >= 0])
+    candidate_labels = np.concatenate(candidate_labels)
+    slot[candidate_labels] = np.arange(candidate_labels.size)
+
+    snapshot_constraints = [name for name in m.constraints if "snapshot" in m.constraints[name].dims]
+    referenced = np.zeros((n_blocks, candidate_labels.size), dtype=bool)
+    for name in snapshot_constraints:
+        _, b, s, hit = _block_terms(m.constraints[name], block_of, slot)
+        referenced[b[hit], s[hit]] = True
+    # A variable only one period uses is already local to it.
+    shared = referenced.sum(axis=0) >= 2
+    if not shared.any():
+        return 0
+
+    block_index = pd.RangeIndex(n_blocks, name=PERIOD_BLOCK_DIM)
+    copy_label = np.full((n_blocks, candidate_labels.size), -1, dtype=np.int64)
+    split = []
+    for name in candidates:
+        var = m.variables[name]
+        labels = var.labels.values
+        valid = labels >= 0
+        slots = slot[labels[valid]]
+        mask = np.zeros((n_blocks,) + labels.shape, dtype=bool)
+        mask[:, valid] = referenced[:, slots] & shared[slots]
+        if not mask.any():
+            continue
+
+        mask = DataArray(
+            mask,
+            coords=[block_index] + [var.indexes[d] for d in var.dims],
+            dims=[PERIOD_BLOCK_DIM, *var.dims],
+        )
+        copy = m.add_variables(
+            var.lower.expand_dims({PERIOD_BLOCK_DIM: block_index}),
+            var.upper.expand_dims({PERIOD_BLOCK_DIM: block_index}),
+            name=f"{PERIOD_SPLIT_PREFIX}{name}",
+            mask=mask,
+        )
+        copy_label[:, slots] = copy.labels.transpose(PERIOD_BLOCK_DIM, *var.dims).values[:, valid]
+        split.append((name, copy, mask))
+
+    moved = 0
+    for name in snapshot_constraints:
+        constraint = m.constraints[name]
+        labels, b, s, hit = _block_terms(constraint, block_of, slot)
+        replacement = np.where(hit, copy_label[np.maximum(b, 0), np.maximum(s, 0)], -1)
+        replace = hit & (replacement >= 0)
+        if not replace.any():
+            continue
+        new_labels = labels.copy()
+        new_labels[replace] = replacement[replace]
+        constraint.vars = constraint.vars.copy(data=new_labels)
+        moved += int(replace.sum())
+
+    n_copies = 0
+    for name, copy, mask in split:
+        m.add_constraints(copy - m.variables[name] == 0, name=f"{PERIOD_SPLIT_PREFIX}{name}-link", mask=mask)
+        n_copies += int(mask.sum())
+
+    logger.info(
+        "Split %s snapshot-independent variable(s) across %s representative periods: "
+        "%s per-period copies, %s constraint terms moved onto them.",
+        len(split),
+        n_blocks,
+        n_copies,
+        moved,
+    )
+    return n_copies

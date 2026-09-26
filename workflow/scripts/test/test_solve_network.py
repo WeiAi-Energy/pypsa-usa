@@ -691,3 +691,46 @@ def test_run_standard_optimize_passes_the_proximal_switch_through(monkeypatch):
         cf_solving={"scheme": "slp", "proximal": True},
     )
     assert "proximal_weight" not in captured
+
+
+@pytest.mark.parametrize(
+    ("options", "expected"),
+    [({}, True), ({"split_capacity_by_representative_period": True}, True),
+     ({"split_capacity_by_representative_period": False}, False)],
+)
+def test_extra_functionality_splits_capacity_last_unless_switched_off(monkeypatch, options, expected):
+    calls = []
+    for name in (
+        "add_bidirectional_link_constraints",
+        "add_representative_period_storage_constraints",
+        "add_electrolysis_electricity_target_constraint",
+        "add_line_x_sssc_total_max_constraint",
+        "add_line_x_sssc_line_capacity_constraint",
+        "tighten_line_x_sssc_bound",
+        "split_capacity_by_representative_period",
+    ):
+        monkeypatch.setattr(solve_network_module, name, lambda *a, name=name, **k: calls.append(name))
+
+    n = SimpleNamespace(opts=[], config={"solving": {"options": options}})
+    solve_network_module.extra_functionality(n, pd.Index([]))
+
+    assert ("split_capacity_by_representative_period" in calls) is expected
+    if expected:
+        assert calls[-1] == "split_capacity_by_representative_period"
+
+
+@pytest.mark.parametrize(
+    ("solver_name", "solver_options", "options", "warns"),
+    [
+        ("gurobi", {"Aggregate": 0}, {}, False),
+        ("gurobi", {"aggregate": 1}, {}, True),
+        ("gurobi", {}, {}, True),
+        ("gurobi", {}, {"split_capacity_by_representative_period": False}, False),
+        ("highs", {}, {}, False),
+    ],
+)
+def test_warns_when_gurobi_aggregator_would_undo_the_capacity_split(caplog, solver_name, solver_options, options, warns):
+    with caplog.at_level(logging.WARNING, logger=solve_network_module.logger.name):
+        solve_network_module._warn_if_aggregator_undoes_capacity_split(options, solver_name, solver_options)
+
+    assert ("Aggregate" in caplog.text) is warns

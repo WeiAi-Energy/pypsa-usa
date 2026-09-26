@@ -50,6 +50,7 @@ from opts.policy import (
 )
 from opts.representative_periods import (
     add_representative_period_storage_constraints,
+    split_capacity_by_representative_period,
 )
 from opts.reserves import (
     add_ERM_constraints,
@@ -68,6 +69,9 @@ FLEXIBLE_ELECTROLYSIS_LINK_SUFFIX = " flexible electrolysis"
 FLEXIBLE_ELECTROLYSIS_BUS_SUFFIX = " flexible electrolysis H2"
 
 DEFAULT_ANNUAL_ELECTRICITY_TWH = 1612.0
+
+# solving.options switch for split_capacity_by_representative_period; on by default.
+SPLIT_CAPACITY_OPTION = "split_capacity_by_representative_period"
 
 
 def prepare_network(n, solve_opts=None):
@@ -653,6 +657,28 @@ def extra_functionality(n, snapshots):
     add_line_x_sssc_total_max_constraint(n, snapshots, config)
     add_line_x_sssc_line_capacity_constraint(n, snapshots, config)
     tighten_line_x_sssc_bound(n, snapshots, config)
+    # Last, so that it sees every per-snapshot row the steps above added.
+    if _capacity_split_enabled(config.get("solving", {}).get("options", {})):
+        split_capacity_by_representative_period(n, config, snapshots)
+
+
+def _capacity_split_enabled(cf_solving):
+    return bool(cf_solving.get(SPLIT_CAPACITY_OPTION, True))
+
+
+def _warn_if_aggregator_undoes_capacity_split(cf_solving, solver_name, solver_options):
+    """Gurobi's aggregator substitutes the per-period capacity copies straight back."""
+    if solver_name != "gurobi" or not _capacity_split_enabled(cf_solving):
+        return
+    aggregate = next((value for key, value in solver_options.items() if key.lower() == "aggregate"), 1)
+    if aggregate != 0:
+        logger.warning(
+            "%s is on but Gurobi's Aggregate is %s; presolve will substitute the "
+            "per-period capacity copies back and the barrier fill will not shrink. "
+            "Set Aggregate: 0.",
+            SPLIT_CAPACITY_OPTION,
+            aggregate,
+        )
 
 
 def _iterative_optimize_kwargs(cf_solving):
@@ -803,6 +829,7 @@ def solve_network(n, config, solving, opts="", **kwargs):
 
     kwargs["solver_options"] = solving["solver_options"][set_of_options] if set_of_options else {}
     kwargs["solver_name"] = solving["solver"]["name"]
+    _warn_if_aggregator_undoes_capacity_split(cf_solving, kwargs["solver_name"], kwargs["solver_options"])
     kwargs["extra_functionality"] = extra_functionality
     kwargs["transmission_losses"] = cf_solving.get("transmission_losses", False)
     kwargs["linearized_unit_commitment"] = cf_solving.get(
