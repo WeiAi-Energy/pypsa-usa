@@ -231,15 +231,12 @@ def representative_periods_reeds_files(wildcards):
     Raw ReEDS supply curves and CF tables feeding the national clustering features.
 
     Selection runs before ``build_renewable_profiles``, so it reads the ReEDS data
-    directly. ``offwind`` and ``offwind_floating`` share one ReEDS technology, so
-    the set is deduplicated.
+    directly. Only onshore wind and solar feed the features (mirrors
+    ``REEDS_FEATURE_GROUPS`` in select_representative_periods.py); offshore wind is
+    excluded from the clustering, so its files are not inputs of this rule.
     """
     carriers = config_for_wildcards(wildcards)["electricity"]["renewable_carriers"]
-    techs = {
-        "offwind" if tech.startswith("offwind") else tech
-        for tech in carriers
-        if tech not in ("hydro", "EGS")
-    }
+    techs = {tech for tech in carriers if tech in ("onwind", "solar")}
     return [
         DATA + f"ReEDS_VRE/{tech}/{file}"
         for tech in sorted(techs)

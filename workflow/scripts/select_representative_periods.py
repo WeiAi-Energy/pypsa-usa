@@ -32,26 +32,39 @@ column of each row block, so the only change is the collapse at the end
 (``block @ W`` instead of ``block.dot(weights)``), and the national aggregate falls out
 as the row sum of the same pass.
 
-tsam min-max normalizes every column, which would give Rhode Island's wind profile the
-same pull as Texas'. Columns are therefore weighted by maximum capacity potential --
-supply-curve nameplate for wind and solar, mean AC demand for load. Note the **square
-root**: ``weightDict`` scales a column linearly but ``clusterMethod="hierarchical"`` is
-ward, which minimises *squared* Euclidean distance, so a column's pull on the clustering
-goes as ``weight**2``. Weights are ``sqrt(share)``, which makes the pull proportional to
-share and makes each feature family's weights satisfy ``sum(w**2) == 1`` -- so wind,
-solar and load contribute equally in total, exactly as the three unweighted national
-columns used to.
+Every column is compared on a per-unit-of-its-maximum scale (``x / max``). tsam always
+min-max normalizes each column internally, and ward only sees differences, so scaling a
+column's ``weightDict`` entry by ``(max - min) / max`` turns tsam's min-max scale into
+``x / max`` (see ``max_normalized_weights``). For a capacity factor, whose minimum is
+~0, this changes nothing; for load, whose minimum is roughly half its peak, it halves
+the range, so a load swing is no longer counted as if it spanned 0 to peak. With the
+build the model ends up with (onshore wind and solar nameplate each about national peak
+load), one GW of deviation then weighs about the same in all three families, where
+min-max normalization weighted a GW of load 3-4x a GW of wind or solar.
 
-``onwind`` and ``offwind`` stay merged into one capacity-weighted ``wind`` feature per
-state. Offshore is 42% of national supply-curve nameplate and dominates the wind column
-of 16 coastal states, so roughly half the wind weight rides on offshore shapes; that is
-deliberate, but it is also why the wind feature is the one to revisit first if the
-selected periods look wrong.
+On top of that scale, columns are weighted by maximum capacity potential -- supply-curve
+nameplate for wind and solar, mean AC demand for load -- so Rhode Island's wind profile
+does not pull as hard as Texas'. Note the **square root**: ``weightDict`` scales a column
+linearly but ``clusterMethod="hierarchical"`` is ward, which minimises *squared*
+Euclidean distance, so a column's pull on the clustering goes as ``weight**2``. Weights
+are ``sqrt(share)``, which makes the pull proportional to share and makes each feature
+family's weights satisfy ``sum(w**2) == 1`` before the max-normalization factor. The
+same shares weight the states when the period weights are refitted (see below).
 
-Two pieces of the older in-network implementation are intentionally gone: the
-"force one spring + one fall representative period" seasonal constraint, and the
-post-hoc rescaling of non-extreme snapshots to match true annual energy totals.
-Representative periods are used exactly as tsam selects them.
+The ``wind`` feature is onshore wind only; ``offwind`` / ``offwind_floating`` are left
+out of the clustering even when they are configured carriers. Offshore is 42% of
+national supply-curve nameplate and, when it was merged in, dominated the wind column of
+16 coastal states, so roughly half the wind weight rode on offshore shapes while the
+model builds almost nothing offshore. The selected periods then under-represented the
+onshore resource the capacity expansion actually responds to. Offshore profiles are
+still built downstream for whichever periods are selected; they just do not steer the
+selection, and the wind-lull extreme is ranked on onshore wind.
+
+The older in-network "force one spring + one fall representative period" seasonal
+constraint is intentionally gone. Representative periods are the real historical
+periods tsam selects, and their values are never rescaled -- every weather hour stays
+physically consistent with its temperature (``build_region_temperature`` reads the same
+hours). Only the period *weights* are adjusted afterwards, see "Period weights".
 
 Extreme periods and weighting
 -----------------------------
@@ -59,7 +72,7 @@ Extreme periods and weighting
 are requested -- one single-resource stress case per clustering feature:
 
 * **demand max**: the period with the highest mean *national* AC demand;
-* **wind min**: the period with the lowest mean *national* wind capacity factor;
+* **wind min**: the period with the lowest mean *national* onshore wind capacity factor;
 * **solar min**: the period with the lowest mean *national* solar capacity factor.
 
 Each is ranked on one raw national aggregate, so the three are the three physical
@@ -80,13 +93,28 @@ picks exactly the period its raw counterpart would. A feature that is missing --
 carrier configured, say -- or degenerate (flat over the whole timeline, so it carries no
 ranking signal at all) is dropped with a warning rather than failing the run.
 
-tsam picks the period with the highest (or lowest) period mean per ranking feature, adds it as
-an *additional cluster center*, and re-checks every other period against it -- a
-period closer to the extreme than to its own medoid joins the extreme's cluster.
-Weights therefore fall out of the cluster membership counts for representative
-and extreme periods alike: an extreme week represents all the weeks that look
-like it, not only its own hours. Snapshot weightings are finally rescaled so
-``objective`` sums to 8760 h per planning horizon.
+tsam picks the period with the highest (or lowest) period mean per ranking feature and
+adds it with ``extremePeriodMethod="append"``: the extreme's only member is its own source
+period, so it constrains the stress case without absorbing the periods around it. (tsam's
+``new_cluster_center`` would hand it every period closer to it than to its own medoid; on
+onshore wind that let the wind lull absorb 15-40 days of a 365-day year and dragged the
+annual mean CF down by several percent.)
+
+Period weights
+--------------
+Weights start as the cluster membership counts, rescaled so ``objective`` sums to
+8760 h per planning horizon. Two adjustments follow (``finalize_period_weights``):
+
+* **Extreme floor.** One source period out of 15 weather years is worth well under an
+  hour per snapshot, so every extreme snapshot is raised to ``MIN_SNAPSHOT_WEIGHT_HOURS``
+  (1 h) and then held fixed.
+* **Refit of the representative weights.** Medoids are real periods, not cluster means,
+  so the weighted average of the selected periods misses the timeline mean -- onshore
+  wind by 7-20% with the counts alone. The representative weights are therefore refitted
+  to the per-state feature means: a least-squares fit of the relative error of every
+  state column, each state weighted by its capacity share (``weight_dict ** 2``, so each
+  family counts equally), subject to the 8760 h total and to every snapshot keeping at
+  least ``MIN_SNAPSHOT_WEIGHT_HOURS``. Only the weights move; the periods do not.
 
 Because both kinds of period come out of one tsam run over one period partition,
 extreme and representative periods necessarily share a length: the single
@@ -123,10 +151,10 @@ from _helpers import configure_logging
 logger = logging.getLogger(__name__)
 
 # Renewable carriers aggregated into each clustering feature. Carriers in the same
-# group are combined by capacity into one mean-capacity-factor series -- onshore and
-# offshore wind therefore share a single "wind" feature per state (see the module
-# docstring on what that costs in coastal states).
-WIND_CARRIERS = ("onwind", "offwind", "offwind_floating")
+# group are combined by capacity into one mean-capacity-factor series. Offshore wind is
+# deliberately absent: it would dominate the wind column of coastal states (see the
+# module docstring).
+WIND_CARRIERS = ("onwind",)
 SOLAR_CARRIERS = ("solar",)
 REEDS_FEATURE_GROUPS = {"wind": WIND_CARRIERS, "solar": SOLAR_CARRIERS}
 
@@ -149,6 +177,10 @@ def state_feature(kind, state):
 # tsam clips any weightDict entry below this and prints a notice, so the national
 # ranking columns are pinned exactly at the floor rather than below it.
 NATIONAL_COLUMN_WEIGHT = 1e-6
+
+# Every snapshot -- representative or extreme -- keeps at least this many hours of the
+# 8760 h year once the period weights are finalized (see "Period weights").
+MIN_SNAPSHOT_WEIGHT_HOURS = 1.0
 
 # The three extreme periods, one per clustering feature: the peak-load block, the wind
 # lull and the solar lull. Each is ranked on the *raw* feature, so each extreme is the
@@ -325,23 +357,34 @@ def _build_contiguous_source_period_rows(source_index, steps_per_period, timeste
     return rows
 
 
+def _extreme_period_sources(agg):
+    """
+    Return ``{period label: source period}`` for every extreme period tsam appended.
+
+    ``extremePeriods`` records each extreme's source period (``stepNo``) and
+    ``extremeClusterIdx`` its label; ``append`` fills both in the same order.
+    """
+    extreme_periods = list((getattr(agg, "extremePeriods", None) or {}).values())
+    labels = list(getattr(agg, "extremeClusterIdx", None) or [])
+    return {
+        int(label): int(info["stepNo"])
+        for label, info in zip(labels, extreme_periods)
+        if info.get("stepNo") is not None
+    }
+
+
 def _build_representative_period_mapping(agg, period_ids):
     """
     Map each period label tsam returned to the source period it was taken from.
 
-    ``clusterCenterIndices`` holds the medoid of cluster ``i`` at position ``i``,
-    and ``extremePeriods`` records the label (``newClusterNo``) and source period
-    (``stepNo``) of every extreme period tsam appended as a new cluster center.
+    ``clusterCenterIndices`` holds the medoid of cluster ``i`` at position ``i``; the
+    extreme periods come from ``_extreme_period_sources``.
     """
     source_periods = {
         int(label): int(center_idx)
         for label, center_idx in enumerate(getattr(agg, "clusterCenterIndices", None) or [])
     }
-    for info in getattr(agg, "extremePeriods", {}).values():
-        new_cluster = info.get("newClusterNo")
-        step_no = info.get("stepNo")
-        if new_cluster is not None and step_no is not None:
-            source_periods[int(new_cluster)] = int(step_no)
+    source_periods.update(_extreme_period_sources(agg))
 
     missing = [int(label) for label in period_ids if int(label) not in source_periods]
     if missing:
@@ -370,12 +413,7 @@ def _scale_snapshot_weightings_to_total_hours(snapshot_weightings, target_hours=
 def _get_extreme_period_ids(agg, period_ids):
     """Return the period labels tsam created for extreme periods."""
     period_id_set = {int(period_id) for period_id in period_ids}
-    extreme_period_ids = set()
-    for info in getattr(agg, "extremePeriods", {}).values():
-        new_cluster = info.get("newClusterNo")
-        if new_cluster is not None and int(new_cluster) in period_id_set:
-            extreme_period_ids.add(int(new_cluster))
-    return sorted(extreme_period_ids)
+    return sorted(label for label in _extreme_period_sources(agg) if label in period_id_set)
 
 
 def _build_period_entry(period_id, kind, steps, source_snapshots, weightings):
@@ -419,7 +457,12 @@ def _assign_period_entry_snapshots(period_label, base_time, timestep_hours, peri
 
 
 def _build_period_snapshot_weightings(period_entries, scale_to_hours=True):
-    """Concatenate per-period snapshot weightings and optionally rescale annually."""
+    """
+    Concatenate per-period snapshot weightings and optionally rescale annually.
+
+    ``finalize_period_weights`` already makes them sum to 8760 h, so the rescale is only
+    a guard against rounding.
+    """
     parts = []
     for entry in period_entries:
         weights = entry["weightings"].copy()
@@ -502,17 +545,199 @@ def serialize_representative_period_metadata(period_entries_by_label):
     return metadata
 
 
+def max_normalized_weights(weight_dict, frame):
+    """
+    Rescale tsam column weights so the clustering compares every column as ``x / max``.
+
+    tsam min-max normalizes each column to ``(x - min) / (max - min)`` and ward only sees
+    differences, so multiplying a column's weight by ``(max - min) / max`` makes the
+    distance exactly the one of ``x / max``. The national ranking columns keep
+    ``NATIONAL_COLUMN_WEIGHT``: they must stay invisible to the distance, and any
+    positive scale leaves their extreme ranking unchanged. A column whose maximum is not
+    positive carries no signal and gets weight 0 (tsam lifts it to its own floor).
+    Columns the frame does not carry are dropped -- tsam raises on an unknown key.
+    """
+    national = set(_NATIONAL_FEATURES.values())
+    weights = {}
+    for column, weight in weight_dict.items():
+        if column not in frame.columns:
+            continue
+        if tuple(column) in national:
+            weights[column] = float(weight)
+            continue
+        peak = float(frame[column].max())
+        span = peak - float(frame[column].min())
+        weights[column] = float(weight) * (span / peak if peak > 0 else 0.0)
+    return weights
+
+
+def refit_representative_weights(
+    period_means,
+    target_means,
+    column_weights,
+    steps,
+    fixed_hours,
+    initial_hours,
+    total_hours=8760.0,
+    min_hours=MIN_SNAPSHOT_WEIGHT_HOURS,
+):
+    """
+    Refit the free period weights so the weighted period means match the target means.
+
+    Minimises ``sum_c column_weights[c] * (pred_c / target_c - 1) ** 2`` with
+    ``pred_c = sum_p steps_p * hours_p * period_means[p, c] / total_hours``, subject to
+    ``sum_p steps_p * hours_p == total_hours`` and ``hours_p >= min_hours`` for every free
+    period; periods with a finite ``fixed_hours`` entry keep it. Columns with a
+    non-positive target or weight are ignored; when none is left, the free weights are
+    moved as little as possible from ``initial_hours`` (relative squared change) instead.
+
+    Parameters
+    ----------
+    period_means : pandas.DataFrame
+        Mean of every column over each period (periods x columns).
+    target_means : pandas.Series
+        Mean of every column over the whole source timeline.
+    column_weights : pandas.Series
+        Non-negative weight of every column's relative error.
+    steps : array-like of int
+        Snapshots per period.
+    fixed_hours : array-like of float
+        Hours per snapshot of a fixed period, NaN for a free one.
+    initial_hours : array-like of float
+        Starting hours per snapshot (the cluster counts, rescaled to ``total_hours``).
+
+    Returns
+    -------
+    numpy.ndarray
+        Hours per snapshot of every period.
+    """
+    from scipy.optimize import minimize
+
+    steps = np.asarray(steps, dtype="float64")
+    fixed_hours = np.asarray(fixed_hours, dtype="float64")
+    initial_hours = np.asarray(initial_hours, dtype="float64")
+    free = np.isnan(fixed_hours)
+    hours = np.where(free, 0.0, fixed_hours)
+    if not free.any():
+        return hours
+
+    # Work in shares of the year: y_p = steps_p * hours_p / total_hours.
+    budget = 1.0 - float(np.sum(steps[~free] * fixed_hours[~free])) / total_hours
+    lower = steps[free] * min_hours / total_hours
+    if lower.sum() > budget * (1.0 + 1e-9):
+        raise ValueError(
+            f"Cannot give every snapshot {min_hours:g} h: the fixed periods and the floor of the "
+            f"{int(free.sum())} free periods need more than {total_hours:g} h.",
+        )
+    # The counts rescaled to the free budget; lifted onto the floor only where they fall short.
+    proportional = steps[free] * initial_hours[free]
+    proportional = budget * proportional / proportional.sum()
+    if (proportional >= lower).all():
+        start = proportional
+    else:
+        start = np.maximum(proportional - lower, 1e-12)
+        start = lower + (budget - lower.sum()) * start / start.sum()
+
+    target = pd.Series(target_means, dtype="float64")
+    weights = pd.Series(column_weights, dtype="float64").reindex(period_means.columns).fillna(0.0)
+    columns = [
+        column for column in period_means.columns
+        if weights[column] > 0 and np.isfinite(target.get(column, np.nan)) and target[column] > 0
+    ]
+    if columns:
+        scale = np.sqrt(weights[columns].to_numpy())[:, None]
+        ratio = (period_means[columns].to_numpy() / target[columns].to_numpy()).T * scale
+        matrix = ratio[:, free]
+        offset = scale[:, 0] - ratio[:, ~free] @ (steps[~free] * fixed_hours[~free] / total_hours)
+
+        def objective(y):
+            residual = matrix @ y - offset
+            return float(residual @ residual), 2.0 * matrix.T @ residual
+    else:
+        reference = proportional
+
+        def objective(y):
+            change = (y - reference) / reference
+            return float(change @ change), 2.0 * change / reference
+
+    result = minimize(
+        objective,
+        start,
+        jac=True,
+        bounds=list(zip(lower, [None] * len(lower))),
+        constraints=[{"type": "eq", "fun": lambda y: y.sum() - budget, "jac": lambda y: np.ones_like(y)}],
+        method="SLSQP",
+        options={"maxiter": 2000, "ftol": 1e-14},
+    )
+    if not result.success:
+        raise RuntimeError(f"Refitting the representative period weights failed: {result.message}")
+    hours[free] = np.maximum(result.x, lower) * total_hours / steps[free]
+    return hours
+
+
+def finalize_period_weights(period_entries, period_means, target_means, weight_dict=None):
+    """
+    Turn cluster-count weights into the final hours per snapshot (see "Period weights").
+
+    The counts are rescaled to 8760 h, every extreme snapshot is raised to
+    ``MIN_SNAPSHOT_WEIGHT_HOURS`` and held there, and the representative weights are
+    refitted to ``target_means`` over the per-state columns of ``weight_dict`` (each
+    weighted by ``weight ** 2``, its capacity share), keeping every snapshot at the same
+    floor. ``period_means`` holds each entry's feature means, row for row. Returns new
+    entries whose ``weightings`` columns all carry the final hours.
+    """
+    steps = np.array([int(entry["steps"]) for entry in period_entries], dtype="float64")
+    counts = np.array([float(entry["weightings"]["objective"].mean()) for entry in period_entries])
+    initial_hours = counts * 8760.0 / float(np.sum(steps * counts))
+    is_extreme = np.array([entry["kind"] == "extreme" for entry in period_entries])
+    fixed_hours = np.where(is_extreme, np.maximum(initial_hours, MIN_SNAPSHOT_WEIGHT_HOURS), np.nan)
+
+    national = set(_NATIONAL_FEATURES.values())
+    state_columns = [
+        column for column in (weight_dict or {})
+        if tuple(column) not in national and column in period_means.columns
+    ]
+    hours = refit_representative_weights(
+        period_means[state_columns],
+        target_means,
+        pd.Series({column: float(weight_dict[column]) ** 2 for column in state_columns}, dtype="float64"),
+        steps,
+        fixed_hours,
+        initial_hours,
+    )
+
+    national_columns = [column for column in _NATIONAL_FEATURES.values() if column in period_means.columns]
+    for label, share in (("cluster counts", steps * initial_hours), ("refitted", steps * hours)):
+        errors = (period_means[national_columns].T @ share / 8760.0) / target_means[national_columns] - 1.0
+        logger.info(
+            "National mean error with %s weights: %s.",
+            label,
+            ", ".join(f"{column[-1]} {100 * error:+.2f}%" for column, error in errors.items()) or "n/a",
+        )
+    if not state_columns:
+        logger.info("No per-state columns to refit on; representative weights only honour the floor.")
+
+    finalized = []
+    for entry, entry_hours in zip(period_entries, hours):
+        updated = dict(entry)
+        updated["weightings"] = pd.DataFrame(
+            float(entry_hours), index=entry["weightings"].index, columns=entry["weightings"].columns,
+        )
+        finalized.append(updated)
+    return finalized
+
+
 def select_period_entries(feature_t_full, source_index_full, representative_periods_cfg, weight_dict=None):
     """
     Select representative + extreme period entries for one source weather-year timeline.
 
-    One tsam run does everything: hierarchical clustering picks ``number``
-    representative periods (represented by the real historical period closest to
-    each cluster centroid, tsam's ``medoidRepresentation``), and -- when
-    ``include_extreme`` is true -- tsam's ``new_cluster_center`` method adds the
-    three single-feature extreme periods (peak demand, wind lull, solar lull) as
-    further cluster centers and reassigns whatever is closer to them. Period weights
-    are the resulting cluster membership counts (see the module docstring).
+    One tsam run picks the periods: hierarchical clustering on the max-normalized
+    features (``max_normalized_weights``) chooses ``number`` representative periods
+    (each the real historical period closest to its cluster centroid, tsam's
+    ``medoidRepresentation``), and -- when ``include_extreme`` is true -- the three
+    single-feature extreme periods (peak demand, wind lull, solar lull) are appended with
+    only their own period as member. ``finalize_period_weights`` then turns the cluster
+    membership counts into the final hours per snapshot (see the module docstring).
 
     Parameters
     ----------
@@ -525,8 +750,9 @@ def select_period_entries(feature_t_full, source_index_full, representative_peri
     representative_periods_cfg : dict
         The ``clustering.temporal.representative_periods`` config block.
     weight_dict : dict[tuple, float], optional
-        Per-column tsam ``weightDict``. Build it with ``build_clustering_weights``;
-        entries naming a column the frame does not carry are dropped.
+        Per-column ``sqrt(capacity share)`` from ``build_feature_frame``. It weights the
+        clustering (after ``max_normalized_weights``) and the state columns of the
+        weight refit; entries naming a column the frame does not carry are dropped.
 
     Returns
     -------
@@ -534,7 +760,7 @@ def select_period_entries(feature_t_full, source_index_full, representative_peri
         Period entries (without a "snapshots" label yet -- see
         ``_assign_period_entry_snapshots``), each carrying a ``source_snapshots``
         DatetimeIndex that indexes directly into the raw source data and a
-        ``weightings`` frame holding that period's cluster weight.
+        ``weightings`` frame holding that period's final hours per snapshot.
     """
     import tsam.timeseriesaggregation as tsam
 
@@ -588,14 +814,10 @@ def select_period_entries(feature_t_full, source_index_full, representative_peri
         rescaleClusterPeriods=False,
     )
     if weight_dict:
-        # Only columns the frame actually carries: tsam raises on an unknown key, and
-        # build_feature_frame drops a column whose series never materialised.
-        tsam_kwargs["weightDict"] = {
-            column: float(weight) for column, weight in weight_dict.items() if column in feature_cluster.columns
-        }
+        tsam_kwargs["weightDict"] = max_normalized_weights(weight_dict, feature_cluster)
     if mean_max_columns or mean_min_columns:
         tsam_kwargs.update(
-            extremePeriodMethod="new_cluster_center",
+            extremePeriodMethod="append",
             addMeanMax=mean_max_columns,
             addMeanMin=mean_min_columns,
         )
@@ -620,7 +842,7 @@ def select_period_entries(feature_t_full, source_index_full, representative_peri
         pd.MultiIndex.from_product([period_ids, range(period_steps)], names=["PeriodNum", "TimeStep"]),
     )
 
-    period_entries = []
+    period_entries, period_means = [], []
     for period_id in period_ids:
         positions = source_period_rows[source_periods[period_id]]
         local_weights = sw_local.loc[pd.IndexSlice[period_id, :]].copy()
@@ -634,6 +856,12 @@ def select_period_entries(feature_t_full, source_index_full, representative_peri
                 local_weights,
             ),
         )
+        period_means.append(feature_t_full.iloc[positions].mean())
+
+    # The target is the mean over the same candidate periods the counts partition.
+    period_entries = finalize_period_weights(
+        period_entries, pd.DataFrame(period_means), feature_cluster.mean(), weight_dict,
+    )
 
     logger.info(
         "Clustered %s source periods into %s periods (%s extreme): %s.",
@@ -643,7 +871,7 @@ def select_period_entries(feature_t_full, source_index_full, representative_peri
         ", ".join(
             f"P{entry['period_id']}"
             f"{'(extreme)' if entry['period_id'] in extreme_period_ids else ''}"
-            f"={entry['weightings']['objective'].iloc[0]:g}x {entry['source_snapshots'][0]:%Y-%m-%d}"
+            f"={entry['weightings']['objective'].iloc[0]:.3g} h {entry['source_snapshots'][0]:%Y-%m-%d}"
             for entry in period_entries
         ),
     )
@@ -795,9 +1023,9 @@ def read_reeds_state_capacity_factor(
 
     Carriers in the same feature group are combined by capacity, so numerator and
     denominator accumulate separately and are divided once at the end. Carriers
-    sharing a supply curve are read once: ``offwind`` and ``offwind_floating`` are
-    the same ReEDS sites split by water depth downstream, so counting both would
-    double the offshore contribution.
+    sharing a supply curve are read once, so two carriers split from the same ReEDS
+    sites downstream are never counted twice. Configured carriers outside
+    ``REEDS_FEATURE_GROUPS`` -- offshore wind among them -- are ignored.
 
     The solar inverter loading ratio is applied per site before aggregating,
     matching the downstream clip at 1.0.
@@ -911,9 +1139,9 @@ def read_reeds_state_capacity_factor(
                     "time index; all must be built on the same weather-year calendar.",
                 )
             else:
-                # Merged onshore + offshore: numerator and denominator both accumulate
-                # per state, so the division at the end is the combined capacity-weighted
-                # mean, not a mean of means.
+                # Several carriers in one group: numerator and denominator both
+                # accumulate per state, so the division at the end is the combined
+                # capacity-weighted mean, not a mean of means.
                 numerator = numerator.add(frame, fill_value=0.0)
                 capacity_by_state = capacity_by_state.add(carrier_capacity, fill_value=0.0)
 

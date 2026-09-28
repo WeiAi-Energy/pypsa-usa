@@ -18,6 +18,7 @@ from build_reeds_renewable_profiles import (
 )
 from select_representative_periods import (
     LOAD_FEATURE,
+    MIN_SNAPSHOT_WEIGHT_HOURS,
     SOLAR_FEATURE,
     WIND_FEATURE,
     _NATIONAL_FEATURES,
@@ -32,6 +33,8 @@ from select_representative_periods import (
     build_plot_data,
     get_include_extreme,
     get_period_hours,
+    max_normalized_weights,
+    refit_representative_weights,
     resolve_extreme_selectors,
     select_period_entries,
     serialize_representative_period_metadata,
@@ -328,32 +331,145 @@ def test_select_period_entries_skips_extremes_when_the_switch_is_off():
     assert all(entry["kind"] == "representative" for entry in entries)
 
 
-def test_get_extreme_period_ids_reads_the_labels_tsam_appended():
-    """Extreme periods are the clusters tsam created via new_cluster_center."""
-    agg = SimpleNamespace(
-        _clusterOrder=np.array([0, 1, 2]),
-        extremePeriods={
-            "wind": {"newClusterNo": 2, "stepNo": 7},
-            # A label tsam dropped from the final matching must not be reported.
-            "solar": {"newClusterNo": 9, "stepNo": 3},
+def test_appended_wind_lull_does_not_absorb_near_lull_days():
+    """An appended extreme represents only its own day, however close its neighbours are."""
+    frame = _extreme_feature_frame()
+    # Ten calm-but-not-extreme days: closer to the zero-wind lull than to the 0.5 medoid.
+    calm = frame.index.normalize().isin(pd.date_range("2030-02-01", periods=10, freq="D"))
+    frame.loc[calm, WIND_FEATURE] = 0.05 * frame.loc[calm, WIND_FEATURE] / 0.5
+
+    entries = select_period_entries(frame, frame.index, {"number": 1, "period_length": 1, "include_extreme": True})
+
+    weight = {entry["source_start"].normalize(): entry["weightings"]["objective"].iloc[0] for entry in entries}
+    assert {PEAK_LOAD_DAY, WIND_LULL_DAY, SOLAR_LULL_DAY} <= set(weight)
+    # One source year: one source day is exactly 1 h per snapshot, the floor.
+    assert weight[WIND_LULL_DAY] == pytest.approx(1.0)
+    assert weight[PEAK_LOAD_DAY] == pytest.approx(1.0)
+    assert sum(weight.values()) == pytest.approx(8760 / 24)
+
+
+def test_extreme_snapshots_are_floored_at_one_hour():
+    """Over two source years an extreme day is worth 0.5 h per snapshot; it is raised to 1 h."""
+    first = _extreme_feature_frame()
+    normal_day = first.loc["2030-03-10"].to_numpy()
+    second = pd.DataFrame(np.tile(normal_day, (365, 1)), columns=first.columns)
+    second.index = first.index + pd.Timedelta(hours=len(first))
+    frame = pd.concat([first, second])
+
+    entries = select_period_entries(frame, frame.index, {"number": 1, "period_length": 1, "include_extreme": True})
+
+    extreme = [entry["weightings"]["objective"].iloc[0] for entry in entries if entry["kind"] == "extreme"]
+    assert extreme == pytest.approx([MIN_SNAPSHOT_WEIGHT_HOURS] * 3)
+    total = sum(entry["steps"] * entry["weightings"]["objective"].iloc[0] for entry in entries)
+    assert total == pytest.approx(8760)
+    # All three weighting columns carry the same final hours.
+    assert all((entry["weightings"].nunique(axis="columns") == 1).all() for entry in entries)
+
+
+def test_refit_matches_a_state_mean_that_the_medoids_miss():
+    """Medoids of a skewed series miss its mean; the refitted weights recover it exactly."""
+    hours = pd.date_range("2030-01-01 00:00", "2030-12-31 23:00", freq="h")
+    level = 0.1 + 0.8 * (np.arange(len(hours)) // 24 / 364.0) ** 3
+    column = state_feature("wind", "TX")
+    frame = pd.DataFrame({column: level}, index=hours)
+    frame.columns = pd.MultiIndex.from_tuples(frame.columns)
+
+    entries = select_period_entries(
+        frame, frame.index, {"number": 2, "period_length": 1, "include_extreme": False}, weight_dict={column: 1.0},
+    )
+
+    weights = np.array([entry["weightings"]["objective"].iloc[0] for entry in entries])
+    means = np.array([frame.loc[entry["source_snapshots"], column].mean() for entry in entries])
+    assert 24 * weights.sum() == pytest.approx(8760)
+    assert (weights >= MIN_SNAPSHOT_WEIGHT_HOURS).all()
+    assert np.dot(24 * weights, means) / 8760 == pytest.approx(frame[column].mean(), rel=1e-6)
+
+
+def test_refit_representative_weights_keeps_fixed_periods_and_the_total():
+    period_means = pd.DataFrame({"x": [0.2, 0.6, 0.4]})
+    hours = refit_representative_weights(
+        period_means, pd.Series({"x": 0.4}), pd.Series({"x": 1.0}),
+        steps=[24, 24, 24], fixed_hours=[np.nan, np.nan, 1.0], initial_hours=[100.0, 200.0, 1.0],
+    )
+
+    assert hours[2] == pytest.approx(1.0)
+    assert np.dot([24, 24, 24], hours) == pytest.approx(8760)
+    assert np.dot(24 * hours, period_means["x"]) / 8760 == pytest.approx(0.4, rel=1e-6)
+
+
+def test_refit_representative_weights_stops_at_the_floor():
+    """A target beyond the best period pushes the other one down to the floor, not below."""
+    hours = refit_representative_weights(
+        pd.DataFrame({"x": [0.2, 0.6]}), pd.Series({"x": 0.7}), pd.Series({"x": 1.0}),
+        steps=[24, 24], fixed_hours=[np.nan, np.nan], initial_hours=[180.0, 185.0],
+    )
+
+    assert hours[0] == pytest.approx(MIN_SNAPSHOT_WEIGHT_HOURS)
+    assert np.dot([24, 24], hours) == pytest.approx(8760)
+
+
+def test_refit_representative_weights_without_columns_keeps_the_count_proportions():
+    hours = refit_representative_weights(
+        pd.DataFrame(index=[0, 1]), pd.Series(dtype="float64"), pd.Series(dtype="float64"),
+        steps=[24, 24], fixed_hours=[np.nan, np.nan], initial_hours=[2.0, 1.0],
+    )
+
+    assert hours[0] / hours[1] == pytest.approx(2.0)
+    assert np.dot([24, 24], hours) == pytest.approx(8760)
+
+
+def test_refit_representative_weights_rejects_an_unreachable_floor():
+    with pytest.raises(ValueError, match="Cannot give every snapshot"):
+        refit_representative_weights(
+            pd.DataFrame(index=range(400)), pd.Series(dtype="float64"), pd.Series(dtype="float64"),
+            steps=[24] * 400, fixed_hours=[np.nan] * 400, initial_hours=[1.0] * 400,
+        )
+
+
+def test_max_normalized_weights_turns_min_max_into_per_unit_of_max():
+    frame = pd.DataFrame(
+        {
+            state_feature("wind", "TX"): [0.0, 0.5, 1.0],
+            state_feature("load", "TX"): [50.0, 75.0, 100.0],
+            state_feature("solar", "TX"): [0.0, 0.0, 0.0],
+            LOAD_FEATURE: [500.0, 750.0, 1000.0],
         },
     )
+    frame.columns = pd.MultiIndex.from_tuples(frame.columns)
 
-    assert _get_extreme_period_ids(agg, period_ids=[0, 1, 2]) == [2]
-    assert _get_extreme_period_ids(SimpleNamespace(), period_ids=[0, 1]) == []
-
-
-def test_representative_period_mapping_covers_medoids_and_extremes():
-    """Cluster i's medoid sits at position i; extremes carry their own stepNo."""
-    agg = SimpleNamespace(
-        clusterCenterIndices=[11, 22],
-        extremePeriods={"load daily max.": {"newClusterNo": 2, "stepNo": 33}},
+    weights = max_normalized_weights(
+        {
+            state_feature("wind", "TX"): 0.8,
+            state_feature("load", "TX"): 0.6,
+            state_feature("solar", "TX"): 0.5,
+            LOAD_FEATURE: 1e-6,
+            state_feature("wind", "CT"): 0.4,
+        },
+        frame,
     )
 
-    assert _build_representative_period_mapping(agg, [0, 1, 2]) == {0: 11, 1: 22, 2: 33}
+    assert weights[state_feature("wind", "TX")] == pytest.approx(0.8)
+    # Load spans half its peak, so its min-max distance is halved back to x / max.
+    assert weights[state_feature("load", "TX")] == pytest.approx(0.3)
+    assert weights[state_feature("solar", "TX")] == 0.0
+    assert weights[LOAD_FEATURE] == 1e-6
+    assert state_feature("wind", "CT") not in weights
 
+
+def test_extreme_period_sources_map_appended_labels_in_order():
+    """append records labels in extremeClusterIdx, in the order of extremePeriods."""
+    agg = SimpleNamespace(
+        clusterCenterIndices=[11, 22],
+        extremePeriods={"load daily max.": {"stepNo": 33}, "wind daily min.": {"stepNo": 44}},
+        extremeClusterIdx=[2, 3],
+    )
+
+    assert _build_representative_period_mapping(agg, [0, 1, 2, 3]) == {0: 11, 1: 22, 2: 33, 3: 44}
+    # A label tsam dropped from the final matching must not be reported.
+    assert _get_extreme_period_ids(agg, period_ids=[0, 1, 2]) == [2]
+    assert _get_extreme_period_ids(SimpleNamespace(), period_ids=[0, 1]) == []
     with pytest.raises(ValueError, match="Unable to map"):
-        _build_representative_period_mapping(agg, [0, 1, 2, 3])
+        _build_representative_period_mapping(agg, [0, 1, 2, 3, 4])
 
 
 def test_validate_period_counts_warns_when_tsam_drops_an_extreme(caplog):
@@ -625,6 +741,42 @@ def test_build_profile_dataset_keeps_time_indexed_for_named_source_hours():
     assert "time" in dataset.indexes
     recovered = dataset["profile"].transpose("time", "bus").to_pandas()
     assert pd.DatetimeIndex(recovered.index).equals(pd.DatetimeIndex(hours, name="time"))
+
+
+def test_read_reeds_state_capacity_factor_leaves_offshore_wind_out(tmp_path, monkeypatch):
+    """Configured offshore carriers must not enter the wind feature or even be read."""
+    import build_reeds_renewable_profiles as reeds
+    import select_representative_periods as selection
+
+    for tech in ("onwind", "solar", "offwind"):
+        path = tmp_path / reeds.REEDS_TECH[tech]["sc"]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame({"sc_point_gid": [1, 2], "capacity": [100.0, 300.0]}).to_csv(path, index=False)
+
+    hours = pd.date_range("2007-01-01", periods=2, freq="h", tz="UTC")
+    opened = []
+
+    def fake_time_indexes(cf_path, weather_years):
+        opened.append(cf_path)
+        return {2007: hours}
+
+    def fake_grouped(cf_path, gids, capacities, weather_year, groups=None, group_labels=None, transform=None):
+        cf = 0.9 if "ofs" in cf_path else 0.3
+        return pd.DataFrame(
+            {label: [cf * capacities[np.asarray(groups) == label].sum()] * len(hours) for label in group_labels},
+        )
+
+    monkeypatch.setattr(reeds, "read_cf_time_indexes", fake_time_indexes)
+    monkeypatch.setattr(reeds, "grouped_available_generation", fake_grouped)
+    monkeypatch.setattr(selection, "read_site_states", lambda *args: {1: "CA", 2: "TX"})
+
+    profiles = selection.read_reeds_state_capacity_factor(
+        ["onwind", "offwind", "offwind_floating", "solar"], str(tmp_path), "unused", "unused", [2007],
+    )
+
+    assert not [path for path in opened if path.endswith(reeds.REEDS_TECH["offwind"]["cf"])]
+    assert profiles["wind"]["national"].tolist() == pytest.approx([0.3, 0.3])
+    assert profiles["wind"]["capacity"].to_dict() == {"CA": 100.0, "TX": 300.0}
 
 
 def _carrier_group(states_frame, capacity):
