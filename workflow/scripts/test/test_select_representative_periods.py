@@ -33,6 +33,7 @@ from select_representative_periods import (
     build_plot_data,
     get_include_extreme,
     get_period_hours,
+    match_period_means,
     max_normalized_weights,
     refit_representative_weights,
     resolve_extreme_selectors,
@@ -134,43 +135,25 @@ def _feature_frame(columns, periods=3):
     return frame
 
 
-def test_extreme_selectors_split_demand_max_from_the_two_capacity_factor_minima():
-    """Demand ranks on addMeanMax; both capacity factors rank on addMeanMin."""
+def test_extreme_selector_ranks_only_peak_demand():
+    """The single extreme is the peak-demand period; wind and solar rank nothing."""
     feature_t = _feature_frame([WIND_FEATURE, SOLAR_FEATURE, LOAD_FEATURE], periods=4)
 
-    mean_max, mean_min = resolve_extreme_selectors(feature_t)
-
-    assert mean_max == [LOAD_FEATURE]
-    # EXTREME_SELECTORS order: wind before solar.
-    assert mean_min == [WIND_FEATURE, SOLAR_FEATURE]
+    assert resolve_extreme_selectors(feature_t) == ([LOAD_FEATURE], [])
 
 
-def test_extreme_selectors_skip_a_missing_feature():
-    """A carrier that is not modelled simply loses its extreme period."""
-    feature_t = _feature_frame([SOLAR_FEATURE, LOAD_FEATURE], periods=4)
+def test_extreme_selector_is_skipped_without_the_load_feature(caplog):
+    feature_t = _feature_frame([WIND_FEATURE, SOLAR_FEATURE], periods=4)
 
-    mean_max, mean_min = resolve_extreme_selectors(feature_t)
-
-    assert mean_max == [LOAD_FEATURE]
-    assert mean_min == [SOLAR_FEATURE]
+    with caplog.at_level("WARNING"):
+        assert resolve_extreme_selectors(feature_t) == ([], [])
+    assert "demand_max" in caplog.text
 
 
-def test_extreme_selectors_skip_a_degenerate_feature():
+def test_extreme_selector_is_skipped_for_a_flat_load():
     """A flat series has no most-extreme period, so it carries no ranking signal."""
     feature_t = _feature_frame([WIND_FEATURE, SOLAR_FEATURE, LOAD_FEATURE], periods=4)
-    feature_t[WIND_FEATURE] = 0.4
     feature_t[LOAD_FEATURE] = 100.0
-
-    mean_max, mean_min = resolve_extreme_selectors(feature_t)
-
-    assert mean_max == []
-    assert mean_min == [SOLAR_FEATURE]
-
-
-def test_extreme_selectors_resolve_nothing_for_an_all_flat_frame():
-    """With no feature carrying any variation there is no extreme period at all."""
-    feature_t = _feature_frame([WIND_FEATURE, SOLAR_FEATURE, LOAD_FEATURE], periods=4)
-    feature_t.loc[:, :] = 1.0
 
     assert resolve_extreme_selectors(feature_t) == ([], [])
 
@@ -212,13 +195,12 @@ SOLAR_LULL_DAY = pd.Timestamp("2030-10-08")
 
 def _extreme_feature_frame():
     """
-    A year of hourly features with one planted day per extreme selector.
+    A year of hourly features with a planted peak-load day and two planted lulls.
 
-    Every other day of the year carries the same normal profile, so each planted day
-    is the unique winner of exactly one selector: July 20 the annual peak load, January
-    15 a full day of zero wind, October 8 a full day of zero sun. None of them wins two,
-    which is what lets the run return all three (tsam drops a selector's candidate once
-    another selector has already claimed it).
+    Every other day of the year carries the same normal profile: July 20 is the annual
+    peak load, January 15 a full day of zero wind, October 8 a full day of zero sun. Only
+    the peak-load day may come back as an extreme; the lulls are there to show that they
+    no longer do.
     """
     hours = pd.date_range("2030-01-01 00:00", "2030-12-31 23:00", freq="h")
     day = hours.normalize()
@@ -242,12 +224,12 @@ def _extreme_feature_frame():
     return frame
 
 
-def test_select_period_entries_returns_one_extreme_per_selector():
-    """A live tsam run must return the peak-load day, the wind lull and the solar lull.
+def test_select_period_entries_returns_the_peak_load_day_as_the_only_extreme():
+    """A live tsam run returns the peak-load day as its one extreme, not the lulls.
 
-    ``number`` is 1 on purpose: the planted extremes are the most distinctive days in
-    the frame, so a larger cluster count makes them medoids in their own right and tsam
-    then drops them as extremes (see ``validate_period_counts``).
+    ``number`` is 1 on purpose: the planted days are the most distinctive in the frame,
+    so a larger cluster count makes them cluster centers in their own right and tsam then
+    drops the peak-load day as an extreme (see ``validate_period_counts``).
     """
     frame = _extreme_feature_frame()
 
@@ -260,13 +242,9 @@ def test_select_period_entries_returns_one_extreme_per_selector():
     representative = [entry for entry in entries if entry["kind"] == "representative"]
     extreme = [entry for entry in entries if entry["kind"] == "extreme"]
     assert len(representative) == 1
-    assert {entry["source_start"].normalize() for entry in extreme} == {
-        PEAK_LOAD_DAY,
-        WIND_LULL_DAY,
-        SOLAR_LULL_DAY,
-    }
-    # Every source period is accounted for: 1 typical day + the three extreme days.
-    assert sum(entry["weightings"]["objective"].iloc[0] for entry in entries) == len(frame) / 24
+    assert [entry["source_start"].normalize() for entry in extreme] == [PEAK_LOAD_DAY]
+    # One source year: the weights of 1 typical day + the extreme day add up to 8760 h.
+    assert sum(entry["weightings"]["objective"].iloc[0] for entry in entries) == pytest.approx(len(frame) / 24)
 
 
 def test_select_period_entries_still_ranks_extremes_on_down_weighted_national_columns():
@@ -276,10 +254,10 @@ def test_select_period_entries_still_ranks_extremes_on_down_weighted_national_co
     be ranked on national aggregates, but tsam can only rank on columns of the frame it
     clusters, so those columns ride along at 1e-6. tsam ranks on the *weighted*
     normalized profiles, and a positive constant scale is order-preserving -- so the
-    same three days must come back as with no weighting at all.
+    same day must come back as with no weighting at all.
     """
     frame = _extreme_feature_frame()
-    # Per-state columns that carry the clustering, plus a state whose lull falls on a
+    # Per-state columns that carry the clustering, plus a state whose load peaks on a
     # different day than the national one, so an accidental rank on a state column
     # would pick the wrong period.
     decoy = frame.index.normalize() == pd.Timestamp("2030-03-03")
@@ -299,8 +277,7 @@ def test_select_period_entries_still_ranks_extremes_on_down_weighted_national_co
     extreme_days = {
         entry["source_start"].normalize() for entry in entries if entry["kind"] == "extreme"
     }
-    assert extreme_days == {PEAK_LOAD_DAY, WIND_LULL_DAY, SOLAR_LULL_DAY}
-    assert pd.Timestamp("2030-03-03") not in extreme_days
+    assert extreme_days == {PEAK_LOAD_DAY}
 
 
 def test_select_period_entries_ignores_weights_for_columns_the_frame_lacks():
@@ -331,25 +308,24 @@ def test_select_period_entries_skips_extremes_when_the_switch_is_off():
     assert all(entry["kind"] == "representative" for entry in entries)
 
 
-def test_appended_wind_lull_does_not_absorb_near_lull_days():
+def test_appended_peak_load_day_does_not_absorb_near_peak_days():
     """An appended extreme represents only its own day, however close its neighbours are."""
     frame = _extreme_feature_frame()
-    # Ten calm-but-not-extreme days: closer to the zero-wind lull than to the 0.5 medoid.
-    calm = frame.index.normalize().isin(pd.date_range("2030-02-01", periods=10, freq="D"))
-    frame.loc[calm, WIND_FEATURE] = 0.05 * frame.loc[calm, WIND_FEATURE] / 0.5
+    # Ten hot-but-not-peak days: closer to the peak day than to the normal day.
+    hot = frame.index.normalize().isin(pd.date_range("2030-07-01", periods=10, freq="D"))
+    frame.loc[hot, LOAD_FEATURE] = 0.95 * frame.loc[hot, LOAD_FEATURE] / 0.5
 
     entries = select_period_entries(frame, frame.index, {"number": 1, "period_length": 1, "include_extreme": True})
 
     weight = {entry["source_start"].normalize(): entry["weightings"]["objective"].iloc[0] for entry in entries}
-    assert {PEAK_LOAD_DAY, WIND_LULL_DAY, SOLAR_LULL_DAY} <= set(weight)
+    assert PEAK_LOAD_DAY in weight
     # One source year: one source day is exactly 1 h per snapshot, the floor.
-    assert weight[WIND_LULL_DAY] == pytest.approx(1.0)
     assert weight[PEAK_LOAD_DAY] == pytest.approx(1.0)
     assert sum(weight.values()) == pytest.approx(8760 / 24)
 
 
 def test_extreme_snapshots_are_floored_at_one_hour():
-    """Over two source years an extreme day is worth 0.5 h per snapshot; it is raised to 1 h."""
+    """Over two source years the extreme day is worth 0.5 h per snapshot; it is raised to 1 h."""
     first = _extreme_feature_frame()
     normal_day = first.loc["2030-03-10"].to_numpy()
     second = pd.DataFrame(np.tile(normal_day, (365, 1)), columns=first.columns)
@@ -359,7 +335,7 @@ def test_extreme_snapshots_are_floored_at_one_hour():
     entries = select_period_entries(frame, frame.index, {"number": 1, "period_length": 1, "include_extreme": True})
 
     extreme = [entry["weightings"]["objective"].iloc[0] for entry in entries if entry["kind"] == "extreme"]
-    assert extreme == pytest.approx([MIN_SNAPSHOT_WEIGHT_HOURS] * 3)
+    assert extreme == pytest.approx([MIN_SNAPSHOT_WEIGHT_HOURS])
     total = sum(entry["steps"] * entry["weightings"]["objective"].iloc[0] for entry in entries)
     assert total == pytest.approx(8760)
     # All three weighting columns carry the same final hours.
@@ -383,6 +359,57 @@ def test_refit_matches_a_state_mean_that_the_medoids_miss():
     assert 24 * weights.sum() == pytest.approx(8760)
     assert (weights >= MIN_SNAPSHOT_WEIGHT_HOURS).all()
     assert np.dot(24 * weights, means) / 8760 == pytest.approx(frame[column].mean(), rel=1e-6)
+
+
+def test_match_period_means_picks_the_member_closest_to_its_cluster_mean():
+    period_means = pd.DataFrame({"x": [0.1, 0.2, 0.9, 0.5, 0.6], "y": [1.0, 1.0, 1.0, 5.0, 1.0]})
+
+    representatives = match_period_means(
+        period_means, [0, 0, 0, 1, 1], pd.Series({"x": 0.5, "y": 2.0}), pd.Series({"x": 1.0, "y": 0.0}),
+    )
+
+    # Cluster 0 averages x = 0.4: 0.2 is closest. y carries no weight, so its outlier is ignored.
+    assert representatives[0] == 1
+    assert representatives[1] in (3, 4)
+
+
+def test_match_period_means_weights_columns_by_their_share():
+    period_means = pd.DataFrame({"x": [0.2, 0.6, 0.4], "y": [0.8, 0.8, 0.2]})
+
+    only_x = match_period_means(period_means, [0, 0, 0], pd.Series({"x": 0.4, "y": 0.6}), pd.Series({"x": 1.0}))
+    mostly_y = match_period_means(
+        period_means, [0, 0, 0], pd.Series({"x": 0.4, "y": 0.6}), pd.Series({"x": 0.01, "y": 1.0}),
+    )
+
+    assert only_x[0] == 2
+    assert mostly_y[0] in (0, 1)
+
+
+def test_match_period_means_returns_none_without_usable_columns():
+    period_means = pd.DataFrame({"x": [0.0, 0.0]})
+
+    assert match_period_means(period_means, [0, 0], pd.Series({"x": 0.0}), pd.Series({"x": 1.0})) is None
+    assert match_period_means(period_means, [0, 0], pd.Series({"x": 1.0}), pd.Series(dtype="float64")) is None
+
+
+def test_selected_representative_is_the_day_whose_mean_matches_the_year():
+    """With one cluster, the representative is the day whose mean is closest to the annual mean."""
+    hours = pd.date_range("2030-01-01 00:00", "2030-12-31 23:00", freq="h")
+    day = np.arange(len(hours)) // 24
+    column = state_feature("wind", "TX")
+    # Right-skewed daily levels with a diurnal shape that differs from day to day.
+    level = 0.1 + 0.8 * (day / 364.0) ** 3
+    shape = 1.0 + 0.3 * np.sin(2 * np.pi * (hours.hour.to_numpy() + day) / 24.0)
+    frame = pd.DataFrame({column: level * shape}, index=hours)
+    frame.columns = pd.MultiIndex.from_tuples(frame.columns)
+
+    entries = select_period_entries(
+        frame, frame.index, {"number": 1, "period_length": 1, "include_extreme": False}, weight_dict={column: 1.0},
+    )
+
+    chosen = frame.loc[entries[0]["source_snapshots"], column].mean()
+    daily = frame[column].groupby(day).mean()
+    assert chosen == pytest.approx(daily.iloc[(daily - frame[column].mean()).abs().argmin()])
 
 
 def test_refit_representative_weights_keeps_fixed_periods_and_the_total():
@@ -476,10 +503,8 @@ def test_validate_period_counts_warns_when_tsam_drops_an_extreme(caplog):
     """A dropped extreme is a warning; a missing representative is an error."""
     weights = pd.DataFrame({"objective": [1.0, 1.0]})
     hours = pd.date_range("2030-01-01 00:00", periods=2, freq="h")
-    entries = [
-        _build_period_entry(0, "representative", 2, hours, weights),
-        _build_period_entry(1, "extreme", 2, hours, weights),
-    ]
+    # The peak-load extreme was dropped: only the representative period came back.
+    entries = [_build_period_entry(0, "representative", 2, hours, weights)]
     cfg = {
         "number": 1,
         "period_length": 2 / 24,
@@ -488,7 +513,7 @@ def test_validate_period_counts_warns_when_tsam_drops_an_extreme(caplog):
 
     with caplog.at_level("WARNING"):
         validate_period_counts({2030: entries}, cfg)
-    assert "instead of the 3 requested" in caplog.text
+    assert "instead of the 1 requested" in caplog.text
 
     with pytest.raises(ValueError, match="expected 2"):
         validate_period_counts({2030: entries}, {**cfg, "number": 2})
