@@ -23,7 +23,7 @@ from snakemake.utils import update_config
 DECARBONIZATION_OPTS = {
     "BAU": (("TCT", "RPS"), ("REM",)),
     "95Emission": (("TCT", "RPS", "REM"), ()),
-    "100VRE": (("TCT", "RPS"), ("REM",)),
+    "100Emission": (("TCT", "RPS"), ("REM",)),
 }
 
 

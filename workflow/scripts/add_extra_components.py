@@ -543,11 +543,11 @@ def apply_gas_fuel_price(n: pypsa.Network, gas_price: float) -> None:
 
 
 def remove_gas_generators(n: pypsa.Network) -> None:
-    """Drop all gas-fueled generators (OCGT, CCGT, and their -CCS variants) for the 100VRE decarbonization scenario."""
+    """Drop all gas-fueled generators (OCGT, CCGT, and their -CCS variants) for the 100Emission decarbonization scenario."""
     gas_carriers = [carrier for carrier in n.generators.carrier.unique() if carrier.split("-")[0] in ("OCGT", "CCGT")]
     gens = n.generators[n.generators.carrier.isin(gas_carriers)]
     if not gens.empty:
-        logger.info("100VRE decarbonization: removing %s gas generators (%s).", len(gens), sorted(gas_carriers))
+        logger.info("100Emission decarbonization: removing %s gas generators (%s).", len(gens), sorted(gas_carriers))
         n.mremove("Generator", gens.index)
 
 
@@ -1294,7 +1294,7 @@ if __name__ == "__main__":
     if snakemake.params.add_extendable_tes:
         attach_tes_storageunits(n, snakemake.input.sector_costs, bus_multipliers=bus_multipliers)
 
-    if snakemake.config.get("scenario", {}).get("decarbonization") == "100VRE":
+    if snakemake.config.get("scenario", {}).get("decarbonization") == "100Emission":
         remove_gas_generators(n)
 
     apply_gas_fuel_price(n, snakemake.params.gas_fuel_price)
