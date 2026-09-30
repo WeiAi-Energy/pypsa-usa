@@ -3,11 +3,10 @@ Representative-period selection: everything in one place.
 
 This module owns the whole representative-period story:
 
-* the tsam hierarchical clustering itself, run on a per-state feature frame
-  (capacity-weighted mean wind CF, capacity-weighted mean solar CF, AC demand -- one
-  column per state) computed straight from the raw ReEDS supply curves / CF tables and
-  the EER demand h5, alongside the three national aggregates (national load ranks the
-  extreme period; all three report the fit of the period weights);
+* the tsam hierarchical clustering itself, run on three national feature series -- the
+  ``p_nom_max``-weighted onshore wind capacity factor, the ``p_nom_max``-weighted solar
+  capacity factor and the AC demand -- computed straight from the raw ReEDS supply curves
+  / CF tables and the EER demand h5;
 * the snapshot definition it writes out (``snapshots.csv``, ``metadata.json``,
   ``profiles.png``) and the readers downstream rules use to consume it;
 * the diagnostic profile plots.
@@ -18,19 +17,15 @@ per-bus profile or network exists. ``build_renewable_profiles`` then builds only
 those hours, and every downstream rule attaches time series for those hours only,
 so the full 15-weather-year x 8760 h timeline is never materialised anywhere.
 
-Spatial resolution and column weights
--------------------------------------
-The wind/solar features are aggregated over **every** site in the ReEDS supply curve,
-grouped by the state the site sits in. A site's state comes from the county FIPS the
-interconnection tables already carry per ``sc_point_gid``, so no spatial join and no bus
-region is needed and this step still depends on nothing but static data files -- which
-matters, because it runs before any network exists. Demand needs no mapping at all: the
-EER h5 is published per state.
-
-Grouping is free on disk. ``grouped_available_generation`` already reads every site
-column of each row block, so the only change is the collapse at the end
-(``block @ W`` instead of ``block.dot(weights)``), and the national aggregate falls out
-as the row sum of the same pass.
+Clustering features and column weights
+--------------------------------------
+The wind and solar features are ``sum_i(capacity_i * cf_i(t)) / sum_i(capacity_i)`` over
+**every** site in the ReEDS supply curve. The supply-curve capacity summed per bus is
+exactly the ``p_nom_max`` that ``build_reeds_renewable_profiles`` writes, so each feature
+is the national capacity factor weighted by where the model can actually build. The load
+feature is the national AC demand, the sum of the EER per-state columns. None of this
+needs a bus region or any other spatial mapping, so the step depends on nothing but
+static data files -- which matters, because it runs before any network exists.
 
 Every column is compared on a per-unit-of-its-maximum scale (``x / max``). tsam always
 min-max normalizes each column internally, and ward only sees differences, so scaling a
@@ -40,25 +35,17 @@ column's ``weightDict`` entry by ``(max - min) / max`` turns tsam's min-max scal
 the range, so a load swing is no longer counted as if it spanned 0 to peak. With the
 build the model ends up with (onshore wind and solar nameplate each about national peak
 load), one GW of deviation then weighs about the same in all three families, where
-min-max normalization weighted a GW of load 3-4x a GW of wind or solar.
-
-On top of that scale, columns are weighted by maximum capacity potential -- supply-curve
-nameplate for wind and solar, mean AC demand for load -- so Rhode Island's wind profile
-does not pull as hard as Texas'. Note the **square root**: ``weightDict`` scales a column
-linearly but ``clusterMethod="hierarchical"`` is ward, which minimises *squared*
-Euclidean distance, so a column's pull on the clustering goes as ``weight**2``. Weights
-are ``sqrt(share)``, which makes the pull proportional to share and makes each feature
-family's weights satisfy ``sum(w**2) == 1`` before the max-normalization factor. The
-same shares weight the states when the period weights are refitted (see below).
+min-max normalization weighted a GW of load 3-4x a GW of wind or solar. Beyond that
+scale the three columns carry equal weight.
 
 The ``wind`` feature is onshore wind only; ``offwind`` / ``offwind_floating`` are left
 out of the clustering even when they are configured carriers. Offshore is 42% of
-national supply-curve nameplate and, when it was merged in, dominated the wind column of
-16 coastal states, so roughly half the wind weight rode on offshore shapes while the
-model builds almost nothing offshore. The selected periods then under-represented the
-onshore resource the capacity expansion actually responds to. Offshore profiles are
-still built downstream for whichever periods are selected; they just do not steer the
-selection.
+national supply-curve nameplate, so merging it in would put roughly half the wind
+feature on offshore shapes while the model builds almost nothing offshore, and the
+selected periods would under-represent the onshore resource the capacity expansion
+actually responds to. Offshore profiles are still built downstream for whichever periods
+are selected; they just do not steer the selection, and the wind-lull extreme is ranked
+on onshore wind.
 
 The older in-network "force one spring + one fall representative period" seasonal
 constraint is intentionally gone. Representative periods are real historical periods and
@@ -69,62 +56,63 @@ periods" and "Period weights".
 
 Representative periods
 ----------------------
-tsam only partitions the timeline into clusters; the member that represents each cluster
-is picked by ``match_period_means``: the period whose per-state means (onshore wind CF,
-solar CF, load -- relative to their timeline means and weighted by capacity share) are
-closest to its cluster's. tsam's own medoid -- the member with the smallest summed
-distance to the rest over every hour of every column -- is a multivariate median. Each
-state's daily wind is right-skewed and windy days are local, so the most central day is
-one with little wind anywhere, and the medoids missed the onshore wind mean by 8-13%
-(and overshot load by 3-4%) before any reweighting. Matching the period means instead
-roughly halves that gap and leaves the weight refit much less to correct. A frame
-without per-state columns falls back to tsam's medoid.
+tsam only partitions the timeline into clusters, on the full hourly profiles of the three
+features; the member that represents each cluster is picked by ``match_period_means``:
+the period whose national means (onshore wind CF, solar CF, load -- relative to their
+timeline means) are closest to its cluster's. Only the means are matched, not the
+intra-period shape: the shape is what tsam clustered on, so the members of a cluster
+already share one. tsam's own medoid -- the member with the smallest summed distance to
+the rest over every hour of every column -- is a multivariate median, and daily wind is
+right-skewed, so the most central day is a calm one and the medoids under-shoot the wind
+mean. A frame without weighted columns falls back to tsam's medoid.
 
 Extreme periods and weighting
 -----------------------------
-``include_extreme`` is a plain on/off switch. When it is true, one extreme period is
-requested: **demand max**, the period with the highest mean *national* AC demand. It
-stays national even though the clustering is per state: the peak-load block is a
-system-wide event. There are no dedicated wind-lull or solar-lull periods; calm and dark
-days enter only through the representative periods.
+``include_extreme`` is a plain on/off switch. When it is true, three extreme periods
+are requested -- one single-resource stress case per clustering feature:
 
-tsam's ``addMeanMax`` can only rank on columns of the frame it is handed, so the national
-load aggregate rides along *in* the clustering frame, at ``NATIONAL_COLUMN_WEIGHT`` (1e-6)
-in ``weightDict`` -- four orders below the smallest state weight -- so it is invisible to
-the clustering distance while remaining available to rank on. That is safe because tsam
-ranks extremes on the weighted, normalized profiles and a positive constant scale is
-order-preserving, so the down-weighted column picks exactly the period its raw
-counterpart would. If the load feature is missing or degenerate (flat over the whole
-timeline, so it carries no ranking signal), the extreme is dropped with a warning rather
-than failing the run.
+* **demand max**: the period with the highest mean national AC demand;
+* **wind min**: the period with the lowest mean ``p_nom_max``-weighted national onshore
+  wind capacity factor;
+* **solar min**: the period with the lowest mean ``p_nom_max``-weighted national solar
+  capacity factor.
 
-tsam adds the extreme period with ``extremePeriodMethod="append"``: its only member is its
-own source period, so it constrains the stress case without absorbing the periods around
-it. (tsam's ``new_cluster_center`` would hand it every period closer to it than to its
-own medoid, shifting the annual means.)
+Each is ranked on one raw feature, so the three are the three physical stress cases the
+system has to survive on their own terms -- the peak-load block, the wind lull and the
+solar lull -- rather than one blended metric that can only ever return whichever stress
+the year happens to be worst at. tsam's ``addMeanMax`` / ``addMeanMin`` rank on the
+weighted, normalized profiles, and a positive constant scale is order-preserving, so
+each picks exactly the period its raw series would. A feature that is missing -- no wind
+carrier configured, say -- or degenerate (flat over the whole timeline, so it carries no
+ranking signal) is dropped with a warning rather than failing the run.
+
+tsam adds each extreme period with ``extremePeriodMethod="append"``: its only member is
+its own source period, so it constrains the stress case without absorbing the periods
+around it. (tsam's ``new_cluster_center`` would hand it every period closer to it than to
+its own medoid; on onshore wind that let the wind lull absorb 15-40 days of a 365-day
+year and dragged the annual mean CF down by several percent.)
 
 Period weights
 --------------
-Weights start as the cluster membership counts, rescaled so ``objective`` sums to
-8760 h per planning horizon. Two adjustments follow (``finalize_period_weights``):
+The weights are the cluster membership counts, rescaled so ``objective`` sums to 8760 h
+per planning horizon (``finalize_period_weights``). One source period out of 15 weather
+years is worth well under an hour per snapshot, so every extreme snapshot is raised to
+``MIN_SNAPSHOT_WEIGHT_HOURS`` (1 h); the representative periods share the rest of the
+year in proportion to their counts.
 
-* **Extreme floor.** One source period out of 15 weather years is worth well under an
-  hour per snapshot, so the extreme snapshots are raised to ``MIN_SNAPSHOT_WEIGHT_HOURS``
-  (1 h) and then held fixed.
-* **Refit of the representative weights.** Representatives are real periods, not cluster
-  means, so the weighted average of the selected periods still misses the timeline mean
-  -- onshore wind by 5-7% with the counts alone. The representative weights are refitted
-  to the per-state feature means: a least-squares fit of the relative error of every
-  state column, each state weighted by its capacity share (``weight_dict ** 2``, so each
-  family counts equally), subject to the 8760 h total and to every snapshot keeping at
-  least ``MIN_SNAPSHOT_WEIGHT_HOURS``. Only the weights move; the periods do not.
+The weights are deliberately not refitted to the timeline means. With a handful of
+periods, a least-squares refit bought a closer mean by pushing whole clusters to the
+floor -- a 578-day cluster down to 1 h per snapshot -- and so traded away the
+distribution the clusters stand for. What is left of the mean mismatch is what
+``match_period_means`` leaves; it is logged.
 
 Because both kinds of period come out of one tsam run over one period partition,
 extreme and representative periods necessarily share a length: the single
 ``period_length`` config key (see ``get_period_hours``). Note also that tsam
-*drops* a requested extreme period that is already a cluster center rather than
-falling back to the next-most-extreme candidate, so a run can legitimately return
-``number`` periods instead of ``number + 1``; ``validate_period_counts`` warns about it.
+*drops* a requested extreme period that is already a cluster center -- or that
+another selector has already claimed -- rather than falling back to the
+next-most-extreme candidate, so a run can legitimately return fewer periods than
+``number + 3``; ``validate_period_counts`` warns about it.
 
 Timezone
 --------
@@ -154,8 +142,7 @@ logger = logging.getLogger(__name__)
 
 # Renewable carriers aggregated into each clustering feature. Carriers in the same
 # group are combined by capacity into one mean-capacity-factor series. Offshore wind is
-# deliberately absent: it would dominate the wind column of coastal states (see the
-# module docstring).
+# deliberately absent: it would dominate the wind feature (see the module docstring).
 WIND_CARRIERS = ("onwind",)
 SOLAR_CARRIERS = ("solar",)
 REEDS_FEATURE_GROUPS = {"wind": WIND_CARRIERS, "solar": SOLAR_CARRIERS}
@@ -164,30 +151,23 @@ WIND_FEATURE = ("Generator", "p_max_pu", "wind")
 SOLAR_FEATURE = ("Generator", "p_max_pu", "solar")
 LOAD_FEATURE = ("Load", "p_set", "ac_load")
 
-# Per-state columns reuse the national tuples with the state code appended to the last
-# level, so the frame keeps one flat 3-level MultiIndex that tsam can key a weightDict
-# and addMeanMax/addMeanMin off.
+# The three clustering columns, keyed by feature family. Flat 3-level tuples, so tsam can
+# key a weightDict and addMeanMax/addMeanMin off them.
 _NATIONAL_FEATURES = {"wind": WIND_FEATURE, "solar": SOLAR_FEATURE, "load": LOAD_FEATURE}
 
-
-def state_feature(kind, state):
-    """Return the frame column for one state's ``kind`` ("wind"/"solar"/"load") feature."""
-    prefix = _NATIONAL_FEATURES[kind]
-    return (*prefix[:-1], f"{prefix[-1]}_{state}")
-
-
-# tsam clips any weightDict entry below this and prints a notice, so the national
-# ranking columns are pinned exactly at the floor rather than below it.
-NATIONAL_COLUMN_WEIGHT = 1e-6
-
-# Every snapshot -- representative or extreme -- keeps at least this many hours of the
-# 8760 h year once the period weights are finalized (see "Period weights").
+# Every extreme snapshot keeps at least this many hours of the 8760 h year once the
+# period weights are finalized (see "Period weights").
 MIN_SNAPSHOT_WEIGHT_HOURS = 1.0
 
-# The extreme period: the peak-load block, ranked on the period mean of the raw national
-# load. ``direction`` picks the tsam argument the feature is passed to -- "max" ->
-# ``addMeanMax``, "min" -> ``addMeanMin``.
-EXTREME_SELECTORS = ({"name": "demand_max", "feature": LOAD_FEATURE, "direction": "max"},)
+# The three extreme periods, one per clustering feature: the peak-load block, the
+# p_nom_max-weighted onshore wind lull and the p_nom_max-weighted solar lull. Each is
+# ranked on the period mean of one raw national feature. ``direction`` picks the tsam
+# argument the feature is passed to -- "max" -> ``addMeanMax``, "min" -> ``addMeanMin``.
+EXTREME_SELECTORS = (
+    {"name": "demand_max", "feature": LOAD_FEATURE, "direction": "max"},
+    {"name": "wind_min", "feature": WIND_FEATURE, "direction": "min"},
+    {"name": "solar_min", "feature": SOLAR_FEATURE, "direction": "min"},
+)
 
 
 # Superseded by the single ``period_length``; a config still carrying one of these
@@ -226,9 +206,9 @@ def get_include_extreme(representative_periods):
     Return the boolean ``representative_periods.include_extreme`` switch.
 
     The key used to take a *configurable* list of per-feature selectors
-    (``demand_max``, ``solar_min``, ...). That is gone -- ``EXTREME_SELECTORS`` is now
-    fixed -- so the key is a plain on/off switch and a leftover list is rejected rather
-    than silently reinterpreted.
+    (``demand_max``, ``solar_min``, ...). That is gone -- the three selectors in
+    ``EXTREME_SELECTORS`` are now fixed -- so the key is a plain on/off switch and a
+    leftover list is rejected rather than silently reinterpreted.
     """
     include_extreme = representative_periods.get("include_extreme", False)
     if include_extreme is None:
@@ -237,8 +217,9 @@ def get_include_extreme(representative_periods):
         return include_extreme
     raise ValueError(
         "representative_periods.include_extreme must be true or false; configurable per-feature "
-        f"selector lists are no longer supported (got {include_extreme!r}). true selects the fixed "
-        "extreme: the period with the highest mean demand.",
+        f"selector lists are no longer supported (got {include_extreme!r}). true selects the three "
+        "fixed extremes: the period with the highest mean demand, the one with the lowest mean onshore "
+        "wind capacity factor, and the one with the lowest mean solar capacity factor.",
     )
 
 
@@ -252,10 +233,10 @@ def resolve_extreme_selectors(feature_t):
     representative-period clustering is bit-for-bit the same whether extremes are
     requested or not.
 
-    A selector whose feature is missing from the frame is dropped with a warning rather
-    than failing the run, and so is one whose feature is degenerate: a flat series has no
-    highest or lowest period, so whichever block tsam's ``idxmax``/``idxmin`` happens to
-    land on carries no meaning.
+    A selector whose feature is missing from the frame -- no wind carrier configured,
+    say -- is dropped with a warning rather than failing the run, and so is one whose
+    feature is degenerate: a flat series has no highest or lowest period, so whichever
+    block tsam's ``idxmax``/``idxmin`` happens to land on carries no meaning.
 
     Parameters
     ----------
@@ -551,19 +532,13 @@ def max_normalized_weights(weight_dict, frame):
 
     tsam min-max normalizes each column to ``(x - min) / (max - min)`` and ward only sees
     differences, so multiplying a column's weight by ``(max - min) / max`` makes the
-    distance exactly the one of ``x / max``. The national ranking columns keep
-    ``NATIONAL_COLUMN_WEIGHT``: they must stay invisible to the distance, and any
-    positive scale leaves their extreme ranking unchanged. A column whose maximum is not
-    positive carries no signal and gets weight 0 (tsam lifts it to its own floor).
-    Columns the frame does not carry are dropped -- tsam raises on an unknown key.
+    distance exactly the one of ``x / max``. A column whose maximum is not positive
+    carries no signal and gets weight 0 (tsam lifts it to its own floor). Columns the
+    frame does not carry are dropped -- tsam raises on an unknown key.
     """
-    national = set(_NATIONAL_FEATURES.values())
     weights = {}
     for column, weight in weight_dict.items():
         if column not in frame.columns:
-            continue
-        if tuple(column) in national:
-            weights[column] = float(weight)
             continue
         peak = float(frame[column].max())
         span = peak - float(frame[column].min())
@@ -571,15 +546,14 @@ def max_normalized_weights(weight_dict, frame):
     return weights
 
 
-def _state_column_shares(weight_dict, columns):
-    """Capacity share (``weight ** 2``) of every per-state column of ``weight_dict`` in ``columns``."""
-    national = set(_NATIONAL_FEATURES.values())
+def _match_weights(weight_dict, columns):
+    """Weight of every clustering column in ``columns`` in the representative match.
+
+    ``weight ** 2``: ward minimises squared distance, so that is the column's pull on the
+    clustering, and the match weighs the columns the same way.
+    """
     return pd.Series(
-        {
-            column: float(weight) ** 2
-            for column, weight in (weight_dict or {}).items()
-            if tuple(column) not in national and column in columns
-        },
+        {column: float(weight) ** 2 for column, weight in (weight_dict or {}).items() if column in columns},
         dtype="float64",
     )
 
@@ -631,143 +605,37 @@ def match_period_means(period_means, cluster_order, target_means, column_weights
     return representatives
 
 
-def refit_representative_weights(
-    period_means,
-    target_means,
-    column_weights,
-    steps,
-    fixed_hours,
-    initial_hours,
-    total_hours=8760.0,
-    min_hours=MIN_SNAPSHOT_WEIGHT_HOURS,
-):
-    """
-    Refit the free period weights so the weighted period means match the target means.
-
-    Minimises ``sum_c column_weights[c] * (pred_c / target_c - 1) ** 2`` with
-    ``pred_c = sum_p steps_p * hours_p * period_means[p, c] / total_hours``, subject to
-    ``sum_p steps_p * hours_p == total_hours`` and ``hours_p >= min_hours`` for every free
-    period; periods with a finite ``fixed_hours`` entry keep it. Columns with a
-    non-positive target or weight are ignored; when none is left, the free weights are
-    moved as little as possible from ``initial_hours`` (relative squared change) instead.
-
-    Parameters
-    ----------
-    period_means : pandas.DataFrame
-        Mean of every column over each period (periods x columns).
-    target_means : pandas.Series
-        Mean of every column over the whole source timeline.
-    column_weights : pandas.Series
-        Non-negative weight of every column's relative error.
-    steps : array-like of int
-        Snapshots per period.
-    fixed_hours : array-like of float
-        Hours per snapshot of a fixed period, NaN for a free one.
-    initial_hours : array-like of float
-        Starting hours per snapshot (the cluster counts, rescaled to ``total_hours``).
-
-    Returns
-    -------
-    numpy.ndarray
-        Hours per snapshot of every period.
-    """
-    from scipy.optimize import minimize
-
-    steps = np.asarray(steps, dtype="float64")
-    fixed_hours = np.asarray(fixed_hours, dtype="float64")
-    initial_hours = np.asarray(initial_hours, dtype="float64")
-    free = np.isnan(fixed_hours)
-    hours = np.where(free, 0.0, fixed_hours)
-    if not free.any():
-        return hours
-
-    # Work in shares of the year: y_p = steps_p * hours_p / total_hours.
-    budget = 1.0 - float(np.sum(steps[~free] * fixed_hours[~free])) / total_hours
-    lower = steps[free] * min_hours / total_hours
-    if lower.sum() > budget * (1.0 + 1e-9):
-        raise ValueError(
-            f"Cannot give every snapshot {min_hours:g} h: the fixed periods and the floor of the "
-            f"{int(free.sum())} free periods need more than {total_hours:g} h.",
-        )
-    # The counts rescaled to the free budget; lifted onto the floor only where they fall short.
-    proportional = steps[free] * initial_hours[free]
-    proportional = budget * proportional / proportional.sum()
-    if (proportional >= lower).all():
-        start = proportional
-    else:
-        start = np.maximum(proportional - lower, 1e-12)
-        start = lower + (budget - lower.sum()) * start / start.sum()
-
-    target = pd.Series(target_means, dtype="float64")
-    weights = pd.Series(column_weights, dtype="float64").reindex(period_means.columns).fillna(0.0)
-    columns = [
-        column for column in period_means.columns
-        if weights[column] > 0 and np.isfinite(target.get(column, np.nan)) and target[column] > 0
-    ]
-    if columns:
-        scale = np.sqrt(weights[columns].to_numpy())[:, None]
-        ratio = (period_means[columns].to_numpy() / target[columns].to_numpy()).T * scale
-        matrix = ratio[:, free]
-        offset = scale[:, 0] - ratio[:, ~free] @ (steps[~free] * fixed_hours[~free] / total_hours)
-
-        def objective(y):
-            residual = matrix @ y - offset
-            return float(residual @ residual), 2.0 * matrix.T @ residual
-    else:
-        reference = proportional
-
-        def objective(y):
-            change = (y - reference) / reference
-            return float(change @ change), 2.0 * change / reference
-
-    result = minimize(
-        objective,
-        start,
-        jac=True,
-        bounds=list(zip(lower, [None] * len(lower))),
-        constraints=[{"type": "eq", "fun": lambda y: y.sum() - budget, "jac": lambda y: np.ones_like(y)}],
-        method="SLSQP",
-        options={"maxiter": 2000, "ftol": 1e-14},
-    )
-    if not result.success:
-        raise RuntimeError(f"Refitting the representative period weights failed: {result.message}")
-    hours[free] = np.maximum(result.x, lower) * total_hours / steps[free]
-    return hours
-
-
-def finalize_period_weights(period_entries, period_means, target_means, weight_dict=None):
+def finalize_period_weights(period_entries, period_means, target_means):
     """
     Turn cluster-count weights into the final hours per snapshot (see "Period weights").
 
     The counts are rescaled to 8760 h, every extreme snapshot is raised to
-    ``MIN_SNAPSHOT_WEIGHT_HOURS`` and held there, and the representative weights are
-    refitted to ``target_means`` over the per-state columns of ``weight_dict`` (each
-    weighted by ``weight ** 2``, its capacity share), keeping every snapshot at the same
-    floor. ``period_means`` holds each entry's feature means, row for row. Returns new
-    entries whose ``weightings`` columns all carry the final hours.
+    ``MIN_SNAPSHOT_WEIGHT_HOURS``, and the representative periods share the remaining
+    hours in proportion to their counts. ``period_means`` holds each entry's feature
+    means, row for row; it and ``target_means`` only feed the logged mean error. Returns
+    new entries whose ``weightings`` columns all carry the final hours.
     """
     steps = np.array([int(entry["steps"]) for entry in period_entries], dtype="float64")
     counts = np.array([float(entry["weightings"]["objective"].mean()) for entry in period_entries])
-    initial_hours = counts * 8760.0 / float(np.sum(steps * counts))
+    hours = counts * 8760.0 / float(np.sum(steps * counts))
     is_extreme = np.array([entry["kind"] == "extreme" for entry in period_entries])
-    fixed_hours = np.where(is_extreme, np.maximum(initial_hours, MIN_SNAPSHOT_WEIGHT_HOURS), np.nan)
 
-    shares = _state_column_shares(weight_dict, period_means.columns)
-    state_columns = list(shares.index)
-    hours = refit_representative_weights(
-        period_means[state_columns], target_means, shares, steps, fixed_hours, initial_hours,
-    )
-
-    national_columns = [column for column in _NATIONAL_FEATURES.values() if column in period_means.columns]
-    for label, share in (("cluster counts", steps * initial_hours), ("refitted", steps * hours)):
-        errors = (period_means[national_columns].T @ share / 8760.0) / target_means[national_columns] - 1.0
-        logger.info(
-            "National mean error with %s weights: %s.",
-            label,
-            ", ".join(f"{column[-1]} {100 * error:+.2f}%" for column, error in errors.items()) or "n/a",
+    hours[is_extreme] = np.maximum(hours[is_extreme], MIN_SNAPSHOT_WEIGHT_HOURS)
+    budget = 8760.0 - float(np.sum(steps[is_extreme] * hours[is_extreme]))
+    representative_share = float(np.sum(steps[~is_extreme] * hours[~is_extreme]))
+    if budget <= 0 or representative_share <= 0:
+        raise ValueError(
+            f"The extreme periods at {MIN_SNAPSHOT_WEIGHT_HOURS:g} h per snapshot leave no hours of the "
+            "8760 h year for the representative periods.",
         )
-    if not state_columns:
-        logger.info("No per-state columns to refit on; representative weights only honour the floor.")
+    hours[~is_extreme] *= budget / representative_share
+
+    columns = [column for column in _NATIONAL_FEATURES.values() if column in period_means.columns]
+    errors = (period_means[columns].T @ (steps * hours) / 8760.0) / target_means[columns] - 1.0
+    logger.info(
+        "National mean error of the period weights: %s.",
+        ", ".join(f"{column[-1]} {100 * error:+.2f}%" for column, error in errors.items()) or "n/a",
+    )
 
     finalized = []
     for entry, entry_hours in zip(period_entries, hours):
@@ -785,27 +653,25 @@ def select_period_entries(feature_t_full, source_index_full, representative_peri
 
     One tsam run partitions the timeline: hierarchical clustering on the max-normalized
     features (``max_normalized_weights``) forms ``number`` clusters, and -- when
-    ``include_extreme`` is true -- the peak-demand extreme period is appended with only its
-    own period as member. Each
-    cluster is represented by the real period whose per-state means match the cluster's
+    ``include_extreme`` is true -- the three single-feature extreme periods (peak demand,
+    wind lull, solar lull) are appended with only their own period as member. Each
+    cluster is represented by the real period whose national means match the cluster's
     best (``match_period_means``), and ``finalize_period_weights`` turns the cluster
     membership counts into the final hours per snapshot (see the module docstring).
 
     Parameters
     ----------
     feature_t_full : pandas.DataFrame
-        Clustering features (per-state weighted wind/solar CF and AC load, plus the
-        three national aggregates -- load ranks the extreme), indexed by
-        ``source_index_full``.
+        Clustering features (national ``p_nom_max``-weighted onshore wind and solar CF and
+        national AC load), indexed by ``source_index_full``.
     source_index_full : pandas.DatetimeIndex
         Full source timeline (e.g. concatenated 15 weather years).
     representative_periods_cfg : dict
         The ``clustering.temporal.representative_periods`` config block.
     weight_dict : dict[tuple, float], optional
-        Per-column ``sqrt(capacity share)`` from ``build_feature_frame``. It weights the
-        clustering (after ``max_normalized_weights``) and, as ``weight ** 2``, the state
-        columns of the representative match and of the weight refit; entries naming a
-        column the frame does not carry are dropped.
+        Per-column weight from ``build_feature_frame``. It weights the clustering (after
+        ``max_normalized_weights``) and, as ``weight ** 2``, the representative match;
+        entries naming a column the frame does not carry are dropped.
 
     Returns
     -------
@@ -826,7 +692,7 @@ def select_period_entries(feature_t_full, source_index_full, representative_peri
 
     if feature_t_full.empty:
         raise ValueError(
-            "No valid weighted wind/solar or total AC load features found for representative period clustering.",
+            "No wind/solar capacity factor or AC load features found for representative period clustering.",
         )
     if len(feature_t_full.index) < 2:
         raise ValueError("Not enough snapshots to cluster representative periods.")
@@ -895,10 +761,10 @@ def select_period_entries(feature_t_full, source_index_full, representative_peri
         candidate_means,
         agg.clusterOrder,
         target_means,
-        _state_column_shares(weight_dict, feature_cluster.columns),
+        _match_weights(weight_dict, feature_cluster.columns),
     )
     if representatives is None:
-        logger.info("No per-state columns to match period means on; representing clusters by tsam's medoids.")
+        logger.info("No weighted columns to match period means on; representing clusters by tsam's medoids.")
     source_periods = _build_representative_period_mapping(agg, period_ids, representatives)
     extreme_period_ids = _get_extreme_period_ids(agg, period_ids)
 
@@ -928,9 +794,7 @@ def select_period_entries(feature_t_full, source_index_full, representative_peri
         period_means.append(feature_t_full.iloc[positions].mean())
 
     # The target is the mean over the same candidate periods the counts partition.
-    period_entries = finalize_period_weights(
-        period_entries, pd.DataFrame(period_means), target_means, weight_dict,
-    )
+    period_entries = finalize_period_weights(period_entries, pd.DataFrame(period_means), target_means)
 
     logger.info(
         "Clustered %s source periods into %s periods (%s extreme): %s.",
@@ -1001,94 +865,19 @@ def select_representative_snapshots(
 
 
 # --------------------------------------------------------------------------- #
-# Per-state clustering features, built straight from the raw sources.
+# National clustering features, built straight from the raw sources.
 # --------------------------------------------------------------------------- #
 
 
-def read_site_states(interconnection_dir, counties_path, interconnection_file):
+def read_reeds_national_capacity_factor(carriers, reeds_vre_dir, weather_years):
     """
-    Map every ``sc_point_gid`` in one interconnection table onto its USPS state code.
+    Build the national wind/solar clustering features from the raw ReEDS files.
 
-    The interconnection tables already carry a 5-digit county FIPS per site -- it is
-    what ``build_reeds_renewable_profiles.load_sites`` joins on -- so the state comes
-    out of a plain lookup rather than a spatial join against bus regions that do not
-    exist yet at this point in the workflow. It also gives offshore sites a state,
-    which a point-in-polygon join against onshore regions cannot.
-
-    Returns
-    -------
-    pandas.Series
-        USPS state code indexed by ``sc_point_gid``; sites whose FIPS matches no
-        county are absent, and the caller reports their capacity rather than
-        silently folding them into another state.
-    """
-    import geopandas as gpd
-    import tables
-
-    # Attributes only: the geometry is irrelevant here and parsing 3,234 county
-    # polygons to read two columns would be pure waste.
-    counties = gpd.read_file(counties_path, columns=["GEOID", "STUSPS"], ignore_geometry=True)
-    fips_to_state = pd.Series(counties.STUSPS.to_numpy(), index=counties.GEOID.astype(str))
-    fips_to_state = fips_to_state[~fips_to_state.index.duplicated()]
-
-    with tables.open_file(f"{interconnection_dir}/{interconnection_file}", "r") as h5:
-        gids = h5.get_node("/data/sc_point_gid")[:]
-        fips = [value.decode() if isinstance(value, bytes) else str(value) for value in h5.get_node("/data/FIPS")[:]]
-    site_fips = pd.Series(fips, index=pd.Index(gids, name="sc_point_gid"))
-    site_fips = site_fips.groupby(level=0).first()
-    return site_fips.map(fips_to_state).dropna()
-
-
-def build_clustering_weights(capacity_by_state):
-    """
-    Turn one feature family's per-state capacity potential into tsam column weights.
-
-    ``weightDict`` scales a column linearly, but ``clusterMethod="hierarchical"`` is
-    ward, which minimises *squared* Euclidean distance: a column's pull on the
-    clustering goes as ``weight**2``. The weight is therefore ``sqrt(share)``, which
-    makes the pull proportional to the state's share of the family's national total
-    and makes ``sum(w**2)`` come out at 1 -- so every family contributes the same
-    total pull no matter how many states it spans, matching what the three unweighted
-    national columns used to do.
-
-    Parameters
-    ----------
-    capacity_by_state : pandas.Series
-        Maximum capacity potential per state: supply-curve nameplate for wind and
-        solar, mean AC demand for load. Non-positive and missing entries drop out.
-
-    Returns
-    -------
-    pandas.Series
-        ``sqrt(share)`` indexed by state code; empty when nothing positive is left.
-    """
-    capacity = pd.Series(capacity_by_state, dtype="float64").dropna()
-    capacity = capacity[capacity > 0]
-    if capacity.empty:
-        return pd.Series(dtype="float64")
-    return np.sqrt(capacity / capacity.sum())
-
-
-def read_reeds_state_capacity_factor(
-    carriers,
-    reeds_vre_dir,
-    interconnection_dir,
-    counties_path,
-    weather_years,
-):
-    """
-    Build the per-state wind/solar clustering features from the raw ReEDS files.
-
-    The feature is the capacity-weighted mean capacity factor,
+    The feature is the ``p_nom_max``-weighted mean capacity factor,
     ``sum_i(capacity_i * cf_i(t)) / sum_i(capacity_i)``, taken over every site in the
-    ReEDS supply curve and grouped by the state the site sits in. Selection runs before
-    ``build_renewable_profiles``, so there are no per-bus profile files to read yet, and
-    this needs nothing but the supply curve, the CF table, and the county FIPS the
-    interconnection table already carries.
-
-    The national aggregate the extreme periods rank on is the row sum of the same
-    grouped numerator over the summed denominator, so it costs no extra pass over the
-    multi-gigabyte CF tables and stays exactly consistent with the state columns.
+    ReEDS supply curve. Selection runs before ``build_renewable_profiles``, so there are
+    no per-bus profile files to read yet, and this needs nothing but the supply curve and
+    the CF table.
 
     Carriers in the same feature group are combined by capacity, so numerator and
     denominator accumulate separately and are divided once at the end. Carriers
@@ -1101,19 +890,16 @@ def read_reeds_state_capacity_factor(
 
     Returns
     -------
-    dict[str, dict | None]
-        ``{"wind": ..., "solar": ...}``; ``None`` for a group with no configured
-        carriers, else ``{"states": DataFrame, "national": Series, "capacity":
-        Series}`` -- mean capacity factor per state over the full weather-year
-        timeline, the national mean, and the supply-curve nameplate per state that
-        ``build_clustering_weights`` turns into column weights.
+    dict[str, pandas.Series | None]
+        ``{"wind": ..., "solar": ...}``: the national mean capacity factor over the full
+        weather-year timeline, or ``None`` for a group with no configured carriers.
     """
     # Imported lazily: build_reeds_renewable_profiles imports this module for
     # read_representative_snapshots, so a top-level import would be circular.
     from build_reeds_renewable_profiles import (
         REEDS_TECH,
         SOLAR_INVERTER_LOADING_RATIO,
-        grouped_available_generation,
+        national_available_generation,
         read_cf_time_indexes,
     )
 
@@ -1121,11 +907,10 @@ def read_reeds_state_capacity_factor(
         return np.clip(block * SOLAR_INVERTER_LOADING_RATIO, None, 1.0)
 
     carriers = set(carriers)
-    site_state_cache = {}
     profiles = {}
     for group, group_carriers in REEDS_FEATURE_GROUPS.items():
         numerator = None
-        capacity_by_state = None
+        total_capacity = 0.0
         seen_supply_curves = set()
         for carrier in group_carriers:
             if carrier not in carriers or carrier not in REEDS_TECH:
@@ -1147,39 +932,17 @@ def read_reeds_state_capacity_factor(
                 logger.warning("No positive %s site capacity in %s. Skipping it.", carrier, cfg["sc"])
                 continue
 
-            if cfg["interconnection"] not in site_state_cache:
-                site_state_cache[cfg["interconnection"]] = read_site_states(
-                    interconnection_dir, counties_path, cfg["interconnection"],
-                )
-            site_states = capacities.index.to_series().map(site_state_cache[cfg["interconnection"]])
-            unassigned = float(capacities[site_states.isna().to_numpy()].sum())
-            if unassigned > 0:
-                logger.warning(
-                    "%.0f MW of %s nameplate (%.2f%%) sits at sites whose county FIPS matches no "
-                    "state and is excluded from the clustering features.",
-                    unassigned,
-                    carrier,
-                    100 * unassigned / float(capacities.sum()),
-                )
-            carrier_capacity = capacities.groupby(site_states.to_numpy()).sum()
-            states = sorted(carrier_capacity.index)
-            if not states:
-                logger.warning("No %s site could be placed in a state. Skipping it.", carrier)
-                continue
-
             transform = solar_transform if carrier in SOLAR_CARRIERS else None
             cf_path = f"{reeds_vre_dir}/{cfg['cf']}"
             # One open for every weather year: these CF tables are multi-gigabyte.
             cf_time_indexes = read_cf_time_indexes(cf_path, weather_years)
             parts = []
             for weather_year in weather_years:
-                values = grouped_available_generation(
+                values = national_available_generation(
                     cf_path,
                     capacities.index.tolist(),
                     capacities,
                     int(weather_year),
-                    groups=site_states.to_numpy(),
-                    group_labels=states,
                     transform=transform,
                 )
                 index = cf_time_indexes[int(weather_year)]
@@ -1188,119 +951,94 @@ def read_reeds_state_capacity_factor(
                         f"ReEDS {carrier} {weather_year} returned {len(values)} hours; "
                         f"expected {len(index)}.",
                     )
-                values.index = index
-                parts.append(values)
+                parts.append(pd.Series(values, index=index))
 
-            frame = pd.concat(parts)
+            series = pd.concat(parts)
+            capacity = float(capacities.sum())
             logger.info(
-                "Aggregated %s ReEDS %s sites across %s states (%.0f MW nameplate); mean CF %.4f.",
+                "Aggregated %s ReEDS %s sites (%.0f MW nameplate); mean CF %.4f.",
                 len(capacities),
                 carrier,
-                len(states),
-                float(carrier_capacity.sum()),
-                float(frame.to_numpy().sum() / (len(frame) * float(carrier_capacity.sum()))),
+                capacity,
+                float(series.mean() / capacity),
             )
             if numerator is None:
-                numerator, capacity_by_state = frame, carrier_capacity
-            elif not frame.index.equals(numerator.index):
+                numerator = series
+            elif not series.index.equals(numerator.index):
                 raise ValueError(
                     f"Carriers contributing to the '{group}' feature do not share an identical "
                     "time index; all must be built on the same weather-year calendar.",
                 )
             else:
                 # Several carriers in one group: numerator and denominator both
-                # accumulate per state, so the division at the end is the combined
+                # accumulate, so the division at the end is the combined
                 # capacity-weighted mean, not a mean of means.
-                numerator = numerator.add(frame, fill_value=0.0)
-                capacity_by_state = capacity_by_state.add(carrier_capacity, fill_value=0.0)
+                numerator = numerator + series
+            total_capacity += capacity
 
-        if numerator is None or float(capacity_by_state.sum()) <= 0:
+        if numerator is None or total_capacity <= 0:
             profiles[group] = None
             continue
 
-        capacity_by_state = capacity_by_state.reindex(numerator.columns).fillna(0.0)
-        state_cf = numerator.divide(capacity_by_state.replace(0.0, np.nan), axis="columns")
-        national_cf = numerator.sum(axis="columns") / float(capacity_by_state.sum())
-        profiles[group] = {
-            "states": state_cf,
-            "national": national_cf,
-            "capacity": capacity_by_state,
-        }
+        profiles[group] = numerator / total_capacity
         logger.info(
-            "Combined %s feature: %s state columns, national mean CF %.4f over %s hours "
-            "(%.0f MW nameplate).",
+            "Combined %s feature: national mean CF %.4f over %s hours (%.0f MW nameplate).",
             group,
-            state_cf.shape[1],
-            float(national_cf.mean()),
-            len(national_cf),
-            float(capacity_by_state.sum()),
+            float(profiles[group].mean()),
+            len(profiles[group]),
+            total_capacity,
         )
     return profiles
 
 
-def build_feature_frame(carrier_profiles, state_demand):
+def build_feature_frame(capacity_factors, national_demand):
     """
     Assemble the clustering feature frame and its tsam column weights.
 
-    The frame carries one column per state and feature family -- wind, solar, AC
-    demand -- plus the three national aggregates (load ranks the extreme; all three report
-    the fit of the period weights). State
-    columns are weighted by ``sqrt(share)`` of maximum capacity potential; the national
-    columns are pinned at ``NATIONAL_COLUMN_WEIGHT`` so they cannot pull on the
-    clustering (see the module docstring on why the square root, and why the national
-    columns have to be in the frame at all).
+    The frame carries one column per feature family -- national ``p_nom_max``-weighted
+    onshore wind CF, solar CF and AC demand -- restricted to the UTC hours every feature
+    shares. The three columns weigh equally; ``max_normalized_weights`` then puts them on
+    a per-unit-of-maximum scale (see the module docstring).
 
     Parameters
     ----------
-    carrier_profiles : dict[str, dict | None]
-        ``{"wind": ..., "solar": ...}`` from ``read_reeds_state_capacity_factor``;
-        each value holds ``"states"``, ``"national"`` and ``"capacity"``.
-    state_demand : pandas.DataFrame
-        AC demand per state for the planning horizon, indexed by actual UTC source
-        timestamps. Build it with ``read_state_demand``.
+    capacity_factors : dict[str, pandas.Series | None]
+        ``{"wind": ..., "solar": ...}`` from ``read_reeds_national_capacity_factor``.
+    national_demand : pandas.Series | None
+        National AC demand for the planning horizon, indexed by actual UTC source
+        timestamps. Build it with ``read_national_demand``.
 
     Returns
     -------
     tuple[pandas.DataFrame, dict[str, pandas.Series | None], dict[tuple, float]]
         The feature frame, the national profiles keyed ``"wind"`` / ``"solar"`` /
-        ``"load"`` that the diagnostic plots and the extreme selectors reuse, and the
-        tsam ``weightDict``.
+        ``"load"`` that the diagnostic plots reuse, and the tsam ``weightDict``.
     """
-    state_frames, national_profiles, capacity_potential = {}, {}, {}
-    for name in ("wind", "solar"):
-        group = carrier_profiles.get(name)
-        if not group:
-            national_profiles[name] = None
-            continue
-        state_frames[name] = group["states"]
-        national_profiles[name] = group["national"]
-        capacity_potential[name] = group["capacity"]
-
-    national_profiles["load"] = None
-    if state_demand is not None and len(state_demand.columns) and len(state_demand):
-        demand = state_demand.apply(pd.to_numeric, errors="coerce").astype("float64")
+    profiles = {name: capacity_factors.get(name) for name in ("wind", "solar")}
+    profiles["load"] = None
+    if national_demand is not None and len(national_demand):
+        demand = pd.to_numeric(pd.Series(national_demand), errors="coerce").astype("float64")
         demand.index = pd.DatetimeIndex(demand.index)
-        state_frames["load"] = demand
-        national_profiles["load"] = demand.sum(axis="columns")
-        # Mean AC demand is the load-side analogue of nameplate potential: the state's
-        # standing share of the system, not the one hour it happens to peak in.
-        capacity_potential["load"] = demand.mean(axis="rows")
+        profiles["load"] = demand
+
+    available = {name: profile for name, profile in profiles.items() if profile is not None and len(profile)}
+    if not available:
+        raise ValueError(
+            "No wind/solar generation or AC demand available for representative-period clustering.",
+        )
 
     # EER is published in fixed CST and VRE in UTC.  Both omit Dec. 31 in leap
     # years, so row counts cannot establish physical alignment.  Use only exact
     # timestamp overlap, which also makes any unpaired boundary hours explicit.
-    if not state_frames:
-        raise ValueError(
-            "No wind/solar generation or AC demand available for representative-period clustering.",
-        )
     common_index = None
-    for frame in state_frames.values():
-        common_index = frame.index if common_index is None else common_index.intersection(frame.index)
+    for profile in available.values():
+        index = pd.DatetimeIndex(profile.index)
+        common_index = index if common_index is None else common_index.intersection(index)
     common_index = pd.DatetimeIndex(common_index).sort_values()
     if common_index.empty:
         raise ValueError("Demand and renewable profiles have no shared UTC timestamps.")
-    for name, frame in state_frames.items():
-        excluded = len(frame.index.difference(common_index))
+    for name, profile in available.items():
+        excluded = len(pd.DatetimeIndex(profile.index).difference(common_index))
         if excluded:
             logger.info(
                 "Excluding %s %s source hours without a physical UTC match in every clustering feature.",
@@ -1308,36 +1046,13 @@ def build_feature_frame(carrier_profiles, state_demand):
                 name,
             )
 
-    feature_map, weight_dict = {}, {}
-    for name, frame in state_frames.items():
-        weights = build_clustering_weights(capacity_potential[name])
-        for state in frame.columns:
-            if state not in weights.index:
-                logger.info(
-                    "Dropping the %s %s clustering column: no positive capacity potential.",
-                    state,
-                    name,
-                )
-                continue
-            column = state_feature(name, state)
-            feature_map[column] = frame[state].reindex(common_index)
-            weight_dict[column] = float(weights[state])
-
-    # The national aggregates ride along for the extreme selector to rank on and for the
-    # weight-fit diagnostics; NATIONAL_COLUMN_WEIGHT keeps them out of the clustering distance.
-    for name, profile in national_profiles.items():
-        if profile is None:
-            continue
-        column = _NATIONAL_FEATURES[name]
-        feature_map[column] = profile.reindex(common_index)
-        weight_dict[column] = NATIONAL_COLUMN_WEIGHT
-
-    features = pd.DataFrame(feature_map, index=common_index)
+    features = pd.DataFrame(
+        {_NATIONAL_FEATURES[name]: profile.reindex(common_index) for name, profile in available.items()},
+        index=common_index,
+    )
     features.columns = pd.MultiIndex.from_tuples(features.columns)
     features = features.replace([np.inf, -np.inf], np.nan)
 
-    # A column that never materialised is dropped, but loudly: at three national
-    # columns this was a no-op, at ~145 it silently decides what gets clustered.
     incomplete = features.columns[features.isna().any()]
     if len(incomplete):
         logger.warning(
@@ -1346,34 +1061,16 @@ def build_feature_frame(carrier_profiles, state_demand):
             ", ".join(str(column[-1]) for column in incomplete),
         )
         features = features.drop(columns=incomplete)
-    weight_dict = {column: weight for column, weight in weight_dict.items() if column in features.columns}
     if features.empty or not len(features.columns):
         raise ValueError("No clustering feature survived the shared-timestamp and completeness checks.")
 
-    state_columns = [column for column in features.columns if tuple(column) not in _NATIONAL_FEATURES.values()]
+    weight_dict = {column: 1.0 for column in features.columns}
     logger.info(
-        "Built clustering features over %s source snapshots: %s state columns + %s national "
-        "ranking columns.",
+        "Built clustering features over %s source snapshots: %s.",
         len(features),
-        len(state_columns),
-        len(features.columns) - len(state_columns),
+        ", ".join(str(column[-1]) for column in features.columns),
     )
-    for name in state_frames:
-        family = {
-            column: weight
-            for column, weight in weight_dict.items()
-            if column != _NATIONAL_FEATURES[name] and column[-1].startswith(f"{_NATIONAL_FEATURES[name][-1]}_")
-        }
-        if family:
-            logger.info(
-                "  %s: %s columns, weight %.4f-%.4f, sum(w^2)=%.3f.",
-                name,
-                len(family),
-                min(family.values()),
-                max(family.values()),
-                float(np.square(list(family.values())).sum()),
-            )
-    return features, national_profiles, weight_dict
+    return features, profiles, weight_dict
 
 
 # --------------------------------------------------------------------------- #
@@ -1729,18 +1426,15 @@ SNAPSHOT_TABLE_COLUMNS = [
 ]
 
 
-def read_state_demand(
+def read_national_demand(
     demand_path: str,
     planning_horizon: int,
     weather_years,
-) -> pd.DataFrame:
+) -> pd.Series:
     """
-    Read per-state AC demand for one planning horizon, rolled to UTC.
+    Read national AC demand for one planning horizon, rolled to UTC.
 
-    EER publishes one column per state, so the clustering resolution needs no mapping
-    here at all -- unlike the VRE side, which has to place supply-curve sites first.
-    The national total the extreme selectors rank on is the row sum, taken in
-    ``build_feature_frame``.
+    EER publishes one column per state; the national feature is their row sum.
 
     Distribution losses are deliberately not applied: they are a uniform
     multiplier and therefore affect neither the clustering (tsam
@@ -1753,15 +1447,15 @@ def read_state_demand(
     demand = ReadEer(demand_path, [planning_horizon], weather_years).read()
     demand = demand.loc[planning_horizon].astype("float64")
     demand.index = pd.DatetimeIndex(demand.index)
-    demand = demand.reindex(sorted(demand.columns), axis="columns")
+    national = demand.sum(axis="columns")
     logger.info(
         "Read AC demand for %s across %s states: %s snapshots, national mean %.1f MW.",
         planning_horizon,
         demand.shape[1],
-        len(demand),
-        float(demand.sum(axis="columns").mean()),
+        len(national),
+        float(national.mean()),
     )
-    return demand
+    return national
 
 
 def build_snapshot_table(period_entries_by_horizon, snapshot_weightings, snapshots) -> pd.DataFrame:
@@ -1863,21 +1557,19 @@ def main(snakemake) -> None:
         )
     planning_horizon = planning_horizons[0]
 
-    carrier_profiles = read_reeds_state_capacity_factor(
+    capacity_factors = read_reeds_national_capacity_factor(
         params.renewable_carriers,
         params.reeds_vre_dir,
-        params.reeds_interconnection_dir,
-        snakemake.input.counties,
         params.renewable_weather_years,
     )
 
-    state_demand = read_state_demand(
+    national_demand = read_national_demand(
         snakemake.input.electricity_demand,
         planning_horizon,
         params.renewable_weather_years,
     )
 
-    feature_t_full, profile_map, weight_dict = build_feature_frame(carrier_profiles, state_demand)
+    feature_t_full, profile_map, weight_dict = build_feature_frame(capacity_factors, national_demand)
 
     snapshots, snapshot_weightings, period_entries_by_horizon, metadata = select_representative_snapshots(
         feature_t_full,
