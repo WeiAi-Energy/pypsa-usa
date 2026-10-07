@@ -83,7 +83,7 @@ electricity:
 flexible_electrolysis:
   enable: true
   annual_electricity_twh: 1512 # total annual electricity demand of the electrolyzer fleet (TWh_e), not its hydrogen output
-  accounting_region: h2ptcreg # h2ptcreg: one H2 balance per 45V PTC region | nation: a single national H2 balance
+  accounting_region: h2ptcreg # h2ptcreg: one H2 balance per 45V PTC region | trans_grp: one per ReEDS transmission group | nation: a single national H2 balance
 
 
 
@@ -115,7 +115,9 @@ links:
 # docs :
 costs:
   atb:
-    model_case: "Market" # Market, R&D
+    report_year: 2025 # ATB vintage; 2025 needs pudl_path v2026.9.0 or later
+    cost_case: "R&D" # R&D, Exp (Expanded; wind, PV and batteries only, others fall back to R&D). Ignored before 2025
+    tax_credits: false # true: financing with tax credits enacted as of July 2025 (the 2024 ATB "Market" case)
     scenario: "Moderate" # Advanced, Conservative, Moderate
   aeo:
     scenario: "reference" # reference, high, low

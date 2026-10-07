@@ -3,10 +3,12 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import geopandas as gpd
 import matplotlib.pyplot as plt
 import pandas as pd
 from matplotlib.legend import Legend
 from matplotlib.patches import FancyBboxPatch
+from shapely.geometry import Point, box
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from plot_network_maps import (
@@ -597,9 +599,15 @@ def test_get_model_region_background_does_not_reapply_merge_tolerance_after_clea
             self.explode_called = 0
             self.reset_called = 0
 
+        geometry = None
+
         def __getitem__(self, key):
             assert key == ["geometry"]
             return self
+
+        def __setitem__(self, key, value):
+            assert key == "geometry"
+            self.geometry = value
 
         def copy(self):
             return self
@@ -623,6 +631,7 @@ def test_get_model_region_background_does_not_reapply_merge_tolerance_after_clea
     with (
         patch("plot_network_maps._clean_model_regions", return_value=cleaned) as clean_mock,
         patch("plot_network_maps._apply_region_merge_tolerance") as tolerance_mock,
+        patch("plot_network_maps._fill_polygon_holes", side_effect=lambda geometry: geometry),
     ):
         result = get_model_region_background(object())
 
@@ -632,6 +641,26 @@ def test_get_model_region_background_does_not_reapply_merge_tolerance_after_clea
     assert cleaned.dissolve_called == 1
     assert cleaned.explode_called == 1
     assert cleaned.reset_called == 1
+
+
+
+def test_get_model_region_background_fills_gap_enclosed_by_neighbouring_regions():
+    # four strips around a 0.4 degree gap that no region covers: the union has a hole the per-region cleaning
+    # cannot see
+    x0, y0 = -100.0, 40.0
+    strips = [
+        box(x0, y0, x0 + 1.0, y0 + 0.3),
+        box(x0, y0 + 0.7, x0 + 1.0, y0 + 1.0),
+        box(x0, y0 + 0.3, x0 + 0.3, y0 + 0.7),
+        box(x0 + 0.7, y0 + 0.3, x0 + 1.0, y0 + 0.7),
+    ]
+    regions = gpd.GeoDataFrame({"name": list("ABCD")}, geometry=strips, crs="EPSG:4326")
+
+    background = get_model_region_background(regions)
+
+    assert len(background) == 1
+    assert len(background.geometry.iloc[0].interiors) == 0
+    assert background.contains(Point(x0 + 0.5, y0 + 0.5)).all()
 
 
 def test_get_adaptive_legend_values_keeps_lower_tiers_when_max_exceeds_one_point_five_times_previous():

@@ -33,6 +33,8 @@ from cartopy import crs as ccrs
 from matplotlib.legend import Legend
 from matplotlib.lines import Line2D
 from matplotlib.patches import Ellipse, FancyBboxPatch, Patch
+from shapely.geometry import Polygon
+from shapely.ops import unary_union
 from visualization_carriers import (
     build_visualization_palette,
     get_visualization_label,
@@ -255,6 +257,8 @@ def get_model_region_background(regions: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     background = _clean_model_regions(regions)[["geometry"]].copy()
     background = background.dissolve()
     background = background.explode(index_parts=False).reset_index(drop=True)
+    # the union opens new holes where neighbouring regions leave a gap between them
+    background["geometry"] = _fill_polygon_holes(background.geometry)
     return background
 
 
@@ -309,7 +313,24 @@ def _clean_model_regions(regions: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         return gpd.GeoDataFrame(geometry=[], crs=original_crs)
 
     cleaned["geometry"] = cleaned.geometry.buffer(0)
+    # onshore regions exclude lakes, reservoirs and unassigned gaps; their interior rings would show the white page
+    # through the grey fill and get outlined by the white zone boundaries
+    cleaned["geometry"] = _fill_polygon_holes(cleaned.geometry)
     return cleaned.to_crs(original_crs).reset_index(drop=True)
+
+
+def _fill_polygon_holes(geometry: gpd.GeoSeries) -> gpd.GeoSeries:
+    """Drop the interior rings of every (multi)polygon."""
+    def fill(geom):
+        if geom is None or geom.is_empty:
+            return geom
+        if geom.geom_type == "Polygon":
+            return Polygon(geom.exterior)
+        if geom.geom_type == "MultiPolygon":
+            return unary_union([Polygon(part.exterior) for part in geom.geoms])
+        return geom
+
+    return geometry.apply(fill)
 
 
 def draw_model_region_background(
@@ -819,8 +840,14 @@ def _add_circle_legend_matching_map(
     small_unit: str,
     large_unit: str,
     legend_style: dict | None = None,
+    fontsize: float = LEGEND_FONT_SIZE,
+    title_fontsize: float = LEGEND_TITLE_SIZE,
+    title_ha: str = "center",
 ) -> FancyBboxPatch | None:
-    """Draw a nested-circles legend whose size-capacity mapping matches the map."""
+    """Draw a nested-circles legend whose size-capacity mapping matches the map.
+
+    ``title_ha="left"`` aligns the title with the left edge of the largest circle instead of centring it on the box.
+    """
     if not legend_values:
         return None
 
@@ -841,12 +868,13 @@ def _add_circle_legend_matching_map(
     x_anc, y_anc = anchor
     side_pad = 0.010
     top_pad = 0.010
-    title_h = 0.022
+    # 0.022 fits the default title on the full-size map; grow it when the title is large relative to the axes
+    title_h = max(0.022, 1.3 * title_fontsize / 72.0 / (ax_pos.height * fig_h_in))
     line_gap = CAPACITY_LEGEND_LABEL_GAP / ar
 
     max_chars = max(len(lbl) for lbl in labels) if labels else 5
-    char_w_ax = LEGEND_FONT_SIZE / 72.0 / (ax_pos.width * fig_w_in)
-    char_h_ax = LEGEND_FONT_SIZE / 72.0 / (ax_pos.height * fig_h_in)
+    char_w_ax = fontsize / 72.0 / (ax_pos.width * fig_w_in)
+    char_h_ax = fontsize / 72.0 / (ax_pos.height * fig_h_in)
     text_w = max_chars * char_w_ax * 0.60
 
     x_text_right = x_anc - side_pad
@@ -886,12 +914,12 @@ def _add_circle_legend_matching_map(
     ax.add_patch(bg)
 
     ax.text(
-        (x_box_left + x_anc) / 2.0,
+        x_box_left + side_pad if title_ha == "left" else (x_box_left + x_anc) / 2.0,
         y_anc - top_pad,
         title,
-        ha="center",
+        ha=title_ha,
         va="top",
-        fontsize=LEGEND_TITLE_SIZE,
+        fontsize=title_fontsize,
         fontweight="bold",
         color=LEGEND_TEXT_COLOR,
         transform=ax.transAxes,
@@ -932,7 +960,7 @@ def _add_circle_legend_matching_map(
             labels[i],
             ha="left",
             va="center",
-            fontsize=LEGEND_FONT_SIZE,
+            fontsize=fontsize,
             color=LEGEND_TEXT_COLOR,
             transform=ax.transAxes,
             zorder=5,

@@ -4,7 +4,7 @@ import logging
 
 import constants as const
 import pandas as pd
-from _helpers import PudlSource, calculate_annuity
+from _helpers import PudlSource, calculate_annuity, get_currency_conversion_factor
 
 logger = logging.getLogger(__name__)
 CCS_CAPTURE_COST_USD_PER_TON = 20
@@ -106,32 +106,105 @@ LIFETIME_DATA = [
 ]  # https://github.com/NREL/ReEDS-2.0/blob/e65ed5ed4ffff973071839481309f77d12d802cd/inputs/plant_characteristics/maxage.csv#L4
 
 
-def load_pudl_atb_data(pudl: PudlSource):
+def load_pudl_atb_data(pudl: PudlSource, report_year: int):
     """Loads ATB data directly from parquet files."""
+    # The tax credit case is part of the join because the 2025 ATB carries more
+    # than one financial row for some technologies within a single model case
+    # (offshore wind has both an ITC and a no-credit row under "R&D + TC").
     query = f"""
     WITH finance_cte AS (
         SELECT
             wacc_real,
             technology_description,
             model_case_nrelatb,
+            model_tax_credit_case_nrelatb,
             scenario_atb,
             projection_year,
             cost_recovery_period_years,
             report_year
         FROM read_parquet('{pudl}/core_nrelatb__yearly_projected_financial_cases_by_scenario.parquet')
     )
-    SELECT *
+    SELECT atb.*, finance.wacc_real
     FROM read_parquet('{pudl}/core_nrelatb__yearly_projected_cost_performance.parquet') atb
     LEFT JOIN finance_cte AS finance
         ON atb.technology_description = finance.technology_description
             AND atb.model_case_nrelatb = finance.model_case_nrelatb
+            AND atb.model_tax_credit_case_nrelatb IS NOT DISTINCT FROM finance.model_tax_credit_case_nrelatb
             AND atb.scenario_atb = finance.scenario_atb
             AND atb.projection_year = finance.projection_year
             AND atb.cost_recovery_period_years = finance.cost_recovery_period_years
             AND atb.report_year = finance.report_year
-    WHERE atb.report_year = 2024
+    WHERE atb.report_year = {int(report_year)}
     """
     return pudl.query(query).to_df()
+
+
+def atb_model_cases(report_year: int, cost_case: str, tax_credits: bool) -> list[str]:
+    """
+    ATB model cases to draw from, most preferred first.
+
+    Up to the 2024 ATB the model case was the financial case alone: "Market"
+    (financing with tax credits) or "R&D" (without). From 2025 it combines a cost
+    drivers case -- "R&D", or "Exp" (Expanded: R&D plus supply chain and market
+    drivers) -- with an optional " + TC" for financing with the tax credits enacted
+    as of July 2025. Only land-based wind, PV and batteries have an Expanded case,
+    so the R&D case is kept as a fallback for every other technology.
+    """
+    if report_year < 2025:
+        return ["Market" if tax_credits else "R&D"]
+    suffix = " + TC" if tax_credits else ""
+    cases = [f"{cost_case}{suffix}"]
+    if cost_case != "R&D":
+        cases.append(f"R&D{suffix}")
+    return cases
+
+
+def select_model_case(atb: pd.DataFrame, cases: list[str]) -> pd.DataFrame:
+    """Keep, per technology, the rows of the first case in ``cases`` it has."""
+    atb = atb[atb.model_case_nrelatb.isin(cases)]
+    rank = atb.model_case_nrelatb.map({case: i for i, case in enumerate(cases)})
+    best = rank.groupby(atb["pypsa-name"]).transform("min")
+    return atb[rank == best]
+
+
+#: Dollar year each ATB vintage is published in. PUDL passes the values through
+#: unadjusted, so they are restated in 2022 USD -- the year every other cost
+#: table in the model (ReEDS interconnection, transmission) is expressed in.
+ATB_DOLLAR_YEAR = {2024: 2022, 2025: 2023}
+
+#: ATB parameters that are money amounts; the rest (years, rates, factors,
+#: heat rates, capacity factors) are restated as they are.
+ATB_MONETARY_PARAMETERS = [
+    "capex_per_kw",
+    "capex_overnight_per_kw",
+    "capex_overnight_additional_per_kw",
+    "capex_grid_connection_per_kw",
+    # USD/kW despite the name: capex_per_kw = overnight + grid connection + this.
+    "capex_construction_finance_factor",
+    "fuel_cost_per_mwh",
+    "levelized_cost_of_energy_per_mwh",
+    "opex_fixed_per_kw",
+    "opex_variable_per_mwh",
+]
+
+
+def restate_atb_in_usd2022(atb: pd.DataFrame, report_year: int) -> pd.DataFrame:
+    """Convert the monetary ATB columns from the vintage's dollar year to 2022 USD."""
+    if report_year not in ATB_DOLLAR_YEAR:
+        raise ValueError(
+            f"No dollar year recorded for the {report_year} ATB; known vintages are {sorted(ATB_DOLLAR_YEAR)}.",
+        )
+    dollar_year = ATB_DOLLAR_YEAR[report_year]
+    factor = get_currency_conversion_factor(dollar_year, "USD")
+    atb = atb.copy()
+    atb[ATB_MONETARY_PARAMETERS] = atb[ATB_MONETARY_PARAMETERS] * factor
+    logger.info(
+        "Restated %d ATB costs from %d USD to 2022 USD (factor %.4f).",
+        report_year,
+        dollar_year,
+        factor,
+    )
+    return atb
 
 
 def load_pudl_aeo_data(pudl: PudlSource):
@@ -188,7 +261,12 @@ if __name__ == "__main__":
     pudl = PudlSource(snakemake.params.pudl_path)
 
     # Import PUDLs ATB data
-    pudl_atb = load_pudl_atb_data(pudl)
+    atb_report_year = int(atb_params.get("report_year", 2025))
+    pudl_atb = load_pudl_atb_data(pudl, atb_report_year)
+    if pudl_atb.empty:
+        raise ValueError(
+            f"No {atb_report_year} ATB data under {pudl}; the 2025 ATB needs PUDL v2026.9.0 or later.",
+        )
     pudl_atb["pypsa-name"] = pudl_atb.apply(
         match_technology,
         axis=1,
@@ -222,7 +300,24 @@ if __name__ == "__main__":
         pudl_atb = pudl_atb_filt
 
     pudl_atb = pudl_atb[pudl_atb.scenario_atb == atb_params.get("scenario", "Moderate")]
-    pudl_atb = pudl_atb[pudl_atb.model_case_nrelatb == atb_params.get("model_case", "Market")]
+    model_cases = atb_model_cases(
+        atb_report_year,
+        atb_params.get("cost_case", "R&D"),
+        atb_params.get("tax_credits", False),
+    )
+    pudl_atb = select_model_case(pudl_atb, model_cases)
+    if pudl_atb["pypsa-name"].duplicated().any():
+        raise ValueError(
+            "ATB rows are not unique per technology after filtering: "
+            f"{sorted(pudl_atb.loc[pudl_atb['pypsa-name'].duplicated(), 'pypsa-name'].unique())}",
+        )
+    logger.info(
+        "ATB %d, %s scenario, model case per technology: %s",
+        atb_report_year,
+        atb_params.get("scenario", "Moderate"),
+        pudl_atb.set_index("pypsa-name")["model_case_nrelatb"].to_dict(),
+    )
+    pudl_atb = restate_atb_in_usd2022(pudl_atb, atb_report_year)
 
     pudl_premelt = pudl_atb.copy()
     # Pivot Data

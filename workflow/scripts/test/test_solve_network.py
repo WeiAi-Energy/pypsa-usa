@@ -13,8 +13,12 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 import solve_network as solve_network_module
 from solve_network import (
     add_electrolysis_electricity_target_constraint,
+    POLICY_DUALS_META_KEY,
     h2ptcreg_hydrogen_shares,
+    policy_duals_metadata,
+    read_policy_duals,
     store_electrolysis_duals,
+    trans_grp_hydrogen_shares,
 )
 HYDROGEN_DEMAND_SHARE = (
     Path(__file__).parents[2] / "repo_data" / "ReEDS_Constraints" / "hydrogen_demand_share.csv"
@@ -326,6 +330,121 @@ def test_add_electrolysis_constraint_rejects_accounting_region_network_mismatch(
         )
 
 
+def _trans_grp_electrolysis_network(pd_values=None):
+    """TX straddles ERCOT and SPP_South (3:1 by Pd); CA sits wholly in CAISO."""
+    hours = pd.date_range("2030-01-01 00:00", "2030-01-01 02:00", freq="h")
+    snapshots = pd.MultiIndex.from_tuples(
+        [(2030, ts) for ts in hours],
+        names=["period", "timestep"],
+    )
+
+    n = pypsa.Network()
+    n.set_snapshots(snapshots)
+    n.set_investment_periods(periods=[2030])
+    for carrier in ("AC", "gen", "load", "H2", "electrolysis"):
+        n.add("Carrier", carrier)
+
+    buses = {"tx_ercot": ("TX", "ERCOT"), "tx_spp": ("TX", "SPP_South"), "ca": ("CA", "CAISO")}
+    for bus in buses:
+        n.add("Bus", bus, carrier="AC")
+    n.buses["reeds_state"] = pd.Series({bus: st for bus, (st, _) in buses.items()})
+    n.buses["trans_grp"] = pd.Series({bus: grp for bus, (_, grp) in buses.items()})
+    n.buses["Pd"] = pd.Series(pd_values or {"tx_ercot": 300.0, "tx_spp": 100.0, "ca": 50.0})
+    n.add("Generator", "g", bus="tx_ercot", carrier="gen", p_nom=1e6, marginal_cost=1.0)
+    n.add("Load", "l", bus="tx_ercot", carrier="load", p_set=pd.Series(0.0, index=snapshots))
+
+    for _, grp in buses.values():
+        n.add("Bus", f"{grp} flexible electrolysis H2", carrier="H2")
+    for bus, (_, grp) in buses.items():
+        n.add(
+            "Link",
+            f"{bus} flexible electrolysis",
+            bus0=bus,
+            bus1=f"{grp} flexible electrolysis H2",
+            carrier="electrolysis",
+            p_nom=0.0,
+            p_nom_extendable=True,
+            efficiency=0.0,
+        )
+    n.snapshot_weightings.loc[:, "generators"] = 2920.0
+    n.optimize.create_model(multi_investment_periods=True)
+    return n, snapshots
+
+
+def _trans_grp_config():
+    return {
+        "flexible_electrolysis": {
+            "enable": True,
+            "annual_electricity_twh": 1512,
+            "accounting_region": "trans_grp",
+        },
+    }
+
+
+def test_add_electrolysis_constraint_splits_electricity_target_across_trans_grps():
+    n, snapshots = _trans_grp_electrolysis_network()
+
+    add_electrolysis_electricity_target_constraint(
+        n,
+        snapshots,
+        _trans_grp_config(),
+        str(HYDROGEN_DEMAND_SHARE),
+    )
+
+    # TX is split 3:1 by bus Pd, then the modelled groups are renormalised.
+    states = pd.read_csv(HYDROGEN_DEMAND_SHARE).set_index("st")["share"]
+    raw = {"ERCOT": 0.75 * states["TX"], "SPP_South": 0.25 * states["TX"], "CAISO": states["CA"]}
+    total = sum(raw.values())
+    for grp, share in raw.items():
+        constraint = n.model.constraints[f"FlexibleElectrolysis-annual_electricity-{grp}-2030"]
+        assert constraint.rhs.item() == pytest.approx(share / total * 1512.0 * 1e3)
+
+
+def test_trans_grp_hydrogen_shares_drop_a_state_without_pd():
+    n, _ = _trans_grp_electrolysis_network({"tx_ercot": 300.0, "tx_spp": 100.0, "ca": 0.0})
+    links = n.links.index
+    regions = n.links.bus1.str.removesuffix(" flexible electrolysis H2")
+
+    shares = trans_grp_hydrogen_shares(n, links, regions, str(HYDROGEN_DEMAND_SHARE))
+
+    tx = pd.read_csv(HYDROGEN_DEMAND_SHARE).set_index("st").loc["TX", "share"]
+    assert shares.to_dict() == pytest.approx({"CAISO": 0.0, "ERCOT": 0.75 * tx, "SPP_South": 0.25 * tx})
+
+
+def test_add_electrolysis_constraint_trans_grp_requires_bus_pd():
+    n, snapshots = _trans_grp_electrolysis_network()
+    n.buses = n.buses.drop(columns="Pd")
+
+    with pytest.raises(ValueError, match="Pd"):
+        add_electrolysis_electricity_target_constraint(
+            n,
+            snapshots,
+            _trans_grp_config(),
+            str(HYDROGEN_DEMAND_SHARE),
+        )
+
+
+def test_add_electrolysis_constraint_rejects_trans_grp_config_on_h2ptcreg_network():
+    n, snapshots, _ = _national_electrolysis_network(
+        "Texas flexible electrolysis H2",
+    )
+    n.buses["trans_grp"] = pd.Series({"b": "ERCOT", "b2": "ERCOT"})
+
+    with pytest.raises(ValueError, match="accounting_region"):
+        add_electrolysis_electricity_target_constraint(
+            n,
+            snapshots,
+            {
+                "flexible_electrolysis": {
+                    "enable": True,
+                    "annual_electricity_twh": 1512,
+                    "accounting_region": "trans_grp",
+                },
+            },
+            str(HYDROGEN_DEMAND_SHARE),
+        )
+
+
 def test_electrolysis_representative_periods_use_single_annual_equality():
     hours = pd.date_range("2030-01-01 00:00", periods=4, freq="h")
     snapshots = pd.MultiIndex.from_product(
@@ -452,6 +571,57 @@ def test_store_electrolysis_duals_recovers_the_marginal_cost(monkeypatch):
     assert abs(unscaled) == pytest.approx(7.0, rel=1e-6)
     # Multiplying instead of dividing would separate these by 1e6.
     assert price_at(1e3) == pytest.approx(unscaled, rel=1e-6)
+
+
+def _network_with_stored_duals():
+    """Two-period network carrying the attributes the store_* helpers set after a solve."""
+    hours = pd.date_range("2050-01-01 00:00", periods=3, freq="2h")
+    n = pypsa.Network()
+    n.set_snapshots(pd.MultiIndex.from_tuples([(2050, ts) for ts in hours], names=["period", "timestep"]))
+    n.set_investment_periods(periods=[2050])
+    n.add("Bus", "b", carrier="AC")
+    n.regional_co2_price = pd.Series({"RegionalCO2-system_cap_2050co2_limit": -143.0}, name="co2_price")
+    n.electrolysis_electricity_price = pd.Series(
+        {"FlexibleElectrolysis-annual_electricity-nation-2050": 24.56}, name="electrolysis_price",
+    )
+    erm = pd.DataFrame({"CAISO": [0.0, 12.5, np.nan], "ERCOT": [3.0, 0.0, 1.25]}, index=n.snapshots)
+    erm.columns.name = "erm_region"
+    n.erm_region_price = erm
+    return n
+
+
+def test_policy_duals_survive_netcdf_export(tmp_path):
+    """The stored duals reach the file through n.meta; the bare attributes do not."""
+    n = _network_with_stored_duals()
+    n.meta = {"wildcards": {"case": "test"}, POLICY_DUALS_META_KEY: policy_duals_metadata(n)}
+    path = tmp_path / "solved.nc"
+    n.export_to_netcdf(path)
+
+    m = pypsa.Network(path)
+    # The reason for the n.meta route: export keeps only scalar network attributes.
+    for attr in ("regional_co2_price", "electrolysis_electricity_price", "erm_region_price"):
+        assert not isinstance(getattr(m, attr, None), (pd.Series, pd.DataFrame))
+
+    duals = read_policy_duals(m)
+    pd.testing.assert_series_equal(
+        duals["regional_co2_price"], n.regional_co2_price, check_names=False,
+    )
+    pd.testing.assert_series_equal(
+        duals["electrolysis_electricity_price"], n.electrolysis_electricity_price, check_names=False,
+    )
+    erm = duals["erm_region_price"]
+    assert erm.index.equals(m.snapshots)
+    # NaN travels as JSON null and comes back as NaN.
+    pd.testing.assert_frame_equal(erm, n.erm_region_price, check_index_type=False)
+
+
+def test_policy_duals_metadata_skips_what_was_not_stored():
+    n = _network_with_stored_duals()
+    del n.erm_region_price
+    n.electrolysis_electricity_price = pd.Series(dtype=float)
+    assert set(policy_duals_metadata(n)) == {"regional_co2_price"}
+    assert policy_duals_metadata(pypsa.Network()) == {}
+    assert read_policy_duals(pypsa.Network()) == {}
 
 
 def _line_x_network():
@@ -596,6 +766,39 @@ def test_line_x_sssc_bound_never_loosens_an_existing_one():
 
     assert _sssc_upper(n)["ab"] == pytest.approx(5.0)
     assert _sssc_upper(n)["bc"] == pytest.approx(80.0)
+
+
+def _solve_with_total_cap(sssc_tot_max):
+    n = _line_x_network()
+    config = _line_x_config(ratio=None)
+    config["lines"]["convert_lines_to_line_x"]["sssc_tot_max"] = sssc_tot_max
+    n.optimize(
+        solver_name="highs",
+        extra_functionality=lambda network, sns: solve_network_module.add_line_x_sssc_total_max_constraint(
+            network, sns, config
+        ),
+    )
+    solve_network_module.store_sssc_total_max_dual(n)
+    return n
+
+
+def test_store_sssc_total_max_dual_is_the_net_value_of_one_more_mvar():
+    """The fixture pays 50 per MVAr of SSSC and gains nothing else from it, so the cap is worth -50."""
+    n = _solve_with_total_cap(30.0)
+    assert n.line_xs.loc[["ab", "bc"], "sssc_nom_opt"].sum() == pytest.approx(30.0)
+    price = n.sssc_total_max_price
+    assert list(price.index) == [solve_network_module.SSSC_TOTAL_MAX_CONSTRAINT]
+    assert price.iloc[0] == pytest.approx(-50.0, rel=1e-6)
+    # and it travels with the other duals
+    assert policy_duals_metadata(n)["sssc_total_max_price"] == {
+        solve_network_module.SSSC_TOTAL_MAX_CONSTRAINT: pytest.approx(-50.0, rel=1e-6),
+    }
+
+
+def test_store_sssc_total_max_dual_stores_nothing_without_a_cap():
+    n = _solve_with_total_cap(np.inf)
+    assert solve_network_module.SSSC_TOTAL_MAX_CONSTRAINT not in n.model.constraints
+    assert not hasattr(n, "sssc_total_max_price")
 
 
 def test_line_x_sssc_bound_leaves_the_optimum_untouched(monkeypatch):

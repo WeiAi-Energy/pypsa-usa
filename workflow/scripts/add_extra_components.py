@@ -390,17 +390,21 @@ def attach_tes_storageunits(n: pypsa.Network, sector_costs_path: str, bus_multip
     )
 
 
+FLEXIBLE_ELECTROLYSIS_ACCOUNTING_REGIONS = ("h2ptcreg", "trans_grp", "nation")
+
+
 def flexible_electrolysis_accounting_region(config: dict) -> str:
     """Return the validated electrolysis accounting level.
 
     ``h2ptcreg`` (default) balances electrolysis per 45V hydrogen PTC region;
-    ``nation`` balances it once over the whole modelled system.
+    ``trans_grp`` per ReEDS transmission group; ``nation`` once over the whole
+    modelled system.
     """
     accounting_region = config.get("accounting_region", "h2ptcreg")
-    if accounting_region not in ("h2ptcreg", "nation"):
+    if accounting_region not in FLEXIBLE_ELECTROLYSIS_ACCOUNTING_REGIONS:
         raise ValueError(
-            "flexible_electrolysis 'accounting_region' must be 'h2ptcreg' or 'nation'; "
-            f"got {accounting_region!r}.",
+            "flexible_electrolysis 'accounting_region' must be one of "
+            f"{list(FLEXIBLE_ELECTROLYSIS_ACCOUNTING_REGIONS)}; got {accounting_region!r}.",
         )
     return accounting_region
 
@@ -416,9 +420,11 @@ def attach_flexible_electrolysis(
     With ``accounting_region: h2ptcreg`` there is one accounting H2 bus per 45V
     hydrogen PTC region (``h2ptcreg``, a bus attribute assigned in
     ``build_base_network``), and each AC bus feeds the bus of the region it sits
-    in. With ``accounting_region: nation`` every electrolysis link instead feeds a
-    single national accounting bus, so hydrogen production is only balanced in
-    total. Either way, buses without an ``h2ptcreg`` (non-US) get no link. The
+    in. With ``accounting_region: trans_grp`` the accounting buses are the ReEDS
+    transmission groups (``trans_grp``) instead. With ``accounting_region: nation``
+    every electrolysis link feeds a single national accounting bus, so hydrogen
+    production is only balanced in total. In every mode, buses without an
+    ``h2ptcreg`` (non-US) get no link. The
     links have ``efficiency = 0``, so nothing is
     injected into the H2 buses and their nodal
     balance holds trivially without any sink component. The annual electrolysis
@@ -468,6 +474,26 @@ def attach_flexible_electrolysis(
         # One accounting bus for the whole system: the h2ptcreg attribute is still
         # what selects the eligible (US) buses, but it no longer splits them.
         bus_regions = pd.Series("nation", index=bus_regions.index)
+    elif accounting_region == "trans_grp":
+        # h2ptcreg still selects the eligible (US) buses; trans_grp splits them.
+        if "trans_grp" not in n.buses.columns:
+            raise ValueError(
+                "flexible_electrolysis 'accounting_region' is 'trans_grp' but the network has no "
+                "'trans_grp' bus attribute. It is assigned in build_base_network.",
+            )
+        eligible = bus_regions.index
+        bus_regions = n.buses.loc[eligible, "trans_grp"].replace("", np.nan).dropna()
+        if len(bus_regions) < len(eligible):
+            logger.info(
+                "No trans_grp for %d eligible AC bus(es); they get no electrolysis link.",
+                len(eligible) - len(bus_regions),
+            )
+        if bus_regions.empty:
+            logger.warning(
+                "Flexible electrolysis is enabled but no eligible AC bus has a trans_grp; "
+                "skipping electrolysis attachment.",
+            )
+            return
 
     add_missing_carriers(n, ["H2", "electrolysis"])
     if "co2_emissions" not in n.carriers.columns:

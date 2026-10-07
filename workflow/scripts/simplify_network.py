@@ -490,8 +490,8 @@ def merge_colocated_generators(n: pypsa.Network, moved: set) -> int:
 
     Nominal capacities add.  Efficiency, capital/marginal costs, retirement
     dates and per-unit availability are averaged with the same effective
-    capacity weights used by the clustering stages: ``p_nom`` for existing
-    plant and finite ``p_nom_max`` for pure candidates.
+    capacity weights used by the clustering stages; see
+    :func:`generator_aggregation_weights`.
 
     Plant retired by the planning horizon is never pooled with plant that
     survives it: that test joins the group key, for the reason given in
@@ -511,11 +511,7 @@ def merge_colocated_generators(n: pypsa.Network, moved: set) -> int:
     if not touched:
         return 0
 
-    p_nom = pd.to_numeric(generators.p_nom, errors="coerce").fillna(0.0).clip(lower=0.0)
-    p_nom_max = pd.to_numeric(generators.p_nom_max, errors="coerce").replace(
-        [np.inf, -np.inf], np.nan,
-    )
-    weights = p_nom.where(p_nom.gt(0.0), p_nom_max).where(lambda x: x.gt(0.0), 1.0)
+    weights = generator_aggregation_weights(generators)
     static_p_max_pu = pd.to_numeric(generators.p_max_pu, errors="coerce").fillna(1.0)
     profiles = n.generators_t.p_max_pu
 
@@ -1456,6 +1452,43 @@ def reduce_low_degree_buses(
 # ---------------------------------------------------------------------------
 
 
+#: Carriers whose extendable generator is a supply-curve bin: ``p_nom_max`` is
+#: the bin's whole resource potential, with any existing capacity already inside
+#: it (``add_electricity`` widens ``p_nom_max`` to at least ``p_nom``).
+SUPPLY_CURVE_CARRIERS = ("onwind", "offwind", "offwind_floating", "solar")
+
+
+def generator_aggregation_weights(generators: pd.DataFrame) -> pd.Series:
+    """
+    The capacity each generator's intensive attributes are averaged over.
+
+    Extendable wind and solar use ``p_nom_max``. Their cost and profile describe
+    the whole supply-curve bin, and the aggregate carries the summed
+    ``p_nom_max``, so that is the only weight that conserves
+    ``sum_i p_nom_max_i * x_i``. Weighting them by ``p_nom`` instead would let a
+    few MW of existing plant stand in for a bin thousands of MW large -- and
+    because every merge leaves ``p_nom > 0`` behind once any member had it, the
+    error compounds across the substation, low-degree and target-count stages.
+
+    Everything else uses ``p_nom`` for existing plant and finite ``p_nom_max``
+    for pure candidates. Generators with neither get weight 1.
+    """
+    p_nom = pd.to_numeric(generators.p_nom, errors="coerce").fillna(0.0).clip(lower=0.0)
+    p_nom_max = pd.to_numeric(generators.p_nom_max, errors="coerce").replace(
+        [np.inf, -np.inf], np.nan,
+    )
+    weights = p_nom.where(p_nom.gt(0.0), p_nom_max)
+
+    carrier = generators.carrier.astype(str).str.removesuffix(RETIRED_CARRIER_TAG)
+    supply_curve = (
+        carrier.isin(SUPPLY_CURVE_CARRIERS)
+        & generators.p_nom_extendable.fillna(False).astype(bool)
+        & p_nom_max.gt(0.0)
+    )
+    weights = weights.where(~supply_curve, p_nom_max)
+    return weights.where(lambda x: x.gt(0.0), 1.0)
+
+
 def apply_wind_solar_cf_aggregation_weights(
     n: pypsa.Network,
     generator_strategies: dict | None = None,
@@ -1474,8 +1507,7 @@ def apply_wind_solar_cf_aggregation_weights(
     sites inside a group get built first, while still advertising the group's
     entire potential as buildable at that inflated capacity factor.
 
-    Existing capacity uses ``p_nom``.  A pure candidate has zero existing
-    capacity, so it instead uses its finite positive ``p_nom_max``.  The same
+    The weights come from :func:`generator_aggregation_weights`.  The same
     weight is applied to all intensive component attributes, including
     efficiency and costs, rather than relying on PyPSA's default ``p_nom``
     weight (which is zero for renewable supply-curve candidates).
@@ -1485,20 +1517,7 @@ def apply_wind_solar_cf_aggregation_weights(
     if n.generators.empty:
         return generator_strategies
 
-    p_nom = (
-        pd.to_numeric(
-            n.generators.get("p_nom", pd.Series(0.0, index=n.generators.index)),
-            errors="coerce",
-        )
-        .fillna(0.0)
-        .clip(lower=0.0)
-    )
-    p_nom_max = pd.to_numeric(
-        n.generators.get("p_nom_max", pd.Series(np.nan, index=n.generators.index)),
-        errors="coerce",
-    ).replace([np.inf, -np.inf], np.nan)
-    weights = p_nom.where(p_nom.gt(0.0), p_nom_max).where(lambda x: x.gt(0.0), 1.0)
-    n.generators["weight"] = weights
+    n.generators["weight"] = generator_aggregation_weights(n.generators)
 
     # `weighted_average` uses the just-populated `weight` column.  This makes
     # capacity and all intensive economics/operating parameters consistent

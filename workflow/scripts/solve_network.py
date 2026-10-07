@@ -139,16 +139,31 @@ def flexible_electrolysis_accounting_region(flex_config):
     """Return the validated electrolysis accounting level.
 
     Mirrors ``add_extra_components.flexible_electrolysis_accounting_region``:
-    ``h2ptcreg`` balances electrolysis per 45V hydrogen PTC region, ``nation``
-    balances it once over the whole modelled system.
+    ``h2ptcreg`` balances electrolysis per 45V hydrogen PTC region, ``trans_grp``
+    per ReEDS transmission group, ``nation`` once over the whole modelled system.
     """
+    accounting_regions = ("h2ptcreg", "trans_grp", "nation")
     accounting_region = flex_config.get("accounting_region", "h2ptcreg")
-    if accounting_region not in ("h2ptcreg", "nation"):
+    if accounting_region not in accounting_regions:
         raise ValueError(
-            "flexible_electrolysis 'accounting_region' must be 'h2ptcreg' or 'nation'; "
-            f"got {accounting_region!r}.",
+            "flexible_electrolysis 'accounting_region' must be one of "
+            f"{list(accounting_regions)}; got {accounting_region!r}.",
         )
     return accounting_region
+
+
+def _read_hydrogen_shares(hydrogen_share_path, level):
+    """Return the state-level hydrogen demand shares summed up to ``level``."""
+    if not hydrogen_share_path:
+        raise ValueError(
+            "Flexible electrolysis is enabled but no hydrogen_demand_share.csv path was provided "
+            "to the hydrogen target constraint.",
+        )
+    shares = pd.read_csv(hydrogen_share_path)
+    missing = {level, "share"} - set(shares.columns)
+    if missing:
+        raise ValueError(f"{hydrogen_share_path} is missing required column(s): {sorted(missing)}.")
+    return shares.groupby(level)["share"].sum()
 
 
 def h2ptcreg_hydrogen_shares(hydrogen_share_path):
@@ -157,16 +172,54 @@ def h2ptcreg_hydrogen_shares(hydrogen_share_path):
     The file stores state-level shares (derived from the hourly state hydrogen
     demand profiles); they are summed up to the ``h2ptcreg`` level here.
     """
-    if not hydrogen_share_path:
-        raise ValueError(
-            "Flexible electrolysis is enabled but no hydrogen_demand_share.csv path was provided "
-            "to the hydrogen target constraint.",
-        )
-    shares = pd.read_csv(hydrogen_share_path)
-    missing = {"h2ptcreg", "share"} - set(shares.columns)
+    return _read_hydrogen_shares(hydrogen_share_path, "h2ptcreg")
+
+
+def trans_grp_hydrogen_shares(n, links, link_regions, hydrogen_share_path):
+    """Return each trans_grp's share of national annual hydrogen demand.
+
+    The hydrogen shares are only known per state, and a state can straddle several
+    transmission groups (TX spans ERCOT, SPP_South, MISO_South and
+    WestConnect_South). Each state's share is split across the groups of its
+    electrolysis buses by their ``Pd``, the same within-state weight
+    ``build_eer_demand`` splits state electricity demand by, keyed on the same
+    ``reeds_state``. Hydrogen thus follows the model's own electricity load. Like
+    that load, it is normalised over the buses present, so in a run that covers
+    only part of a state the in-network part takes the whole state's share.
+    """
+    state_shares = _read_hydrogen_shares(hydrogen_share_path, "st")
+
+    missing = {"Pd", "reeds_state"} - set(n.buses.columns)
     if missing:
-        raise ValueError(f"{hydrogen_share_path} is missing required column(s): {sorted(missing)}.")
-    return shares.groupby("h2ptcreg")["share"].sum()
+        raise ValueError(
+            "flexible_electrolysis 'accounting_region' is 'trans_grp' but the network's buses "
+            f"lack {sorted(missing)}, needed to split state hydrogen shares.",
+        )
+    bus0 = n.links.loc[links, "bus0"].to_numpy()
+    # trim_network relabels kept external buses as "imports_<state>".
+    states = pd.Series(
+        n.buses.reeds_state.reindex(bus0).astype(str).str.removeprefix("imports_").to_numpy(),
+        index=links,
+    )
+    unknown = pd.Index(states.unique()).difference(state_shares.index)
+    if len(unknown):
+        raise ValueError(
+            f"No hydrogen demand share for state(s) {list(unknown)} in {hydrogen_share_path}.",
+        )
+
+    weight = pd.Series(
+        pd.to_numeric(n.buses.Pd.reindex(bus0), errors="coerce").fillna(0.0).clip(lower=0.0).to_numpy(),
+        index=links,
+    )
+    state_weight = weight.groupby(states).transform("sum")
+    empty = sorted(states[state_weight <= 0.0].unique())
+    if empty:
+        # Mirrors build_eer_demand, which drops a state's electricity demand alike.
+        logger.warning("No electrolysis bus carries Pd in %s; their hydrogen share is dropped.", empty)
+    within_state = (weight / state_weight).where(state_weight > 0.0, 0.0)
+
+    link_shares = states.map(state_shares) * within_state
+    return link_shares.groupby(link_regions.reindex(links)).sum()
 
 
 def _electrolysis_capacity_terms(n, links):
@@ -205,7 +258,9 @@ def add_electrolysis_electricity_target_constraint(
     With ``h2ptcreg`` the configured national total is split across the 45V
     hydrogen PTC regions by their share of national hydrogen demand -- the fleet
     has the same electricity input per unit of hydrogen everywhere, so splitting
-    the electricity by hydrogen demand is the same split. With ``nation`` a single
+    the electricity by hydrogen demand is the same split. ``trans_grp`` splits it the
+    same way across ReEDS transmission groups, with each state's share divided among
+    its groups by bus ``Pd`` (see ``trans_grp_hydrogen_shares``). With ``nation`` a single
     constraint requires the whole electrolyzer fleet to draw the configured total.
 
     The electrolysis links carry ``efficiency = 0`` in the network so that the H2
@@ -266,16 +321,36 @@ def add_electrolysis_electricity_target_constraint(
             "add_extra_components after changing accounting_region.",
         )
 
+    if accounting_region == "trans_grp" and not is_national_network:
+        known_groups = set(n.buses.get("trans_grp", pd.Series(dtype=object)).dropna().astype(str))
+        unknown = modelled_regions.difference(known_groups)
+        if len(unknown):
+            raise ValueError(
+                "flexible_electrolysis 'accounting_region' is 'trans_grp', but the network's "
+                f"electrolysis accounting bus(es) {list(unknown)} are not transmission groups. "
+                "Rebuild the network from add_extra_components after changing accounting_region.",
+            )
+
     if accounting_region == "nation":
         # All links share one accounting bus, so the fleet total equals the sum of
         # the regional hydrogen productions, i.e. the configured national total.
         region_targets = pd.Series({"nation": total_target_twh})
     else:
-        region_shares = h2ptcreg_hydrogen_shares(hydrogen_share_path)
+        if accounting_region == "trans_grp":
+            region_shares = trans_grp_hydrogen_shares(
+                n,
+                flexible_links,
+                link_regions,
+                hydrogen_share_path,
+            )
+        else:
+            region_shares = h2ptcreg_hydrogen_shares(hydrogen_share_path)
         unknown = modelled_regions.difference(region_shares.index)
         if len(unknown):
             raise ValueError(
-                f"No hydrogen demand share for h2ptcreg region(s) {list(unknown)} in {hydrogen_share_path}.",
+                f"No hydrogen demand share for {accounting_region} region(s) {list(unknown)} in "
+                f"{hydrogen_share_path}. If the network was built at a different accounting level, "
+                "rebuild it from add_extra_components after changing accounting_region.",
             )
 
         # Renormalise over the modelled regions so the configured total is still met
@@ -407,6 +482,103 @@ def store_electrolysis_duals(n):
     )
 
 
+# ``n.meta`` key the stored duals travel under. ``export_to_netcdf`` keeps only scalar
+# network attributes, so the Series and DataFrame the ``store_*`` helpers attach to the
+# network are dropped on export without a warning; ``n.meta`` is written as JSON and
+# survives.
+POLICY_DUALS_META_KEY = "policy_duals"
+
+# Scalar prices, one value per constraint name: attribute set by the store_* helper.
+SCALAR_DUAL_ATTRS = ("regional_co2_price", "electrolysis_electricity_price", "sssc_total_max_price")
+
+
+def _json_number(value):
+    """A finite float, or None where JSON has no number to hold it."""
+    value = float(value)
+    return value if np.isfinite(value) else None
+
+
+def _json_label(label):
+    """A snapshot label as JSON: a timestamp as ISO text, a (period, timestep) pair as a list."""
+    if isinstance(label, tuple):
+        return [_json_label(part) for part in label]
+    if isinstance(label, pd.Timestamp):
+        return label.isoformat()
+    if isinstance(label, np.generic):
+        return label.item()
+    return label
+
+
+def policy_duals_metadata(n):
+    """
+    JSON-safe copy of the policy duals the ``store_*`` helpers attached to ``n``.
+
+    Values keep the solver's sign convention, as the helpers stored them (a binding
+    ``<=`` budget such as the CO2 cap comes out negative):
+
+    ``regional_co2_price``
+        Currency per tonne CO2, by constraint name.
+    ``electrolysis_electricity_price``
+        Currency per MWh_e, by constraint name.
+    ``sssc_total_max_price``
+        Currency per MVAr and year, by constraint name.
+    ``erm_region_price``
+        ``{"snapshots": [...], "regions": [...], "values": [[...], ...]}``, one row
+        per snapshot; a ``(period, timestep)`` snapshot is a two-item list.
+
+    A dual that was not stored is left out, so an empty dict means nothing to keep.
+    """
+    duals = {}
+    for attr in SCALAR_DUAL_ATTRS:
+        prices = getattr(n, attr, None)
+        if prices is not None and not prices.empty:
+            duals[attr] = {str(name): _json_number(value) for name, value in prices.items()}
+
+    erm = getattr(n, "erm_region_price", None)
+    if erm is not None and not erm.empty:
+        duals["erm_region_price"] = {
+            "snapshots": [_json_label(label) for label in erm.index],
+            "regions": [str(region) for region in erm.columns],
+            "values": [[_json_number(value) for value in row] for row in erm.to_numpy()],
+        }
+    return duals
+
+
+def read_policy_duals(n):
+    """
+    Inverse of :func:`policy_duals_metadata` on a solved network read back from disk.
+
+    Returns a dict holding whichever of ``regional_co2_price``,
+    ``electrolysis_electricity_price`` (both ``pd.Series``) and ``erm_region_price``
+    (``pd.DataFrame``, snapshot by region) the solve stored. ERM rows are labelled
+    with ``n.snapshots`` when they cover it, otherwise rebuilt from the stored labels.
+    """
+    meta = getattr(n, "meta", None) or {}
+    stored = meta.get(POLICY_DUALS_META_KEY, {})
+    duals = {}
+    for attr in SCALAR_DUAL_ATTRS:
+        if attr in stored:
+            duals[attr] = pd.Series(stored[attr], name=attr, dtype=float)
+
+    if "erm_region_price" in stored:
+        erm = stored["erm_region_price"]
+        labels = erm["snapshots"]
+        if labels and isinstance(labels[0], list):
+            index = pd.MultiIndex.from_tuples(
+                [(period, pd.Timestamp(timestep)) for period, timestep in labels],
+            )
+        else:
+            index = pd.DatetimeIndex(labels)
+        if len(index) == len(n.snapshots) and index.equals(n.snapshots.set_names(index.names)):
+            index = n.snapshots
+        else:
+            index = index.set_names(n.snapshots.names)
+        frame = pd.DataFrame(erm["values"], index=index, columns=erm["regions"], dtype=float)
+        frame.columns.name = "erm_region"
+        duals["erm_region_price"] = frame
+    return duals
+
+
 def _get_line_x_sssc_total_max(config):
     """Return the optional LineX SSSC total capacity limit."""
     line_x_config = config.get("lines", {}).get("convert_lines_to_line_x", {})
@@ -437,6 +609,10 @@ def _get_line_x_sssc_variable(model):
     return None
 
 
+# Name of the system-wide SSSC capacity cap; store_sssc_total_max_dual reads its dual.
+SSSC_TOTAL_MAX_CONSTRAINT = "LineX-sssc_tot_max"
+
+
 def add_line_x_sssc_total_max_constraint(n, snapshots, config):
     """Cap the sum of optimized LineX SSSC capacities when configured."""
     sssc_tot_max = _get_line_x_sssc_total_max(config)
@@ -454,9 +630,32 @@ def add_line_x_sssc_total_max_constraint(n, snapshots, config):
 
     n.model.add_constraints(
         line_x_sssc_var.sum() <= sssc_tot_max,
-        name="LineX-sssc_tot_max",
+        name=SSSC_TOTAL_MAX_CONSTRAINT,
     )
     logger.info("Added LineX SSSC total capacity constraint at %.3f MW.", sssc_tot_max)
+
+
+def store_sssc_total_max_dual(n):
+    """
+    Store the shadow price of the system SSSC cap in ``n.sssc_total_max_price``.
+
+    A ``pd.Series`` in currency per MVAr and year, indexed by constraint name: what
+    one more MVAr of allowed SSSC capacity saves, net of that MVAr's own annualised
+    cost, since the SSSC capex is part of the objective. A binding cap comes out
+    negative in the solver's convention. The row carries no snapshot dimension, so
+    the capacity split leaves it on the original variable and its dual is unchanged.
+    An uncapped run has no such row and stores nothing.
+    """
+    name = SSSC_TOTAL_MAX_CONSTRAINT
+    if name not in n.model.constraints:
+        return
+    dual = getattr(n.model.constraints[name], "dual", None)
+    if dual is None:
+        logger.warning("No dual available for %s; skipping its SSSC capacity price.", name)
+        return
+    price = float(np.asarray(dual).reshape(-1)[0]) / row_scale(n, name)
+    n.sssc_total_max_price = pd.Series({name: price}, name="sssc_total_max_price")
+    logger.info("Stored the SSSC capacity cap price: %s %.4g/MVAr/yr.", name, price)
 
 
 def _get_line_x_sssc_nom_max_pu(config):
@@ -925,6 +1124,7 @@ if __name__ == "__main__":
     if "REM" in opts:
         store_regional_co2_duals(n)
     store_electrolysis_duals(n)
+    store_sssc_total_max_dual(n)
 
     existing_meta = getattr(n, "meta", {})
     if not isinstance(existing_meta, dict):
@@ -934,10 +1134,18 @@ if __name__ == "__main__":
         **existing_meta,
         "wildcards": dict(snakemake.wildcards),
     }
+    # Carried in n.meta because the attributes the store_* helpers set are not exported.
+    policy_duals = policy_duals_metadata(n)
+    if policy_duals:
+        n.meta[POLICY_DUALS_META_KEY] = policy_duals
+    else:
+        n.meta.pop(POLICY_DUALS_META_KEY, None)
     n.export_to_netcdf(snakemake.output[0])
+    # The config output stays a config: results live in the network, not here.
+    config_meta = {key: value for key, value in n.meta.items() if key != POLICY_DUALS_META_KEY}
     with open(snakemake.output.config, "w") as file:
         yaml.dump(
-            n.meta,
+            config_meta,
             file,
             default_flow_style=False,
             allow_unicode=True,

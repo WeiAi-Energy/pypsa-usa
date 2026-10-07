@@ -18,6 +18,7 @@ from simplify_network import (
     busmap_by_target_bus_count,
     clustering_from_busmap,
     contract_short_branches,
+    generator_aggregation_weights,
     planning_horizon,
     retired_by,
     identity_busmap,
@@ -97,6 +98,59 @@ def _split_plant_network():
         index=n.snapshots,
     )
     return n
+
+
+def _supply_curve_pair_network():
+    """Two extendable solar bins, one of which also carries a little existing plant."""
+    n = _network_with_degree_two_bus()
+    for name, bus, p_nom, capital_cost in (("at_a", "a", 10.0, 100.0), ("at_b", "b", 0.0, 200.0)):
+        n.add(
+            "Generator",
+            name,
+            bus=bus,
+            carrier="solar",
+            p_nom=p_nom,
+            p_nom_min=p_nom,
+            p_nom_max=1000.0,
+            p_nom_extendable=True,
+            capital_cost=capital_cost,
+        )
+    n.generators_t.p_max_pu = pd.DataFrame(
+        {"at_a": [0.2, 0.2], "at_b": [0.6, 0.6]},
+        index=n.snapshots,
+    )
+    return n
+
+
+def test_extendable_supply_curve_bins_are_weighted_by_their_potential():
+    n = _supply_curve_pair_network()
+    n.add("Generator", "plant", bus="c", carrier="CCGT", p_nom=300.0, p_nom_max=np.inf, p_nom_extendable=True)
+    n.add("Generator", "fixed_solar", bus="d", carrier="solar", p_nom=40.0, p_nom_max=500.0)
+    n.add("Generator", "candidate", bus="d", carrier="OCGT", p_nom_max=np.inf, p_nom_extendable=True)
+
+    weights = generator_aggregation_weights(n.generators)
+
+    # The existing 10 MW must not stand in for the 1000 MW bin it sits in.
+    assert weights["at_a"] == weights["at_b"] == 1000.0
+    # Everything else keeps p_nom for existing plant, p_nom_max or 1 for candidates.
+    assert weights["plant"] == 300.0
+    assert weights["fixed_solar"] == 40.0
+    assert weights["candidate"] == 1.0
+
+
+def test_clustering_conserves_the_potential_weighted_cost_and_profile_of_wind_solar():
+    n = _supply_curve_pair_network()
+    busmap = pd.Series({"m": "m", "a": "ab", "b": "ab", "c": "c", "d": "d"})
+
+    clustered = clustering_from_busmap(n, busmap, line_length_factor=1.0).network
+
+    merged = clustered.generators.query("bus == 'ab' and carrier == 'solar'")
+    assert len(merged) == 1
+    merged = merged.iloc[0]
+    assert merged.p_nom == 10.0
+    assert merged.p_nom_max == 2000.0
+    np.testing.assert_allclose(merged.capital_cost, 150.0)
+    np.testing.assert_allclose(clustered.generators_t.p_max_pu[merged.name], [0.4, 0.4])
 
 
 def test_low_degree_bus_splits_capacity_and_averages_generator_attributes():

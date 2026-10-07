@@ -169,6 +169,43 @@ def test_attach_flexible_electrolysis_nation_still_skips_buses_without_an_h2ptcr
     assert set(links.bus0) == {"ac_1"}
 
 
+def test_attach_flexible_electrolysis_trans_grp_uses_one_bus_per_transmission_group():
+    n = network_with_ac_buses()
+    n.add("Bus", "ac_3", carrier="AC", x=5.0, y=6.0, country="US")
+    n.add("Bus", "ac_4", carrier="AC", x=7.0, y=8.0, country="MX")
+    n.buses["h2ptcreg"] = pd.Series({"ac_1": "Texas", "ac_2": "California", "ac_3": "Texas"})
+    n.buses["trans_grp"] = pd.Series({"ac_1": "ERCOT", "ac_2": "CAISO", "ac_3": "ERCOT", "ac_4": "MX_grp"})
+
+    attach_flexible_electrolysis(
+        n,
+        {"enable": True, "accounting_region": "trans_grp"},
+        str(COSTS),
+    )
+
+    h2_buses = {"ERCOT" + FLEXIBLE_ELECTROLYSIS_BUS_SUFFIX, "CAISO" + FLEXIBLE_ELECTROLYSIS_BUS_SUFFIX}
+    assert set(n.buses.index[n.buses.carrier == "H2"]) == h2_buses
+    links = n.links[n.links.carrier == "electrolysis"]
+    # ac_4 has no h2ptcreg (non-US), so it gets no link despite its trans_grp.
+    assert set(links.bus0) == {"ac_1", "ac_2", "ac_3"}
+    assert links.set_index("bus0").bus1.to_dict() == {
+        "ac_1": "ERCOT" + FLEXIBLE_ELECTROLYSIS_BUS_SUFFIX,
+        "ac_2": "CAISO" + FLEXIBLE_ELECTROLYSIS_BUS_SUFFIX,
+        "ac_3": "ERCOT" + FLEXIBLE_ELECTROLYSIS_BUS_SUFFIX,
+    }
+    assert n.buses.loc["ERCOT" + FLEXIBLE_ELECTROLYSIS_BUS_SUFFIX, "x"] == pytest.approx(3.0)
+
+
+def test_attach_flexible_electrolysis_trans_grp_requires_the_bus_attribute():
+    n = network_with_ac_buses()
+
+    with pytest.raises(ValueError, match="trans_grp"):
+        attach_flexible_electrolysis(
+            n,
+            {"enable": True, "accounting_region": "trans_grp"},
+            str(COSTS),
+        )
+
+
 def test_attach_flexible_electrolysis_rejects_unknown_accounting_region():
     n = network_with_ac_buses()
 

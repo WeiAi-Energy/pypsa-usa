@@ -2,13 +2,23 @@
 # Costs
 ## Costs and Candidate Resources
 
- In PyPSA-USA, candidate resource forecasted capital and operating costs are defined by the NREL Annual Technology Baseline (ATB) accessed through the PUDL project. The model currently uses the 2024 ATB which provides data for expected costs across the years 2025 - 2050. Users are able to configure which ATB model case and scenario to reference:
+ In PyPSA-USA, candidate resource forecasted capital and operating costs are defined by the NLR (formerly NREL) Annual Technology Baseline (ATB) accessed through the PUDL project. The model uses the 2025 ATB by default, which provides projected costs across the years 2023 - 2060 and requires PUDL v2026.9.0 or later. ATB costs are published in the vintage's own dollar year (2023 USD for the 2025 ATB, 2022 USD for the 2024 ATB) and are restated in 2022 USD with US CPI, the year every other cost table in the model uses. Users are able to configure the ATB vintage, cost drivers case, financing case and scenario:
 
  ```yaml
    atb:
-    model_case: "Market" # Market, R&D
+    report_year: 2025 # ATB vintage; 2025 needs pudl_path v2026.9.0 or later
+    cost_case: "R&D" # R&D, Exp
+    tax_credits: false
     scenario: "Moderate" # Advanced, Conservative, Moderate
 ```
+
+The 2025 ATB splits what earlier vintages called the model case into two parts. The
+cost drivers case is either `R&D` (research-driven cost reductions only) or `Exp`
+(Expanded: R&D plus supply chain and market drivers). The Expanded case exists only for
+land-based wind, PV and batteries, so every other technology falls back to `R&D`.
+`tax_credits` selects financing that includes the tax credits enacted as of July 2025.
+For `report_year` 2024 and earlier, `tax_credits: true` selects the `Market` case and
+`false` selects the `R&D` case; `cost_case` is ignored.
 
 ### Regional Cost Differentiation
 
