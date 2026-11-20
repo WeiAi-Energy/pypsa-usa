@@ -26,7 +26,10 @@ country -- interconnection labels and the seam cut need the national graph --
 and ``build_base_network`` then filters it by ``{interconnect}`` exactly as it
 filters the BE grid.
 
-Selected with ``model_topology: transmission_network: hifld``.
+Selected with ``model_topology: transmission_network: hifld``. The input is the
+HIFLD "Electric Power Transmission Lines" layer as downloaded by
+``rule retrieve_hifld_transmission_lines``; ``reduce_lines`` keeps one row per
+line record with its voltage, DC flag, endpoints and route length.
 
 The five things HIFLD cannot supply on its own
 ----------------------------------------------
@@ -53,8 +56,8 @@ The five things HIFLD cannot supply on its own
 
 4. *Offshore points of interconnection.* The BE path finds them by looking for
    onshore buses wired to BE's own offshore substations, which HIFLD does not
-   have. The coordinates of those POI sites were extracted from BE once and are
-   matched here to the nearest HIFLD bus.
+   have. The same BE sites (see ``be_offshore_poi_sites``) are matched here to
+   the nearest HIFLD bus.
 
 5. *Generators.* Nothing to do for the main fleet: ``add_electricity`` matches
    ``powerplants.csv`` (PUDL/EIA, carries lat/lon) to buses by coordinate, so it
@@ -70,6 +73,7 @@ import numpy as np
 import pandas as pd
 import shapely
 from _helpers import configure_logging
+from build_base_network import BE_OFFSHORE_SUB_ID_MIN, TEXAS_POI_SUB_IDS
 from build_bus_population import load_county_population
 from build_shapes import load_na_shapes
 from scipy.sparse import coo_matrix
@@ -145,6 +149,89 @@ BUS_ID_OFFSET = 200_000
 MAX_REKEY_KM = {"dcline": 75.0, "plant": 100.0, "poi": 100.0}
 
 
+#: Voltage (kV) taken for a record whose ``VOLTAGE`` is missing, by ``VOLT_CLASS``.
+CLASS_KV = {
+    "UNDER 100": 69.0,
+    "100-161": 138.0,
+    "220-287": 230.0,
+    "345": 345.0,
+    "500": 500.0,
+    "735 AND ABOVE": 765.0,
+}
+
+#: ``STATUS`` values of lines that do not carry power.
+DROP_STATUS = ("UNDER CONSTRUCTION", "INACTIVE")
+
+COLUMNS = ["id", "kv", "dc", "lon1", "lat1", "lon2", "lat2", "route_km"]
+
+
+def _parts(geometry):
+    return list(geometry.geoms) if geometry.geom_type == "MultiLineString" else [geometry]
+
+
+def endpoints(geometry) -> tuple[float, float, float, float]:
+    """First point of the first part and last point of the last part."""
+    parts = _parts(geometry)
+    (lon1, lat1), (lon2, lat2) = parts[0].coords[0][:2], parts[-1].coords[-1][:2]
+    return lon1, lat1, lon2, lat2
+
+
+def route_km(geometry) -> float:
+    """Length of a (multi)line string in km, as the sum of great-circle segments."""
+    total = 0.0
+    for part in _parts(geometry):
+        xy = np.radians(np.asarray(part.coords)[:, :2])
+        lon, lat = xy[:, 0], xy[:, 1]
+        a = np.sin(np.diff(lat) / 2) ** 2 + np.cos(lat[:-1]) * np.cos(lat[1:]) * np.sin(np.diff(lon) / 2) ** 2
+        total += float((2 * EARTH_RADIUS_KM * np.arcsin(np.sqrt(a))).sum())
+    return total
+
+
+def reduce_lines(raw: gpd.GeoDataFrame) -> pd.DataFrame:
+    """The HIFLD layer as one row per line record with the :data:`COLUMNS`.
+
+    ``kv`` is ``VOLTAGE`` or, where that is missing (``-999999``), the
+    representative voltage of ``VOLT_CLASS`` (:data:`CLASS_KV`); ``dc`` is 1 if
+    ``TYPE`` names DC; the endpoints are the first point of the first part and the
+    last point of the last part; ``route_km`` sums great-circle segments. Records
+    with neither a voltage nor a voltage class, :data:`DROP_STATUS` records and
+    empty geometries are dropped.
+    """
+    geometry = raw.geometry.name
+    lines = raw.rename(columns={c: c.upper() for c in raw.columns if c != geometry})
+    if lines.crs is not None:
+        lines = lines.to_crs(4326)
+    lines = lines[lines.geometry.notna() & ~lines.geometry.is_empty]
+
+    voltage = pd.to_numeric(lines["VOLTAGE"], errors="coerce")
+    kv = voltage.where(voltage > 0, lines["VOLT_CLASS"].map(CLASS_KV))
+    keep = kv.notna() & ~lines["STATUS"].isin(DROP_STATUS)
+    logger.info(
+        "Keeping %d of %d records; dropping %d without a voltage or voltage class and %d %s.",
+        int(keep.sum()),
+        len(lines),
+        int(kv.isna().sum()),
+        int((kv.notna() & lines["STATUS"].isin(DROP_STATUS)).sum()),
+        " or ".join(DROP_STATUS),
+    )
+    lines, kv = lines[keep], kv[keep]
+
+    ends = np.array([endpoints(g) for g in lines.geometry])
+    out = pd.DataFrame(
+        {
+            "id": pd.to_numeric(lines["ID"]).astype(np.int64).to_numpy(),
+            "kv": kv.astype(float).to_numpy(),
+            "dc": lines["TYPE"].astype(str).str.contains("DC").astype(int).to_numpy(),
+            "lon1": ends[:, 0],
+            "lat1": ends[:, 1],
+            "lon2": ends[:, 2],
+            "lat2": ends[:, 3],
+            "route_km": [route_km(g) for g in lines.geometry],
+        },
+    )
+    return out.sort_values("id").reset_index(drop=True)[COLUMNS]
+
+
 def haversine_km(lon1, lat1, lon2, lat2):
     lon1, lat1, lon2, lat2 = (np.radians(np.asarray(v, dtype=float)) for v in (lon1, lat1, lon2, lat2))
     a = np.sin((lat2 - lat1) / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin((lon2 - lon1) / 2) ** 2
@@ -195,7 +282,7 @@ def cluster_sites(lon, lat, radius_km=SITE_RADIUS_KM):
 
 
 def _within(points, shapes):
-    """Return per point whether it falls inside any of ``shapes``."""
+    """Boolean per point: whether it falls inside any of ``shapes``."""
     hit = gpd.sjoin(points, shapes[["geometry"]].to_crs(points.crs), how="left", predicate="within")
     return hit.groupby(level=0).index_right.first().reindex(range(len(points))).notna().to_numpy()
 
@@ -454,6 +541,30 @@ def rekey_by_coordinate(lat, lon, bus_table, max_km, restrict_to=None):
     return new_id, distance_km
 
 
+def be_offshore_poi_sites(be_bus2sub, be_sub, be_branch):
+    """The BE substations ``build_base_network`` uses as offshore points of interconnection.
+
+    Those are the onshore ends of BE's lines from its offshore substations
+    (``identify_osw_poi``) plus :data:`TEXAS_POI_SUB_IDS` (``assign_texas_poi``).
+    Returns ``sub_id``, ``name``, ``lat``, ``lon``, ``interconnect`` and ``source``.
+    """
+    sub_of = be_bus2sub.set_index("bus_id").sub_id
+    lines = be_branch.query("branch_device_type == 'Line'")
+    from_sub = lines.from_bus_id.map(sub_of)
+    to_sub = lines.to_bus_id.map(sub_of)
+    landfall = to_sub[(from_sub >= BE_OFFSHORE_SUB_ID_MIN) & (to_sub < BE_OFFSHORE_SUB_ID_MIN)].unique()
+
+    sites = pd.concat(
+        [
+            pd.DataFrame({"sub_id": landfall, "source": "be_offshore_line"}),
+            pd.DataFrame({"sub_id": TEXAS_POI_SUB_IDS, "source": "texas_hardcoded"}),
+        ],
+        ignore_index=True,
+    ).drop_duplicates("sub_id")
+    sites = sites.merge(be_sub[["sub_id", "name", "lat", "lon", "interconnect"]], on="sub_id", how="left")
+    return sites[["sub_id", "name", "lat", "lon", "interconnect", "source"]]
+
+
 def build_sites(ac):
     """Cluster line endpoints into substation sites and drop the station jumpers."""
     site = cluster_sites(np.concatenate([ac.lon1, ac.lon2]), np.concatenate([ac.lat1, ac.lat2]))
@@ -562,7 +673,7 @@ def build_branches(ac, bus0, bus1, buses, bus_of, interconnect, reference, trans
 
 
 def main(snakemake):
-    lines = pd.read_csv(snakemake.input.hifld_lines)
+    lines = reduce_lines(gpd.read_file(snakemake.input.hifld_lines))
     ac = lines.query("dc == 0").reset_index(drop=True)
     logger.info("Read %d HIFLD line record(s), %d of them AC.", len(lines), len(ac))
 
@@ -761,7 +872,7 @@ def main(snakemake):
     )
 
     # ---- offshore points of interconnection --------------------------------
-    poi = pd.read_csv(snakemake.input.offshore_poi)
+    poi = be_offshore_poi_sites(be_bus2sub.reset_index(), be_substations, be_branch)
     poi_bus, d_poi = rekey_by_coordinate(poi.lat, poi.lon, located, MAX_REKEY_KM["poi"])
     poi_out = poi.assign(bus_id=poi_bus, distance_km=d_poi.round(2))
     poi_out = poi_out[poi_out.bus_id >= 0]
