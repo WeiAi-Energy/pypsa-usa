@@ -91,6 +91,7 @@ def aggregate_to_substations(
     busmap,
     topological_boundaries: str,
     aggregation_strategies=dict(),
+    line_length_factor: float = 1.0,
 ):
     logger.info("Aggregating buses to substation level...")
 
@@ -101,7 +102,7 @@ def aggregate_to_substations(
         busmap,
         aggregate_generators_weighted=True,
         aggregate_one_ports=["Load", "StorageUnit"],
-        line_length_factor=1.0,
+        line_length_factor=line_length_factor,
         line_strategies=LINE_CAPEX_STRATEGIES,
         bus_strategies={
             "type": "max",
@@ -233,7 +234,10 @@ if __name__ == "__main__":
 
     busmap_to_sub = n.buses.sub_id.astype(int).astype(str).to_frame()
 
-    n = assign_line_lengths(n, 1.25)
+    # Lines enter the aggregation at their model length (great-circle x
+    # lines.length_factor) and leave it at the same basis, so pypsa's length
+    # rescaling of r/x leaves a line that is not merged unchanged.
+    n = assign_line_lengths(n, params.length_factor)
     n.links["underwater_fraction"] = 0
     n.buses.drop(columns=["substation_off"], inplace=True)
 
@@ -242,6 +246,7 @@ if __name__ == "__main__":
         busmap_to_sub.sub_id,
         topological_boundaries,
         params.aggregation_strategies,
+        line_length_factor=params.length_factor,
     )
 
     if topological_boundaries in ["reeds_zone", "state"] and "county" in n.buses.columns:

@@ -91,6 +91,8 @@ if config["model_topology"]["transmission_network"] == "hifld" and "EGS" in (
 # built once nationally (interconnection labelling needs the whole graph), hence
 # the usa shapes; build_base_network filters it by {interconnect}.
 rule build_hifld_grid:
+    params:
+        length_factor=config_provider("lines", "length_factor"),
     input:
         hifld_lines=DATA + "hifld/transmission_lines.geojson",
         county_population=DATA + "population/DECENNIALDHC2020.P1-Data.csv",
@@ -1140,6 +1142,7 @@ rule aggregate_to_substations:
         ),
         voltage_factor=config_provider("lines", "voltage_factor", default=False),
         dollar_year=config_provider("costs", "dollar_year"),
+        length_factor=config_provider("lines", "length_factor"),
     input:
         bus2sub=BUSMAPS + "{interconnect}/bus2sub.csv",
         sub=BUSMAPS + "{interconnect}/sub.csv",
@@ -1193,6 +1196,7 @@ rule cluster_resources:
         focus_weights=config_provider("focus_weights", default=False),
         simplify_network=config_provider("clustering", "simplify_network"),
         planning_horizons=config_provider("scenario", "planning_horizons"),
+        length_factor=config_provider("lines", "length_factor"),
     input:
         network=NETWORKS + "{interconnect}/elec_b.nc",
         regions_onshore=GEOSPATIAL + "{interconnect}/regions_onshore.geojson",

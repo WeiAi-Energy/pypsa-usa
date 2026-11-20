@@ -130,6 +130,7 @@ if __name__ == "__main__":
             solver_name=solver_name,
             algorithm=params.simplify_network["algorithm"],
             aggregation_strategies=params.aggregation_strategies,
+            line_length_factor=params.length_factor,
             weighting_strategy="population",
         )
         busmap = clustering.busmap

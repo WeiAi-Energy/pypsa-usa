@@ -55,7 +55,9 @@ interconnection. From the 2024-09-30 data it has 52,477 substations, 59,948 buse
   buses left in islands at the footprint boundary are merged into the nearest substation of the main
   network.
 - **Electrical parameters**: per-km resistance, reactance and susceptance, and the per-circuit rating,
-  are the medians of the TAMU lines of the same voltage class, applied over the route length.
+  are the medians of the TAMU lines of the same voltage class, applied over the great-circle distance
+  between the two substations times `lines.length_factor`. The TAMU per-km values are taken over the
+  same length (great-circle distance times `lines.length_factor`).
 - **Other inputs**: bus load weights come from county population. TAMU's DC ties, its hydro plants and
   its offshore wind points of interconnection, and the NREL capacity caps (keyed by TAMU substation),
   are moved to the nearest HIFLD bus or substation.

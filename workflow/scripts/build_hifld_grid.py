@@ -405,13 +405,15 @@ def largest_component_per_interconnect(n_site, bus0, bus1, interconnect):
     return keep_site
 
 
-def class_reference_parameters(be_bus, be_branch):
+def class_reference_parameters(be_bus, be_branch, length_factor):
     """Per-km r/x/b and per-circuit MVA for each voltage class, from BE's medians.
 
     BE's per-unit values are on a 100 MVA base, so a line's ohmic value is
     ``r_pu * kV**2 / 100``; dividing by the great-circle distance between its two
-    substations gives the per-km figure. Only lines over 1 km with a positive
-    rating are used, which excludes bus couplers.
+    substations times ``length_factor`` gives the per-km figure, on the same
+    length basis ``build_branches`` applies it over. Only lines whose great-circle
+    distance exceeds 1 km with a positive rating are used, which excludes bus
+    couplers.
     """
     lines = be_branch.query("branch_device_type == 'Line'").copy()
     for side in ("from", "to"):
@@ -422,15 +424,18 @@ def class_reference_parameters(be_bus, be_branch):
     usable = lines.query("km > 1 and x > 0 and b > 0 and rateA > 0 and from_kv == to_kv")
     usable = usable.assign(kV=usable.from_kv, cls=class_of(usable.from_kv))
 
+    # the line length on the model's basis: great-circle distance x length_factor
+    usable = usable.assign(length_km=usable.km * length_factor)
+
     reference = {}
     for level in VOLTAGE_CLASSES:
         group = usable.loc[usable.cls == level]
         if len(group) < 20:
             raise ValueError(f"Only {len(group)} usable BE lines in the {level} kV class; cannot take a median.")
         reference[level] = {
-            "r_ohm_km": float((group.r * group.kV**2 / 100 / group.km).median()),
-            "x_ohm_km": float((group.x * group.kV**2 / 100 / group.km).median()),
-            "b_s_km": float((group.b * 100 / group.kV**2 / group.km).median()),
+            "r_ohm_km": float((group.r * group.kV**2 / 100 / group.length_km).median()),
+            "x_ohm_km": float((group.x * group.kV**2 / 100 / group.length_km).median()),
+            "b_s_km": float((group.b * 100 / group.kV**2 / group.length_km).median()),
             "mva": float(group.rateA.median()),
         }
     return reference
@@ -593,17 +598,34 @@ def build_sites(ac):
     return ac[~self_loop].reset_index(drop=True), bus0[~self_loop], bus1[~self_loop], site_xy
 
 
-def build_branches(ac, bus0, bus1, buses, bus_of, interconnect, reference, transformer_reference):
+def build_branches(
+    ac,
+    bus0,
+    bus1,
+    site_xy,
+    buses,
+    bus_of,
+    interconnect,
+    reference,
+    transformer_reference,
+    length_factor,
+):
     """Synthesise line and transformer electrical parameters onto HIFLD's geometry.
 
-    Impedance is built from HIFLD's *surveyed route* length, which is what the
-    conductor actually measures. ``build_base_network`` separately sets
-    ``Line.length`` to the great-circle distance between the two substations, which
-    is 12% shorter over the whole grid; that figure drives per-km cost and
-    clustering, not the electrical parameters, and nothing downstream recomputes
-    r/x/b from it.
+    Impedance is built over the great-circle distance between the two sites times
+    ``length_factor`` (``lines.length_factor``), the same length the rest of the
+    model gives a line: ``build_base_network`` sets ``Line.length`` to that
+    great-circle distance and the clustering steps multiply it by
+    ``length_factor``. HIFLD's surveyed route length is not used here.
     """
-    km = ac.route_km.to_numpy()
+    lon, lat = site_xy.lon.to_numpy(), site_xy.lat.to_numpy()
+    km = haversine_km(lon[bus0], lat[bus0], lon[bus1], lat[bus1]) * length_factor
+    logger.info(
+        "Impedance length: %.0f km (great-circle x %.2f) against %.0f km of surveyed route.",
+        km.sum(),
+        length_factor,
+        ac.route_km.sum(),
+    )
     kv = ac.cls.to_numpy().astype(float)
     per_km = {field: np.array([reference[c][field] for c in ac.cls]) for field in ("r_ohm_km", "x_ohm_km", "b_s_km")}
 
@@ -754,7 +776,7 @@ def main(snakemake):
     be_bus["lon"] = be_bus2sub.sub_id.map(be_sub.lon)
     be_branch = pd.read_csv(snakemake.input.be_branch, index_col=0)
 
-    reference = class_reference_parameters(be_bus, be_branch)
+    reference = class_reference_parameters(be_bus, be_branch, snakemake.params.length_factor)
     for level, values in reference.items():
         logger.info(
             "%3d kV reference: r %.4f ohm/km, x %.4f ohm/km, b %.3e S/km, %.0f MVA per circuit",
@@ -768,11 +790,13 @@ def main(snakemake):
         ac,
         bus0,
         bus1,
+        site_xy,
         buses,
         bus_of,
         interconnect,
         reference,
         transformer_reference_parameters(be_bus, be_branch),
+        snakemake.params.length_factor,
     )
 
     # ---- load allocation weights from population --------------------------
