@@ -614,9 +614,9 @@ def build_branches(
 
     Impedance is built over the great-circle distance between the two sites times
     ``length_factor`` (``lines.length_factor``), the same length the rest of the
-    model gives a line: ``build_base_network`` sets ``Line.length`` to that
-    great-circle distance and the clustering steps multiply it by
-    ``length_factor``. HIFLD's surveyed route length is not used here.
+    model gives a line (``build_base_network`` sets ``Line.length`` to the same
+    product), so ``x / length`` is the per-km reference. HIFLD's surveyed route
+    length is not used here.
     """
     lon, lat = site_xy.lon.to_numpy(), site_xy.lat.to_numpy()
     km = haversine_km(lon[bus0], lat[bus0], lon[bus1], lat[bus1]) * length_factor

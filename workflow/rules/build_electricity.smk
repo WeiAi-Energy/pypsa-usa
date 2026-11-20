@@ -1373,7 +1373,6 @@ def dynamic_line_rating_enabled():
 rule build_dynamic_line_rating:
     params:
         dynamic_line_rating=config_provider("lines", "dynamic_line_rating"),
-        length_factor=config_provider("lines", "length_factor"),
     input:
         dlr=config["lines"].get("dynamic_line_rating", {}).get("file") or [],
         base_network=NETWORKS + "{interconnect}/elec_base_network.nc",

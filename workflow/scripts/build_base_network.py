@@ -214,24 +214,28 @@ def map_bus_to_region(
     return joined[~duplicated]
 
 
-def assign_line_length(n: pypsa.Network):
-    """Assigns line length to each line in the network using Haversine distance."""
+def assign_line_length(n: pypsa.Network, length_factor: float):
+    """Set each line's length to the great-circle distance between its buses times ``length_factor``.
+
+    This is the model length every later stage uses (``aggregate_to_substations``
+    and the clustering steps recompute it on the same basis).
+    """
     bus_df = n.buses[["x", "y"]]
     bus0 = bus_df.loc[n.lines.bus0].values
     bus1 = bus_df.loc[n.lines.bus1].values
     distances = haversine_np(bus0[:, 0], bus0[:, 1], bus1[:, 0], bus1[:, 1])
-    n.lines["length"] = distances
+    n.lines["length"] = distances * length_factor
 
 
 def assign_link_length_and_efficiency(n: pypsa.Network, length_factor: float):
-    """Assigns link length and efficiency to each link (DC transmission line) in the network using Haversine distance."""
+    """Set each DC link's length (great-circle distance times ``length_factor``) and its efficiency."""
     bus_df = n.buses[["x", "y"]]
     bus0 = bus_df.loc[n.links.bus0].values
     bus1 = bus_df.loc[n.links.bus1].values
-    distances = haversine_np(bus0[:, 0], bus0[:, 1], bus1[:, 0], bus1[:, 1])
-    n.links["length"] = distances
+    length = haversine_np(bus0[:, 0], bus0[:, 1], bus1[:, 0], bus1[:, 1]) * length_factor
+    n.links["length"] = length
     # 2% loss for inverters, 3%/1000km loss for DC lines, https://www.nature.com/articles/s41560-025-01752-6#Sec14
-    n.links["efficiency"] = 1 - 0.02 - 0.03 * distances * length_factor / 1000
+    n.links["efficiency"] = 1 - 0.02 - 0.03 * length / 1000
 
 
 def create_grid(polygon, cell_size):
@@ -770,7 +774,7 @@ def main(snakemake):
     add_custom_line_type(n)
     assign_line_types(n, snakemake.config["lines"]["types"])
     length_factor = snakemake.params.length_factor
-    assign_line_length(n)
+    assign_line_length(n, length_factor)
     assign_link_length_and_efficiency(n, length_factor)
     assign_missing_regions(n)
     assign_reeds_memberships(n, snakemake.input.reeds_memberships)

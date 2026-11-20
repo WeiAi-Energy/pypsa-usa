@@ -18,7 +18,8 @@ Mapping
   lines (not by the branch's own s_nom, which clustering/calibration may change).
   Every Line / AC Link joining (A, B) gets that rating (forward, reverse and
   vintaged ITL links alike); branches without base lines keep 1.0.
-* Base lines with great-circle length x ``lines.length_factor`` above
+* Base lines whose ``length`` (great-circle distance x ``lines.length_factor``,
+  as ``build_base_network`` stores it) exceeds
   ``lines.dynamic_line_rating.max_length_km`` keep the static rating (1.0).
 
 Time axis
@@ -122,7 +123,6 @@ def aggregate_dynamic_line_rating(
     base_network: pypsa.Network,
     busmap_files: list[str],
     network: pypsa.Network,
-    length_factor: float,
     max_length_km: float | None,
 ) -> pd.DataFrame:
     """Hourly relative rating of every model branch, labelled on the weather year's 365-day calendar."""
@@ -141,9 +141,9 @@ def aggregate_dynamic_line_rating(
 
     capped = np.zeros(len(base), dtype=bool)
     if max_length_km is not None:
-        capped = (base.length.to_numpy() * length_factor) > max_length_km
+        capped = base.length.to_numpy() > max_length_km
         logger.info(
-            f"{capped.sum()} base lines longer than {max_length_km} km (length x {length_factor}) "
+            f"{capped.sum()} base lines longer than {max_length_km} km "
             "keep the static rating.",
         )
 
@@ -200,7 +200,6 @@ if __name__ == "__main__":
         base_network=pypsa.Network(snakemake.input.base_network),
         busmap_files=[snakemake.input.busmap_b, snakemake.input.busmap_s, snakemake.input.busmap_c],
         network=pypsa.Network(snakemake.input.network),
-        length_factor=snakemake.params.length_factor,
         max_length_km=dlr.get("max_length_km"),
     )
     rating.to_parquet(snakemake.output[0])
