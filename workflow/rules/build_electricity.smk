@@ -1362,6 +1362,37 @@ rule add_extra_components:
         "../scripts/add_extra_components.py"
 
 
+def dynamic_line_rating_enabled():
+    return bool(config["lines"].get("dynamic_line_rating", {}).get("enable", False))
+
+
+rule build_dynamic_line_rating:
+    params:
+        dynamic_line_rating=config_provider("lines", "dynamic_line_rating"),
+        length_factor=config_provider("lines", "length_factor"),
+    input:
+        dlr=config["lines"].get("dynamic_line_rating", {}).get("file") or [],
+        base_network=NETWORKS + "{interconnect}/elec_base_network.nc",
+        busmap_b=BUSMAPS + "{interconnect}/busmap_b.csv",
+        busmap_s=BUSMAPS + "{interconnect}/busmap_s{simpl}.csv",
+        busmap_c=BUSMAPS + "{interconnect}/busmap_s{simpl}_{clusters}.csv",
+        network=NETWORKS + "{interconnect}/elec_s{simpl}_c{clusters}_ec.nc",
+    output:
+        PROFILES + "{interconnect}/dynamic_line_rating_s{simpl}_c{clusters}.parquet",
+    log:
+        LOGS + "{interconnect}/build_dynamic_line_rating_s{simpl}_c{clusters}.log",
+    benchmark:
+        BENCHMARKS + "{interconnect}/build_dynamic_line_rating_s{simpl}_c{clusters}"
+    threads: 1
+    resources:
+        mem_mb=lambda wildcards, input, attempt: 8000 * attempt,
+        walltime=config_provider(
+            "walltime", "build_dynamic_line_rating", default="01:00:00"
+        ),
+    script:
+        "../scripts/build_dynamic_line_rating.py"
+
+
 rule prepare_network:
     params:
         time_resolution=config_provider("clustering", "temporal", "resolution_elec"),
@@ -1385,6 +1416,12 @@ rule prepare_network:
             if config["custom_files"].get("activate", False)
             else RESOURCES
             + f"costs/costs_{config['scenario']['planning_horizons'][0]}.csv"
+        ),
+        dlr=(
+            PROFILES
+            + "{interconnect}/dynamic_line_rating_s{simpl}_c{clusters}.parquet"
+            if dynamic_line_rating_enabled()
+            else []
         ),
     output:
         NETWORKS + "{interconnect}/elec_s{simpl}_c{clusters}_ec_l{ll}_{opts}.nc",

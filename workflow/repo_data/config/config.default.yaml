@@ -289,8 +289,10 @@ lines:
   # the transport model, price all new AC capacity as 500 kV lines.
   voltage_factor: false                    # true = scale by voltage class; false = price every line at 500 kV
   dynamic_line_rating:
-    file: null                             # hourly relative ratings per model Line / AC Link, built outside the workflow by aggregate_dlr.py (absolute path; not tracked by Snakemake); null = static ratings
+    enable: false                          # true = scale s_max_pu (Lines) / p_max_pu (AC Links) hourly by the ratings in `file`, aggregated onto the model branches by rule build_dynamic_line_rating
+    file: null                             # CSV of hourly relative ratings, one column per line of elec_base_network.nc (e.g. dlr_2012.csv: 8760 rows from 1 Jan 00:00 of the weather year); required with enable
     cap: 1.3                               # upper clip on the relative rating; null = no cap
+    max_length_km: 100                     # base lines with length x length_factor above this keep the static rating; null = no limit
 
   # pyPSA line-type catalog, mapped onto AC corridors by v_nom. Every line in
   # the base network is assigned the LineType matching its voltage; values

@@ -102,10 +102,10 @@ def apply_dynamic_line_rating(n, fn, cap=None):
     Scale branch ratings by hourly relative dynamic line ratings read from ``fn``.
 
     ``fn`` (.parquet or .csv) holds one column per model Line or AC Link and one row
-    per hour of the weather year (365-day calendar), as written by the standalone
-    ``aggregate_dlr.py``. Snapshots are matched by relabelling each timestep to the
-    weather year. Lines get ``s_max_pu * rating``, AC links ``p_max_pu * rating``;
-    ``cap`` clips the relative rating from above. Snakemake does not track ``fn``.
+    per hour of the weather year (365-day calendar), as written by rule
+    ``build_dynamic_line_rating``. Snapshots are matched by relabelling each timestep
+    to the weather year. Lines get ``s_max_pu * rating``, AC links
+    ``p_max_pu * rating``; ``cap`` clips the relative rating from above.
     """
     rating = pd.read_parquet(fn) if str(fn).endswith(".parquet") else pd.read_csv(fn, index_col=0)
     rating.index = pd.DatetimeIndex(rating.index)
@@ -410,8 +410,8 @@ if __name__ == "__main__":
     set_line_s_max_pu(n, transport_model, params.lines["s_max_pu"])
 
     dlr = params.lines.get("dynamic_line_rating") or {}
-    if dlr.get("file"):
-        apply_dynamic_line_rating(n, dlr["file"], cap=dlr.get("cap"))
+    if dlr.get("enable"):
+        apply_dynamic_line_rating(n, snakemake.input.dlr, cap=dlr.get("cap"))
 
     # temporal averaging
     time_resolution = params.time_resolution
