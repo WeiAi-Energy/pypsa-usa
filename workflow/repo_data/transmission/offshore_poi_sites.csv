@@ -1,0 +1,60 @@
+sub_id,name,lat,lon,interconnect,source
+242,ROCKLAND 3,44.1219,-69.143,Eastern,be_offshore_line
+420,ADDISON 1,44.5637,-67.7603,Eastern,be_offshore_line
+502,YARMOUTH 4,43.767,-70.135,Eastern,be_offshore_line
+872,PORTSMOUTH 4,43.0595,-70.8234,Eastern,be_offshore_line
+1318,FAIRHAVEN 2,41.5837,-70.8534,Eastern,be_offshore_line
+1766,MARSHFIELD 5,42.1299,-70.8231,Eastern,be_offshore_line
+1969,SOMERSET 4,41.6982,-71.2124,Eastern,be_offshore_line
+2084,NEWPORT 10,41.4771,-71.3748,Eastern,be_offshore_line
+2868,LYNBROOK,40.6317,-73.6483,Eastern,be_offshore_line
+3456,HOLTSVILLE 2,40.8312,-73.0765,Eastern,be_offshore_line
+3513,YAPHANK,40.7936,-72.9519,Eastern,be_offshore_line
+5945,MARMORA 2,39.2818,-74.6181,Eastern,be_offshore_line
+5995,ATLANTIC CITY 6,39.3832,-74.4232,Eastern,be_offshore_line
+8300,DOVER 18,39.1735,-75.5279,Eastern,be_offshore_line
+9046,BERLIN 12,38.3425,-75.2686,Eastern,be_offshore_line
+10106,NORFOLK 15,37.0106,-76.2998,Eastern,be_offshore_line
+10354,WASHINGTON 53,35.6577,-77.0147,Eastern,be_offshore_line
+10448,ELIZABETH CITY 3,36.313,-76.2227,Eastern,be_offshore_line
+10454,MOREHEAD CITY,34.7474,-76.7587,Eastern,be_offshore_line
+11215,SOUTHPORT 5,33.9293,-78.0783,Eastern,be_offshore_line
+11649,CHARLESTON 14,32.7088,-79.9686,Eastern,be_offshore_line
+11841,CONWAY 13,33.8723,-79.1697,Eastern,be_offshore_line
+12092,GEORGETOWN 13,33.3293,-79.3769,Eastern,be_offshore_line
+13139,SAVANNAH 22,32.1358,-81.1375,Eastern,be_offshore_line
+13180,BRUNSWICK 14,31.2021,-81.5536,Eastern,be_offshore_line
+13494,JACKSONVILLE 39,30.259,-81.4346,Eastern,be_offshore_line
+13804,DAYTONA BEACH 3,29.2101,-81.0458,Eastern,be_offshore_line
+13874,MELBOURNE 4,28.0987,-80.5918,Eastern,be_offshore_line
+13938,HOLLYWOOD 12,26.0103,-80.1158,Eastern,be_offshore_line
+14346,MIAMI 71,25.5839,-80.3376,Eastern,be_offshore_line
+14639,BOCA RATON 9,27.327,-80.2298,Eastern,be_offshore_line
+35000,NEAH BAY,48.2414,-124.578,Western,be_offshore_line
+35001,FORKS,47.6956,-124.184,Western,be_offshore_line
+35003,WESTPORT,46.9275,-124.172,Western,be_offshore_line
+35005,OCEAN PARK,46.4983,-123.983,Western,be_offshore_line
+35511,GOLD BEACH,42.5352,-124.277,Western,be_offshore_line
+35515,COOS BAY 1,43.3603,-124.093,Western,be_offshore_line
+35517,FLORENCE 1,44.1582,-124.055,Western,be_offshore_line
+35525,CLOVERDALE 1,45.3609,-123.787,Western,be_offshore_line
+35794,TOLEDO 2,44.6119,-123.932,Western,be_offshore_line
+35831,CRESCENT CITY,41.9152,-124.134,Western,be_offshore_line
+35834,MENDOCINO,39.2883,-123.803,Western,be_offshore_line
+35835,FORT BRAGG,39.4902,-123.661,Western,be_offshore_line
+36073,EUREKA 3,40.7415,-124.21,Western,be_offshore_line
+36086,PETALUMA 1,38.1578,-122.69,Western,be_offshore_line
+36122,SAN FRANCISCO 6,37.8485,-122.559,Western,be_offshore_line
+36252,SANTA CRUZ 1,37.0109,-122.132,Western,be_offshore_line
+36461,PACIFIC GROVE,36.6363,-121.937,Western,be_offshore_line
+36734,SANTA BARBARA 6,34.4782,-119.771,Western,be_offshore_line
+37251,REDONDO BEACH 4,33.8504,-118.395,Western,be_offshore_line
+37277,AVILA BEACH,35.2115,-120.856,Western,be_offshore_line
+37532,SAN DIEGO 4,32.8839,-117.253,Western,be_offshore_line
+40729,WADSWORTH,28.795,-96.0481,Texas,texas_hardcoded
+40760,TEXAS CITY 1,29.3914,-94.9201,Texas,texas_hardcoded
+40776,BAYTOWN 1,29.6744,-94.9139,Texas,texas_hardcoded
+40854,FREEPORT 1,28.9802,-95.342,Texas,texas_hardcoded
+40893,GALVESTON 2,29.2782,-94.8333,Texas,texas_hardcoded
+40894,POINT COMFORT 1,28.6527,-96.56,Texas,texas_hardcoded
+40908,FREEPORT 2,28.9913,-95.4075,Texas,texas_hardcoded

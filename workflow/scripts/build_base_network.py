@@ -766,8 +766,7 @@ def main(snakemake):
             assert len(n.buses) > 0, (
                 "No buses remaining in network. Check your model_topology: inclusion:, you may be filtering the wrong zones for the selected interconnect"
             )
-        if is_hifld:
-            n = merge_footprint_islands(n)
+        # bill: no footprint island merge (PR #956), as in the sssc project grid.
 
     col_list = ["poi_bus", "poi_sub", "poi"]
     n.buses = n.buses.drop(columns=[col for col in col_list if col in n.buses])

@@ -92,7 +92,10 @@ if config["model_topology"]["transmission_network"] == "hifld" and "EGS" in (
 # the usa shapes; build_base_network filters it by {interconnect}.
 rule build_hifld_grid:
     input:
-        hifld_lines=DATA + "hifld/transmission_lines.geojson",
+        # bill: the HIFLD grid of the sssc project (local line table), not the
+        # Esri download of PR #956, so that dlr_2012.csv matches its line ids.
+        hifld_lines="repo_data/transmission/hifld_lines.csv.gz",
+        offshore_poi="repo_data/transmission/offshore_poi_sites.csv",
         county_population=DATA + "population/DECENNIALDHC2020.P1-Data.csv",
         county_shapes=GEOSPATIAL + "usa/county_shapes.geojson",
         state_shapes=GEOSPATIAL + "usa/state_boundaries.geojson",
