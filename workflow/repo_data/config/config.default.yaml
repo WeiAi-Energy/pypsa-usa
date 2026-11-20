@@ -288,6 +288,9 @@ lines:
   # dearer (x1.4 at 345 kV, x1.9 at 230 kV, x2.9 at 138 kV), while the ReEDS tables, and
   # the transport model, price all new AC capacity as 500 kV lines.
   voltage_factor: false                    # true = scale by voltage class; false = price every line at 500 kV
+  dynamic_line_rating:
+    file: null                             # hourly relative ratings per model Line / AC Link, built outside the workflow by aggregate_dlr.py (absolute path; not tracked by Snakemake); null = static ratings
+    cap: 1.3                               # upper clip on the relative rating; null = no cap
 
   # pyPSA line-type catalog, mapped onto AC corridors by v_nom. Every line in
   # the base network is assigned the LineType matching its voltage; values

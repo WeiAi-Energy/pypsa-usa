@@ -347,6 +347,12 @@ properties:
       regional_costs: {type: boolean}
       voltage_factor: {type: boolean}
       types: {type: object}
+      dynamic_line_rating:
+        type: object
+        additionalProperties: false
+        properties:
+          file: {type: [string, "null"]}
+          cap: {type: [number, "null"]}
 
   links:
     type: object

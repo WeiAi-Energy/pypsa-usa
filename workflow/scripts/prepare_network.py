@@ -97,6 +97,50 @@ def set_line_s_max_pu(n, transport_model, s_max_pu=0.7):
         n.lines["s_max_pu"] = s_max_pu
 
 
+def apply_dynamic_line_rating(n, fn, cap=None):
+    """
+    Scale branch ratings by hourly relative dynamic line ratings read from ``fn``.
+
+    ``fn`` (.parquet or .csv) holds one column per model Line or AC Link and one row
+    per hour of the weather year (365-day calendar), as written by the standalone
+    ``aggregate_dlr.py``. Snapshots are matched by relabelling each timestep to the
+    weather year. Lines get ``s_max_pu * rating``, AC links ``p_max_pu * rating``;
+    ``cap`` clips the relative rating from above. Snakemake does not track ``fn``.
+    """
+    rating = pd.read_parquet(fn) if str(fn).endswith(".parquet") else pd.read_csv(fn, index_col=0)
+    rating.index = pd.DatetimeIndex(rating.index)
+    rating.columns = rating.columns.astype(str)
+    if cap is not None:
+        rating = rating.clip(upper=cap)
+
+    weather_year = rating.index[0].year
+    timesteps = n.snapshots.get_level_values("timestep")
+    rating = rating.reindex(pd.DatetimeIndex([t.replace(year=weather_year) for t in timesteps]))
+    if rating.isna().any().any():
+        raise ValueError(f"{fn} does not cover every snapshot of weather year {weather_year}.")
+    rating.index = n.snapshots
+
+    applied = 0
+    for static, dynamic, attr, names in [
+        (n.lines, n.lines_t, "s_max_pu", n.lines.index),
+        (n.links, n.links_t, "p_max_pu", n.links.index[n.links.carrier == "AC"]),
+    ]:
+        cols = rating.columns.intersection(names.astype(str))
+        if cols.empty:
+            continue
+        if len(cols) < len(names):
+            logger.warning(f"{len(names) - len(cols)} of {len(names)} branches have no dynamic rating in {fn}.")
+        scaled = rating[cols].mul(static.loc[cols, attr], axis=1)
+        dynamic[attr] = pd.concat([dynamic[attr].drop(columns=cols, errors="ignore"), scaled], axis=1)
+        applied += len(cols)
+    if not applied:
+        raise ValueError(f"No column of {fn} names a Line or AC Link of this network.")
+    logger.info(
+        f"Dynamic line rating from {fn} (weather year {weather_year}, cap {cap}) applied to {applied} branches; "
+        f"mean relative rating {rating.to_numpy().mean():.3f}."
+    )
+
+
 def set_transmission_limit(n, ll_type, factor):
     """
     Set transmission limits according to ll wildcard.
@@ -364,6 +408,10 @@ if __name__ == "__main__":
     n.investment_period_weightings["objective"] = objective_w
 
     set_line_s_max_pu(n, transport_model, params.lines["s_max_pu"])
+
+    dlr = params.lines.get("dynamic_line_rating") or {}
+    if dlr.get("file"):
+        apply_dynamic_line_rating(n, dlr["file"], cap=dlr.get("cap"))
 
     # temporal averaging
     time_resolution = params.time_resolution
