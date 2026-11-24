@@ -335,18 +335,17 @@ their four deliberate simplifications.
 - `Demand Response` and `Pumping Load` are CPUC-only resources with no PyPSA-USA counterpart;
   they are kept as rows with `model_mw == 0`.
 - The CPUC `Capmax MW` column is **nameplate** capacity as SERVM sees it, while the model side
-  totals `p_nom`. Seasonal derates are applied downstream in `add_electricity`, not in
-  `powerplants.csv`, so the benchmark compares nameplate to nameplate — but any summer-rating
-  comparison against a third source will not line up with either.
+  totals `p_nom`. The ambient-temperature thermal derate is applied downstream in
+  `add_electricity`, not in `powerplants.csv`, so the benchmark compares nameplate to
+  nameplate — but any summer-rating comparison against a third source will not line up with
+  either.
 - `honor_planned_retirements: true` drops units at their EIA planned retirement date as of the
   first investment period, so the fleet is smaller than an all-existing-units inventory.
 
 **Not implemented**
 
-- `conventional: ambient_derate` (CPUC SERVM unit-specific hourly thermal derates) is a
-  reserved phase-2 option. `enable: true` raises `NotImplementedError`. When it lands it
-  *replaces* the EIA-860 seasonal derate rather than stacking on it — stacking an ambient
-  derate on a seasonal derate, or on a UCAP-derated capacity credit, double-counts the same
-  thermal deficiency.
+- CPUC SERVM unit-specific hourly thermal derates are not used. Thermal units carry the
+  generic temperature-dependent forced-outage derate of `conventional: ambient_derate`
+  (Murphy et al. 2019 curves at the bus-region temperature) instead.
 - `servm_weather_years` with more than one entry (stochastic weather scenarios) raises
   `NotImplementedError`.

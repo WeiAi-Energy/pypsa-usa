@@ -694,13 +694,33 @@ Processed cost tables are written to `resources/costs/costs_{year}.csv`.
    :file: configtables/costs.csv
 ```
 
+(ambient_derate_cf)=
+## `conventional: ambient_derate`
+
+Thermal units are always derated for temperature-dependent forced outages
+([PyPSA-USA #850](https://github.com/PyPSA/pypsa-usa/issues/850), following ReEDS
+`outage_rates.py`): `p_max_pu(t) = 1 - FOR(T_bus(t))`. FOR is the forced outage rate of
+the unit's prime mover as a function of temperature from Murphy, Lavin & Apt (2019),
+interpolated linearly between the published points (-15 to 35 °C), extended linearly
+beyond them and capped at `max_outage`. `T_bus` is the area-weighted mean 2 m air
+temperature of the bus's onshore region, which `build_ambient_temperature` computes from
+the ERA5 cutout of `renewable_weather_years[0]` (`retrieve_cutout` downloads it from Zenodo,
+about 5 GB per year). This replaces the EIA-860 summer/winter seasonal derate. Carriers
+missing from `prime_movers` are not derated.
+
+The existing fleet is derated in `add_electricity` at the `{simpl}` bus, before clustering,
+so a clustered generator takes the capacity-weighted mean of its members' profiles. New
+builds of every thermal carrier are derated in `add_extra_components` at the clustered bus.
+
 (ucap_cf)=
 ## `ucap`
 
 The `ucap` section applies an Unforced Capacity (UCAP) derate to conventional generators for
 resource-adequacy accounting: each carrier's capacity is derated by its Forced Outage Rate (FOR),
 implemented as `p_max_pu = 1 - FOR`. Enable it when reserve-margin constraints should be met with
-outage-derated rather than installed capacity. Rates are given in percent per carrier.
+outage-derated rather than installed capacity. Rates are given in percent per carrier. A carrier
+that `conventional: ambient_derate: prime_movers` already derates for forced outages cannot also
+be listed here; the run stops rather than count the outages twice.
 
 ```{eval-rst}
 .. literalinclude:: ../../workflow/repo_data/config/config.common.yaml

@@ -266,23 +266,40 @@ conventional:
   unit_commitment: false                   # true = enforce min-up/down, startup costs (LP relaxation by default)
   must_run: false                          # true = apply ADS must-run minimum loading to flagged thermal plants
   dynamic_fuel_price:
-    enable: false                          # true = use time-varying fuel prices instead of constant
+    # true = existing plants' fuel prices vary in time (monthly PUDL / wholesale series, add_electricity);
+    # false = every gas, coal, oil, nuclear and biomass plant pays the AEO/ATB fuel cost of each investment
+    # period (add_extra_components); with several periods, plants whose cost changes between their active
+    # periods get a marginal_cost time series stepping by period, all others a static marginal_cost
+    enable: false
     pudl: true                             # PUDL receipts-based fuel cost time series (monthly resolution)
     wholesale: true                        # CAISO/wholesale natural-gas hub prices (overrides PUDL for NG)
 
-  # PHASE 2 (NOT IMPLEMENTED): ambient-temperature capacity derates for thermal
-  # units, from the CPUC SERVM unit-specific hourly derate profiles. Setting
-  # `enable: true` raises NotImplementedError in add_electricity — the profiles
-  # are not retrieved or applied yet (see the reserved
-  # `retrieve_cpuc_thermal_derate` rule in workflow/rules/retrieve.smk).
-  # When implemented it REPLACES the EIA-860 summer/winter seasonal derate
-  # rather than stacking on it; stacking an ambient derate on a seasonal derate
-  # (or on a UCAP-derated capacity credit) double-counts the same thermal
-  # deficiency and must never be done.
+  # Temperature-dependent derate of thermal units (always on; PyPSA-USA #850,
+  # after ReEDS outage_rates.py): p_max_pu(t) = 1 - FOR(T_bus(t)), with FOR vs.
+  # temperature per prime mover from Murphy et al. (2019) and T_bus the
+  # area-weighted mean air temperature of the bus region from the ERA5 cutout
+  # of renewable_weather_years[0] (build_ambient_temperature; retrieve_cutout
+  # downloads the ~5 GB cutout from Zenodo). Carriers not listed under
+  # prime_movers are not derated. Cannot be combined with `ucap` for the same
+  # carrier (both are forced-outage derates).
   ambient_derate:
-    enable: false                          # PHASE 2 — leave false
-    source: cpuc_servm                     # CPUC SERVM unit-specific hourly derates
-    replaces_seasonal_derate: true         # never stack with the EIA-860 seasonal derate
+    outage_curves: repo_data/plants/outage_forced_temperature_murphy2019.csv
+    cutout: era5                           # atlite cutout name; file is cutouts/usa_{cutout}_{weather year}.nc
+    max_outage: 0.4                        # cap on the FOR extrapolated beyond -15..35 degC (ReEDS value)
+    prime_movers:                          # carrier -> Murphy (2019) prime-mover curve
+      CCGT: combined_cycle
+      CCGT-95CCS: combined_cycle
+      CCGT-97CCS: combined_cycle
+      OCGT: combustion_turbine
+      hydrogen_ct: combustion_turbine
+      oil: diesel                          # ReEDS maps oil/gas steam (OGS) to the diesel curve
+      coal: steam
+      coal-95CCS: steam
+      coal-99CCS: steam
+      biomass: steam
+      waste: steam
+      nuclear: nuclear
+      SMR: nuclear
 
 
 # ====================================================================

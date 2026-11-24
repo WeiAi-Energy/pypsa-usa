@@ -47,7 +47,7 @@ generator — or a StorageUnit for battery contracts — at a California bus:
 - **Bus** is the max-LAF bus of the row's SERVM region, taken from the same
   `build_servm_load_weights` table the demand path uses. This is why the option requires
   `demand: profile: servm`.
-- **Techno-economics** (heat rate, efficiency, marginal cost, ramp rates, seasonal derates,
+- **Techno-economics** (heat rate, efficiency, marginal cost, ramp rates,
   unit-commitment parameters) are capacity-weighted over the plant's constituent units, so a
   contract inherits the same data the physical fleet carries. Generators are named
   `R <cpuc_unit_name>`, mirroring the `C` prefix on the conventional fleet, and are attached
@@ -62,7 +62,9 @@ Four simplifications are deliberate and worth knowing before reading results:
    such profile at all the contract is dropped rather than given an implicit 100 % capacity
    factor.
 2. **Remote hydro (the Hoover entitlements) is attached as a firm, energy-unlimited
-   generator** carrying only the EIA-860 seasonal derate. CRSP hydrology, Lake Mead elevation
+   generator** with no derate (hydro has no entry in `conventional: ambient_derate:
+   prime_movers`). Remote thermal contracts take the ambient-temperature derate of their
+   California attachment bus, not of their physical location. CRSP hydrology, Lake Mead elevation
    and the monthly energy schedules that actually bound those entitlements are not modelled.
 3. **Rows with no `eia_plant_id` are skipped** — nine rows, 2,210 MW in total: Mexicali
    TDM/LR2, Powerex/BC, the ESJ Baja wind contracts, a few pure entitlement rows (1,931 MW

@@ -521,7 +521,9 @@ CONFIG_DIFF_ALLOWLIST: tuple[tuple[str, str], ...] = (
     # --- capabilities shipped default-off (HF-21) ----------------------------
     (
         "conventional.ambient_derate",
-        "HF-21 default-off capability (enable: false); develop raises if it is ever enabled",
+        "deliberate model change (PyPSA-USA #850): always-on temperature-dependent FOR derate of "
+        "thermal units, replacing the EIA-860 summer/winter derate; thermal p_max_pu differs from "
+        "the baseline by design",
     ),
     (
         "electricity.imports",
@@ -635,7 +637,6 @@ _ALLOWLIST_GUARDS = {
     "costs.atb": _atb_equals_inline_fallback,
     "clustering.cluster_network.weighting_strategy": _not_population,
     "clustering.simplify_network.weighting_strategy": _not_population,
-    "conventional.ambient_derate": _disabled_block,
     "dac": _disabled_block,
     "electricity.imports": _disabled_block,
     "electricity.exports": _disabled_block,

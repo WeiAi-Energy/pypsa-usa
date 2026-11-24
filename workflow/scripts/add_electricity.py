@@ -26,6 +26,13 @@ from _helpers import (
     update_p_nom_max,
     weighted_avg,
 )
+from ambient_derate import (
+    ambient_derate_settings,
+    apply_ambient_derate,
+    clip_p_min_pu_to_p_max_pu,
+    load_bus_temperature,
+    load_outage_curves,
+)
 from constants import (
     REGIONAL_MULTIPLIER_COL,
     RENEWABLE_INTERCONNECTION_COL,
@@ -791,15 +798,14 @@ def attach_conventional_generators(
     if unit_commitment:
         for attr in committable_fields:
             plants[attr] = plants[attr].astype(float).fillna(defaults[attr])
-        # p_min_pu is the unit's minimum stable level. For a conventional unit
-        # p_max_pu is the seasonal derate (apply_seasonal_capacity_derates below),
-        # so p_min_pu must not exceed the *tighter* of the two seasons: above it
-        # the only feasible commitment is status = 0 and the unit's capacity
-        # silently disappears for that whole season.
-        # build_powerplants.sanitize_uc_parameters already enforces
+        # p_min_pu is the unit's minimum stable level. It must not exceed the
+        # unit's net capability (the tighter of the EIA-860 summer and winter
+        # ratings): build_powerplants.sanitize_uc_parameters already enforces
         # this at the source; the clip here is the second line of defence for
         # hand-edited or externally supplied powerplants.csv files, and the 0.95
         # factor leaves 5 % headroom against the rounding applied to p_max_pu.
+        # The hourly ambient derate (p_max_pu) can sit lower still; it clips
+        # p_min_pu again once applied (ambient_derate.clip_p_min_pu_to_p_max_pu).
         plants["p_min_pu"] = (
             (plants.minimum_load_mw / plants.p_nom)
             .clip(
@@ -1458,28 +1464,6 @@ def _remote_vre_profile(n: pypsa.Network, bus: str, carrier: str) -> pd.Series |
     return profiles[available].mean(axis=1)
 
 
-def _apply_remote_seasonal_derates(n: pypsa.Network, derates: pd.DataFrame):
-    """Seasonal (EIA-860) p_max_pu for firm remote units, mirroring apply_seasonal_capacity_derates.
-
-    ``apply_seasonal_capacity_derates`` runs earlier in ``main`` and keys off the
-    ``plants`` frame, so it cannot see these generators; the same summer/winter
-    split is reproduced here for exactly the columns added by this module.
-    """
-    if derates.empty:
-        return
-    sns_dt = n.snapshots.get_level_values(1)
-    summer_sns = sns_dt[sns_dt.month.isin([6, 7, 8])]
-    winter_sns = sns_dt[~sns_dt.month.isin([6, 7, 8])]
-
-    p_max_pu = pd.DataFrame(1.0, index=sns_dt, columns=derates.index)
-    p_max_pu.loc[summer_sns, derates.index] *= derates["summer_derate"].astype(float)
-    p_max_pu.loc[winter_sns, derates.index] *= derates["winter_derate"].astype(float)
-    p_max_pu = broadcast_investment_horizons_index(n, p_max_pu).round(3)
-    # Round only the new columns: the VRE profiles already in the frame are
-    # attached at full precision and must not be re-rounded here.
-    n.generators_t.p_max_pu = pd.concat([n.generators_t.p_max_pu, p_max_pu], axis=1)
-
-
 def attach_remote_contracted_resources(
     n: pypsa.Network,
     plants_prefilter: pd.DataFrame,
@@ -1782,7 +1766,7 @@ def _attach_remote_firm(
         commit_flags = firm["carrier"].isin(conventional_carriers)
         # p_min_pu is a hard must-run on a non-committable generator, so it is
         # only carried for units that are actually committable. The 0.95 factor
-        # and the seasonal-derate clip mirror attach_conventional_generators.
+        # and the clip to the EIA-860 net ratings mirror attach_conventional_generators.
         p_min_pu = (
             firm["min_load_pu"]
             .clip(upper=np.minimum(firm["summer_derate"], firm["winter_derate"]), lower=0)
@@ -1822,8 +1806,8 @@ def _attach_remote_firm(
     n.generators.loc[firm.index, "vom_cost"] = firm["vom"]
     n.generators.loc[firm.index, "fuel_cost"] = firm["fuel_cost"]
     n.generators.loc[firm.index, "heat_rate"] = firm["heat_rate"]
-
-    _apply_remote_seasonal_derates(n, firm[["summer_derate", "winter_derate"]])
+    # p_max_pu: the ambient-temperature derate (ambient_derate.apply_ambient_derate)
+    # reaches these units in the caller, at their attachment bus
 
 
 def collect_remote_vre_profiles(n: pypsa.Network, vre: pd.DataFrame) -> tuple[dict[str, pd.Series], list[str]]:
@@ -1948,56 +1932,6 @@ def broadcast_investment_horizons_index(n: pypsa.Network, df: pd.DataFrame):
     return df
 
 
-def check_ambient_derate_not_enabled(conventional: dict) -> None:
-    """Guard the phase-2 ``conventional.ambient_derate`` hook.
-
-    Ambient-temperature derates are meant to REPLACE the EIA-860 seasonal
-    derate applied by :func:`apply_seasonal_capacity_derates`, never to stack
-    on top of it (or on top of a UCAP-derated capacity credit) — stacking
-    double-counts the same thermal deficiency. Until the CPUC SERVM
-    unit-specific hourly derate profiles are retrieved and applied, enabling
-    the key is a hard error rather than a silent no-op.
-    """
-    if (conventional or {}).get("ambient_derate", {}).get("enable", False):
-        raise NotImplementedError(
-            "conventional.ambient_derate is a phase-2 hook; CPUC unit-specific hourly derate profiles are not yet retrieved or applied.",
-        )
-
-
-def apply_seasonal_capacity_derates(
-    n: pypsa.Network,
-    plants: pd.DataFrame,
-    conventional_carriers: list,
-    sns: pd.DatetimeIndex,
-):
-    """Applies conventional rerate factor p_max_pu based on the seasonal capacity derates defined in eia860."""
-    sns_dt = sns.get_level_values(1)
-    summer_sns = sns_dt[sns_dt.month.isin([6, 7, 8])]
-    winter_sns = sns_dt[~sns_dt.month.isin([6, 7, 8])]
-
-    # conventional_carriers = ['geothermal'] # testing override impact
-
-    conv_plants = plants.query("carrier in @conventional_carriers")
-    conv_plants.index = "C" + conv_plants.index
-    conv_gens = n.generators.query("carrier in @conventional_carriers")
-
-    p_max_pu = pd.DataFrame(1.0, index=sns_dt, columns=conv_gens.index)
-    p_max_pu.loc[summer_sns, conv_gens.index] *= conv_plants.loc[
-        :,
-        "summer_derate",
-    ].astype(float)
-    p_max_pu.loc[winter_sns, conv_gens.index] *= conv_plants.loc[
-        :,
-        "winter_derate",
-    ].astype(float)
-
-    p_max_pu = broadcast_investment_horizons_index(n, p_max_pu)
-    n.generators_t.p_max_pu = pd.concat(
-        [n.generators_t.p_max_pu, p_max_pu],
-        axis=1,
-    ).round(3)
-
-
 def apply_must_run_ratings(
     n: pypsa.Network,
     plants: pd.DataFrame,
@@ -2023,6 +1957,9 @@ def apply_must_run_ratings(
     )
     must_run = conv_plants.query("ads_mustrun == True")
     n.generators.loc[must_run.index, "p_min_pu"] = must_run.minimum_load_pu.round(3) * 0.95
+    # the ambient derate makes p_max_pu vary hourly, and it can fall below
+    # the EIA-860 ratings the minimum load was clipped to above
+    clip_p_min_pu_to_p_max_pu(n, must_run.index)
 
 
 def clean_bus_data(n: pypsa.Network):
@@ -2258,13 +2195,22 @@ def main(snakemake):
         renewable_carriers,
         unit_commitment=params.conventional["unit_commitment"],
     )
-    check_ambient_derate_not_enabled(params.conventional)
-    apply_seasonal_capacity_derates(
-        n,
-        plants,
-        conventional_carriers,
-        n.snapshots,
-    )
+    # Temperature-dependent forced-outage derate of thermal units:
+    # p_max_pu(t) = 1 - FOR(T_bus(t)), at the {simpl} bus, before clustering.
+    ambient_temperature, _ = load_bus_temperature(snakemake.input.ambient_temperature)
+    ambient_settings = ambient_derate_settings(params.conventional)
+    outage_curves = load_outage_curves(snakemake.input.outage_curves)
+
+    def ambient_derate():
+        return apply_ambient_derate(
+            n,
+            ambient_temperature,
+            ambient_settings,
+            outage_curves,
+            broadcast_investment_horizons_index,
+        )
+
+    ambient_derate()
 
     if params.conventional.get("must_run", False):
         # TODO (@ktehranchi): In the future the plants that are must-run should
@@ -2354,6 +2300,8 @@ def main(snakemake):
                 params.conventional["unit_commitment"],
             )
             _finalize_remote_summary(summary, dropped_vre)
+        # firm remote units take the derate of their attachment bus
+        ambient_derate()
 
     update_p_nom_max(n)
 

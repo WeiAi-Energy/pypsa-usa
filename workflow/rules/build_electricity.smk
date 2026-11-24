@@ -528,6 +528,52 @@ rule build_renewable_profiles:
         "../scripts/build_renewable_profiles.py"
 
 
+AMBIENT_DERATE = config.get("conventional", {}).get("ambient_derate") or {}
+
+
+def ambient_derate_files(wildcards):
+    """Inputs of the temperature-dependent thermal derate (conventional.ambient_derate)."""
+    return {
+        "ambient_temperature": TEMPERATURE
+        + f"{wildcards.interconnect}/temp_air_s{wildcards.simpl}.nc",
+        "outage_curves": AMBIENT_DERATE.get(
+            "outage_curves",
+            "repo_data/plants/outage_forced_temperature_murphy2019.csv",
+        ),
+    }
+
+
+rule build_ambient_temperature:
+    params:
+        snapshots=config_provider("snapshots"),
+        weather_years=config_provider("renewable_weather_years"),
+    input:
+        regions_onshore=GEOSPATIAL + "{interconnect}/regions_onshore_s{simpl}.geojson",
+        # the ERA5 cutout of the weather year; retrieve_cutout fetches it from
+        # Zenodo unless enable.build_cutout builds it
+        cutout=lambda w: (
+            "cutouts/"
+            + CDIR
+            + "usa_"
+            + AMBIENT_DERATE.get("cutout", "era5")
+            + f"_{config['renewable_weather_years'][0]}.nc"
+        ),
+    output:
+        temperature=TEMPERATURE + "{interconnect}/temp_air_s{simpl}.nc",
+    log:
+        LOGS + "{interconnect}/build_ambient_temperature_s{simpl}.log",
+    benchmark:
+        BENCHMARKS + "{interconnect}/build_ambient_temperature_s{simpl}"
+    threads: 1
+    resources:
+        mem_mb=lambda wildcards, attempt: 12000 * attempt,
+        walltime=config_provider(
+            "walltime", "build_ambient_temperature", default="01:00:00"
+        ),
+    script:
+        "../scripts/build_ambient_temperature.py"
+
+
 # eastern broken out just to aviod awful formatting issues
 # texas in western due to spillover of interconnect
 INTERCONNECT_2_STATE = {
@@ -1042,6 +1088,7 @@ rule add_electricity:
     input:
         unpack(dynamic_fuel_price_files),
         unpack(remote_contracted_resource_files),
+        unpack(ambient_derate_files),
         **(
             {
                 # For GODEEEP future scenarios: pass all horizon-specific profiles

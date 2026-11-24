@@ -147,12 +147,6 @@ rule retrieve_cpuc_baseline_generators:
         "../scripts/retrieve_cpuc_data.py"
 
 
-# RESERVED (phase 2): `retrieve_cpuc_thermal_derate` will pull the CPUC SERVM
-# unit-specific ambient-temperature derate profiles that back the
-# `conventional.ambient_derate` config hook. Until it lands, enabling that key
-# raises NotImplementedError in add_electricity.
-
-
 sector_datafiles = [
     # heating sector
     "population/DECENNIALDHC2020.P1-Data.csv",
@@ -287,10 +281,9 @@ rule retrieve_ship_raster:
         move(input[0], output[0])
 
 
-if (
-    not config["enable"].get("build_cutout", False)
-    and not config["renewable"]["dataset"] == "godeeep"
-):
+# Every dataset needs the cutout: build_ambient_temperature reads the air
+# temperature of the weather year from it for the thermal derate.
+if not config["enable"].get("build_cutout", False):
 
     rule retrieve_cutout:
         input:

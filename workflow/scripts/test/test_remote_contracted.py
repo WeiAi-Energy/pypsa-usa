@@ -320,7 +320,16 @@ def test_remote_renewable_without_any_profile_is_dropped(network, plants_prefilt
     assert "no capacity-factor profile" in caplog.text
 
 
-def test_firm_units_carry_seasonal_derates_and_commitment(network, plants_prefilter):
+def test_firm_units_carry_ambient_derate_and_commitment(network, plants_prefilter):
+    from add_electricity import broadcast_investment_horizons_index
+    from ambient_derate import (
+        DEFAULT_OUTAGE_CURVES,
+        ambient_derate_settings,
+        apply_ambient_derate,
+        forced_outage_rate,
+        load_outage_curves,
+    )
+
     _attach(
         network,
         plants_prefilter,
@@ -333,13 +342,29 @@ def test_firm_units_carry_seasonal_derates_and_commitment(network, plants_prefil
     assert not network.generators.at[name, "p_nom_extendable"]
     assert network.generators.at[name, "p_nom_min"] == pytest.approx(400.0)
     # minimum_load_mw is 40 % of every constituent, clipped by the tighter
-    # seasonal derate (0.9) and relaxed by the 5 % headroom factor
+    # EIA-860 net rating (0.9) and relaxed by the 5 % headroom factor
     assert network.generators.at[name, "p_min_pu"] == pytest.approx(0.4 * 0.95)
+    # no seasonal p_max_pu any more: the caller applies the ambient derate
+    assert name not in network.generators_t.p_max_pu.columns
 
+    hours = pd.DatetimeIndex(network.snapshots.get_level_values(1))
+    temperature = pd.DataFrame(
+        {bus: np.where(hours.month == 7, 35.0, 10.0) for bus in network.buses.index},
+        index=hours,
+    )
+    curves = load_outage_curves(os.path.join(os.path.dirname(__file__), "..", "..", DEFAULT_OUTAGE_CURVES))
+    apply_ambient_derate(
+        network,
+        temperature,
+        ambient_derate_settings({}),
+        curves,
+        broadcast_investment_horizons_index,
+    )
     p_max_pu = network.generators_t.p_max_pu[name]
     months = p_max_pu.index.get_level_values(1).month
-    assert np.allclose(p_max_pu[months == 7], 0.9)  # summer derate
-    assert np.allclose(p_max_pu[months == 1], 1.0)  # winter derate
+    cc = curves["combined_cycle"]
+    assert np.allclose(p_max_pu[months == 7], 1 - forced_outage_rate(np.array([35.0]), cc)[0], atol=1e-3)
+    assert np.allclose(p_max_pu[months == 1], 1 - forced_outage_rate(np.array([10.0]), cc)[0], atol=1e-3)
 
 
 def test_category_mismatch_uses_the_contracted_category_carrier(network, plants_prefilter, caplog):
