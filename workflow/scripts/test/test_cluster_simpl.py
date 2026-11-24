@@ -11,6 +11,7 @@ import pypsa
 from cluster_network import clustering_for_n_clusters
 from cluster_simpl import (
     build_county_busmap,
+    build_state_busmap,
     resolve_simpl_mode,
 )
 
@@ -21,6 +22,10 @@ def test_resolve_simpl_mode_identity():
 
 def test_resolve_simpl_mode_county():
     assert resolve_simpl_mode("county") == "county"
+
+
+def test_resolve_simpl_mode_state():
+    assert resolve_simpl_mode("state") == "state"
 
 
 def test_resolve_simpl_mode_kmeans_digits():
@@ -169,3 +174,14 @@ def test_county_clustering_works_on_an_interconnection_seam(substation_network):
     assert len(buses) == 3
     assert buses.loc["p9_06001_eastern", "interconnect"] == "eastern"
     assert buses.loc["p9_06001_western", "interconnect"] == "western"
+
+
+def test_build_state_busmap_one_bus_per_state(substation_network):
+    substation_network.buses.loc[["s3", "s4"], "reeds_state"] = "NV"
+    assert build_state_busmap(substation_network).tolist() == ["CA", "CA", "NV", "NV"]
+
+
+def test_build_state_busmap_splits_a_state_across_interconnections(substation_network):
+    substation_network.buses.loc["s4", "interconnect"] = "eastern"
+    busmap = build_state_busmap(substation_network)
+    assert busmap.tolist() == ["CA_western", "CA_western", "CA_western", "CA_eastern"]

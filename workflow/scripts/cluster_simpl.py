@@ -36,19 +36,20 @@ def resolve_simpl_mode(value: str) -> str:
     Returns one of:
       - "identity": pass-through (empty string)
       - "county":   fast-path using county FIPS as busmap
+      - "state":    fast-path using the state as busmap (one bus per state)
       - "kmeans":   numeric value -> N-cluster k-means
 
     Raises ValueError for anything else, listing the recognized values.
     """
     if value == "":
         return "identity"
-    if value == "county":
-        return "county"
+    if value in ("county", "state"):
+        return value
     if value.isdigit():
         return "kmeans"
     raise ValueError(
         f"Unknown simpl wildcard value {value!r}. Recognized values are: "
-        f'"" (identity pass-through), "county" (county FIPS fast-path), '
+        f'"" (identity pass-through), "county" (county FIPS fast-path), "state" (state fast-path), '
         f"or a positive integer (k-means).",
     )
 
@@ -70,19 +71,42 @@ def build_county_busmap(n: "pypsa.Network") -> "pd.Series":
             "'reeds_zone') in your config, or use a numeric {simpl} wildcard.",
         )
     busmap = n.buses.reeds_zone.astype(str) + "_" + n.buses.county.astype(str)
+    return _split_at_interconnection_seams(n, busmap, "county")
 
-    # A few counties straddle an interconnection seam (east Texas, MT/WY).
-    # Buses of different interconnections must not be merged: pypsa refuses
-    # to aggregate a disagreeing bus attribute, and the merge would join two
-    # asynchronous systems. Those counties get one bus per interconnection.
+
+def build_state_busmap(n: "pypsa.Network") -> "pd.Series":
+    """Construct a sub_id -> '<state>' busmap for the simpl='state' fast-path.
+
+    The state is ``reeds_state``, which aggregate_to_substations keeps under every
+    topological_boundaries; with topological_boundaries='state' it is also the zone.
+    """
+    if "reeds_state" not in n.buses.columns or n.buses.reeds_state.isna().any():
+        raise ValueError(
+            "simpl='state' requires every substation bus to carry a non-null 'reeds_state' attribute.",
+        )
+    busmap = n.buses.reeds_state.astype(str)
+    return _split_at_interconnection_seams(n, busmap, "state")
+
+
+def _split_at_interconnection_seams(n: "pypsa.Network", busmap: "pd.Series", kind: str) -> "pd.Series":
+    """Give a group spanning two interconnections one bus per interconnection.
+
+    A few counties (east Texas, MT/WY) and states (TX, NM, SD, ...) straddle an
+    interconnection seam. Buses of different interconnections must not be merged:
+    pypsa refuses to aggregate a disagreeing bus attribute, and the merge would join
+    two asynchronous systems.
+    """
     if "interconnect" in n.buses.columns:
         split = n.buses.groupby(busmap).interconnect.transform("nunique") > 1
         if split.any():
             groups = sorted(busmap[split].unique())
+            busmap = busmap.copy()
             busmap[split] = busmap[split] + "_" + n.buses.interconnect[split].astype(str)
             logger.info(
-                "simpl='county': %d county group(s) span two interconnections and are split: %s",
+                "simpl='%s': %d %s group(s) span two interconnections and are split: %s",
+                kind,
                 len(groups),
+                kind,
                 groups,
             )
     return busmap.rename("busmap")
@@ -105,7 +129,7 @@ if __name__ == "__main__":
     schema_entry = log_network_schema(n, stage="entry")
 
     simpl_mode = resolve_simpl_mode(snakemake.wildcards.simpl)
-    if simpl_mode in ("kmeans", "county"):
+    if simpl_mode in ("kmeans", "county", "state"):
         configured_strategy = params.simplify_network.get(
             "weighting_strategy",
             "population",
@@ -118,14 +142,15 @@ if __name__ == "__main__":
                 configured_strategy,
             )
 
-        # county fast-path: the busmap is the county FIPS partition, so no
-        # k-means (and no cluster-count QP) runs at all.
-        county_busmap = build_county_busmap(n) if simpl_mode == "county" else False
+        # county / state fast-path: the busmap is the county FIPS or state
+        # partition, so no k-means (and no cluster-count QP) runs at all.
+        zone_busmaps = {"county": build_county_busmap, "state": build_state_busmap}
+        zone_busmap = zone_busmaps[simpl_mode](n) if simpl_mode in zone_busmaps else False
 
         clustering = clustering_for_n_clusters(
             n,
-            0 if simpl_mode == "county" else int(snakemake.wildcards.simpl),
-            custom_busmap=county_busmap,
+            0 if zone_busmap is not False else int(snakemake.wildcards.simpl),
+            custom_busmap=zone_busmap,
             focus_weights=params.focus_weights,
             solver_name=solver_name,
             algorithm=params.simplify_network["algorithm"],
