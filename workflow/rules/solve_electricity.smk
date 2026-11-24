@@ -15,6 +15,10 @@ def ev_policy_input(wildcards):
         return []
 
 
+def piecewise_line_costs_input(wildcards):
+    return config["lines"].get("piecewise_expansion_costs") or []
+
+
 rule solve_network:
     params:
         solving=config_provider("solving"),
@@ -29,6 +33,7 @@ rule solve_network:
         interface_limits=config["electricity"]["transmission_interface_limits"],
         pop_layout=pop_layout_input,
         ev_policy=ev_policy_input,
+        piecewise_line_costs=piecewise_line_costs_input,
     output:
         network=RESULTS
         + "{interconnect}/networks/elec_s{simpl}_c{clusters}_ec_l{ll}_{opts}_{sector}.nc",

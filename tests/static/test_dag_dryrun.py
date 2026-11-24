@@ -145,6 +145,15 @@ def test_interface_limits_input_follows_config_key(tmp_path):
 
 
 @pytest.mark.fast
+def test_piecewise_line_costs_input_follows_config_key(tmp_path):
+    """``lines: piecewise_expansion_costs`` adds its CSV to ``solve_network``'s inputs only when set."""
+    curves = tmp_path / "line_cost_curves.csv"
+    curves.write_text("line,breakpoint,capital_cost\n0,100,1.0\n")
+    assert not any(path.endswith("line_cost_curves.csv") for path in _solve_network_inputs([]))
+    assert str(curves) in _solve_network_inputs([f"lines={{piecewise_expansion_costs: '{curves}'}}"])
+
+
+@pytest.mark.fast
 @pytest.mark.parametrize("sector", ["", "E"])
 def test_co2_storage_input_in_electricity_studies(tmp_path, sector):
     """``co2: storage`` gives ``add_extra_components`` the CO2 storage CSV in electricity-only studies.

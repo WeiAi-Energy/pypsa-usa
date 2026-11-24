@@ -80,7 +80,10 @@ optimisation model. It is handled in the rule `prepare_network`.
 The wildcard consists of a type letter followed by a factor, e.g. `v1.25`, `copt`:
 
 - **`v` (volume):** limits the total *volume* of line expansion — capacity increases
-  weighted by line length (MW·km) — across AC lines and AC/DC links.
+  weighted by line length (MW·km) — across AC lines and AC/DC links. A corridor modelled
+  as a `_fwd`/`_rev` pair of links (HVDC lines, transport-model interfaces) counts once:
+  `prepare_network` gives each link of the pair half the corridor's length, as each
+  already carries half its capital cost.
 - **`c` (cost):** limits the total *cost* of line expansion — capacity increases weighted
   by capital cost — across AC lines and AC/DC links.
 
@@ -94,6 +97,41 @@ After the type letter you can specify:
   bounds apply).
 
 We recommend using the line-volume limit (`v...`) for constraining transmission expansion.
+
+### Limits per investment period
+
+With several planning horizons, an `ll` entry can instead give one limit per period as a
+mapping from planning horizon to limit:
+
+```yaml
+scenario:
+  planning_horizons: [2030, 2040, 2050]
+  ll: [{2040: v1.1, 2050: v1.2}]
+```
+
+The `Snakefile` turns the mapping into the wildcard `2040v1.1+2050v1.2`, which can also be
+written directly. Each limit caps the capacity installed by that period relative to today's:
+here at most 10 % more MW·km by 2040 and 20 % more by 2050. A period without its own entry
+takes the latest earlier one, and periods before the first entry (2030 here) get no
+expansion. Every year must be a planning horizon, and `opt` lifts the cap for its period.
+
+With several planning horizons a single `ll` such as `v1.1` is read the same way, as the
+limit of every period.
+
+PyPSA gives an extendable line a single capacity for all periods. pypsa-bill instead gives
+the AC lines and AC/DC links one capacity per period in every perfect-foresight solve over
+several planning horizons, with or without an `ll` limit (`s_nom_<period>` for lines,
+`p_nom_<period>` for links, for every period but the last, whose capacity is `s_nom`). Each
+cannot shrink over time, limits that period's flows and replaces the line's capacity in that
+period's investment cost, so a line carries flow and is paid for only from the period it is
+built in. The iterative line-impedance update (`skip_iterations: false`) rescales each
+period's impedance to that period's capacity. The results hold the capacity of each period
+in the columns `s_nom_<period>_opt` / `p_nom_<period>_opt`, with `s_nom_opt` the capacity of
+the last one. Links that are already split into vintages, i.e. the transport model's
+interface links `<name>` with a copy `<name>_<horizon>` built in each later horizon, keep
+their single capacity, since each copy only counts from its build year. Under
+`foresight: myopic` each horizon gets its own limit and line capacity is
+kept from one horizon to the next.
 
 ```{note}
 In result filenames the wildcard is preceded by the letter `l`

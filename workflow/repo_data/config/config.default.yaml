@@ -317,11 +317,30 @@ lines:
   # dearer (x1.4 at 345 kV, x1.9 at 230 kV, x2.9 at 138 kV), while the ReEDS tables, and
   # the transport model, price all new AC capacity as 500 kV lines.
   voltage_factor: false                    # true = scale by voltage class; false = price every line at 500 kV
-  dynamic_line_rating:
-    enable: false                          # true = scale s_max_pu (Lines) / p_max_pu (AC Links) hourly by the ratings in `file`, aggregated onto the model branches by rule build_dynamic_line_rating
-    file: null                             # CSV of hourly relative ratings, one column per line of elec_base_network.nc (e.g. dlr_2012.csv: 8760 rows from 1 Jan 00:00 of the weather year); required with enable
-    cap: 1.3                               # upper clip on the relative rating; null = no cap
-    max_length_km: 100                     # base lines with length (great-circle x length_factor) above this keep the static rating; null = no limit
+  # Convex piecewise expansion cost per line, replacing capital_cost for capacity added
+  # above today's s_nom. CSV with columns line,breakpoint,capital_cost, one row per segment:
+  # `line` is a line name in the solved network, `breakpoint` the segment's upper end in MW
+  # above today's s_nom (inf or empty = unbounded) and `capital_cost` its annualised cost
+  # per MW, non-decreasing from segment to segment. Lines not listed keep capital_cost.
+  piecewise_expansion_costs: null          # path relative to workflow/, or null = off
+  # Static synchronous series compensators (needs pypsa-bill): every AC line may get an
+  # SSSC, built by the optimisation, whose series compensation shifts the line's angle in
+  # the voltage law and so steers flows around loops. With several investment periods
+  # (perfect foresight) the SSSC capacity, its cost and max_pu apply per period.
+  sssc:
+    enable: true                          # true = extendable SSSCs on all AC lines
+    capex: 80                              # overnight cost, $/kW (= $/kVAr of SSSC rating)
+    lifetime: 20                           # years, for the annuity
+    wacc_real: 0.036                       # real discount rate, for the annuity (as transmission lines)
+    fom_fraction: 0.015                    # fixed O&M per year as a share of capex (as transmission, ReEDS trans_fom_frac)
+    max_pu: 0.3                            # SSSC rating <= max_pu x line capacity s_nom (per period)
+  # Hourly line ratings, for interconnect usa with transmission_network: hifld and
+  # renewable_weather_years: [2012] (other setups keep the static N1_derate only).
+  # The ratings of data/dlr_2012.csv (true) or data/slr_2012.csv (false), downloaded
+  # from Zenodo and aggregated onto the model branches, multiply the static rating
+  # independently of the derate: s_max_pu = N1_derate x rating (AC Links: p_max_pu x rating).
+  # Dynamic ratings are capped at 1.3 per base line, before the aggregation (fixed in build_dynamic_line_rating).
+  dynamic_line_rating: true              # true = dynamic ratings (dlr), false = static ratings (slr)
 
   # pyPSA line-type catalog, mapped onto AC corridors by v_nom. Every line in
   # the base network is assigned the LineType matching its voltage; values

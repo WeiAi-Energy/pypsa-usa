@@ -74,7 +74,14 @@ properties:
         items: {type: integer}
       clusters: {type: array}
       simpl: {type: array}
-      ll: {type: array}
+      ll:
+        type: array
+        items:
+          oneOf:
+          - {type: string}
+          - type: object
+            minProperties: 1
+            additionalProperties: {type: string}
       opts: {type: array}
       sector: {type: string}
       scope: {enum: [urban, rural, total]}
@@ -343,23 +350,27 @@ properties:
   lines:
     type: object
     additionalProperties: false
-    required: [s_max_pu, types]
+    required: [N1_derate, types]
     properties:
-      s_max_pu: {type: number}
+      N1_derate: {type: number, exclusiveMinimum: 0, maximum: 1}
       s_nom_max: {type: number}
       max_extension: {type: number}
       length_factor: {type: number}
       regional_costs: {type: boolean}
       voltage_factor: {type: boolean}
-      types: {type: object}
-      dynamic_line_rating:
+      piecewise_expansion_costs: {type: [string, "null"]}
+      sssc:
         type: object
         additionalProperties: false
         properties:
           enable: {type: boolean}
-          file: {type: [string, "null"]}
-          cap: {type: [number, "null"]}
-          max_length_km: {type: [number, "null"]}
+          capex: {type: number, minimum: 0}
+          lifetime: {type: number, exclusiveMinimum: 0}
+          wacc_real: {type: number, minimum: 0}
+          fom_fraction: {type: number, minimum: 0}
+          max_pu: {type: number, exclusiveMinimum: 0}
+      types: {type: object}
+      dynamic_line_rating: {type: boolean}
 
   links:
     type: object

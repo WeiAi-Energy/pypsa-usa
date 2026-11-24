@@ -6,7 +6,9 @@ as.
 - adding an exogenous **price** per tonne emissions of carbon-dioxide (or other kinds),
 - setting an **N-1 security margin** factor for transmission line capacities,
 - specifying an expansion limit on the **cost** of transmission expansion,
-- specifying an expansion limit on the **volume** of transmission expansion, and
+- specifying an expansion limit on the **volume** of transmission expansion,
+- letting the optimisation build **SSSCs** (static synchronous series compensators)
+  on AC lines (``lines: sssc``, needs pypsa-bill), and
 - reducing the **temporal** resolution by averaging over multiple hours
   or segmenting time series into chunks of varying lengths using ``tsam``.
 """
@@ -18,6 +20,7 @@ import numpy as np
 import pandas as pd
 import pypsa
 from _helpers import (
+    calculate_annuity,
     configure_logging,
     is_transport_model,
     load_costs,
@@ -27,7 +30,7 @@ from _helpers import (
 )
 from constants import HOURS_PER_YEAR
 from opts.bidirectional_link import bidirectional_pairs
-from select_representative_periods import apply_representative_periods, representative_periods_enabled
+from select_representative_periods import META_KEY, apply_representative_periods, representative_periods_enabled
 
 idx = pd.IndexSlice
 
@@ -277,28 +280,12 @@ def set_transmission_limit(n, ll_type, factor):
     """
     logger.info(f"Setting transmission limit for {ll_type} to {factor}")
 
-    dc_links = n.links.carrier == "DC" if not n.links.empty else pd.Series()
-    ac_links_existing = n.links.carrier == "AC" if not n.links.empty else pd.Series()
-
-    lines_s_nom = n.lines.s_nom
-    col = "capital_cost" if ll_type == "c" else "length"
-    ref = (
-        lines_s_nom @ n.lines[col]
-        + n.links.loc[dc_links, "p_nom"] @ n.links.loc[dc_links, col]
-        + n.links.loc[ac_links_existing, "p_nom"] @ n.links.loc[ac_links_existing, col]
-    )
+    ref = _transmission_reference(n, ll_type)
 
     if factor == "opt" or float(factor) > 1.0:
         # if opt allows expansion set respective lines/links to extendable
         # all links prior to this point have extendable set to false
-        n.lines["s_nom_min"] = lines_s_nom
-        n.lines["s_nom_extendable"] = True
-
-        n.links.loc[dc_links, "p_nom_min"] = n.links.loc[dc_links, "p_nom"]
-        n.links.loc[dc_links, "p_nom_extendable"] = True
-
-        n.links.loc[ac_links_existing, "p_nom_min"] = n.links.loc[ac_links_existing, "p_nom"]
-        n.links.loc[ac_links_existing, "p_nom_extendable"] = True
+        _make_transmission_extendable(n)
     if factor != "opt":
         con_type = "expansion_cost" if ll_type == "c" else "volume_expansion"
         rhs = round(float(factor) * ref, 2)
@@ -497,6 +484,61 @@ def set_line_nom_max(
     n.links["p_nom_max"] = n.links.p_nom_max.clip(upper=p_nom_max_set)
 
 
+def sssc_capital_cost(capex_per_kw, lifetime, wacc_real, fom_fraction=0.0):
+    """Annual SSSC cost in currency per MVAr and year: capital recovery of an overnight cost per kVAr plus FOM."""
+    return 1e3 * capex_per_kw * (calculate_annuity(lifetime, wacc_real) + fom_fraction)
+
+
+def attach_sssc(n, sssc, transport_model=False):
+    """
+    Let the optimisation build static synchronous series compensators (SSSCs) on AC lines.
+
+    Needs pypsa-bill, which models an SSSC as optional Line attributes: its compensation
+    ``q_sssc`` (MVAr) shifts the line's angle in the voltage law by ``-q_sssc / s_nom``,
+    within ``|q_sssc| <= sssc_nom``. Every AC line with a positive ``s_nom`` gets an
+    extendable SSSC with no existing capacity, the annual cost ``capital_cost_sssc``
+    (capital recovery plus the FOM share ``fom_fraction`` of the overnight cost)
+    and ``sssc_nom <= max_pu * s_nom``, where ``s_nom`` is the line's capacity (variable
+    if the line is extendable). With several investment periods, solve_network applies
+    that limit, and the SSSC capacity, per period (:mod:`opts.sssc`).
+    """
+    if not sssc or not sssc.get("enable", False):
+        return n
+    if "sssc_nom_extendable" not in n.lines.columns:
+        raise RuntimeError(
+            "lines: sssc: enable needs pypsa-bill (pypsa 1.3.0+bill), whose lines carry SSSC attributes.",
+        )
+    if transport_model:
+        logger.warning("lines: sssc is ignored by the transport model, which has no voltage law.")
+        return n
+
+    ac_buses = n.buses.index[n.buses.carrier == "AC"]
+    eligible = (
+        (n.lines.carrier == "AC")
+        & n.lines.bus0.isin(ac_buses)
+        & n.lines.bus1.isin(ac_buses)
+        & (n.lines.s_nom > 0)
+        & np.isfinite(n.lines.s_nom)
+    )
+    lines = n.lines.index[eligible]
+    if lines.empty:
+        logger.warning("lines: sssc is enabled but no AC line has a positive s_nom; no SSSC is added.")
+        return n
+
+    fom = sssc.get("fom_fraction", 0.0)
+    cost = sssc_capital_cost(sssc["capex"], sssc["lifetime"], sssc["wacc_real"], fom)
+    n.lines.loc[lines, "sssc_nom_extendable"] = True
+    n.lines.loc[lines, "sssc_nom_min"] = n.lines.loc[lines, "sssc_nom"]
+    n.lines.loc[lines, "capital_cost_sssc"] = cost
+    n.lines.loc[lines, "sssc_nom_max_pu"] = sssc["max_pu"]
+    logger.info(
+        f"Extendable SSSCs on {len(lines)} of {len(n.lines)} lines at {cost:.1f} per MVAr and year "
+        f"(capex {sssc['capex']} per kW, {sssc['lifetime']} years, wacc {sssc['wacc_real']}, FOM {fom:.1%}/yr), "
+        f"sssc_nom <= {sssc['max_pu']} * s_nom.",
+    )
+    return n
+
+
 if __name__ == "__main__":
     if "snakemake" not in globals():
         from _helpers import mock_snakemake
@@ -573,8 +615,8 @@ if __name__ == "__main__":
             dict(co2=params.costs["emission_prices"]["co2"]),
         )
 
-    ll_type, factor = snakemake.wildcards.ll[0], snakemake.wildcards.ll[1:]
-    set_transmission_limit(n, ll_type, factor)
+    halve_paired_link_length(n)
+    apply_transmission_limit(n, snakemake.wildcards.ll)
 
     set_line_nom_max(
         n,
@@ -584,6 +626,10 @@ if __name__ == "__main__":
         p_nom_max_ext=params.links.get("max_extension", np.inf),
     )
 
+    attach_sssc(n, params.lines.get("sssc"), transport_model)
+
     n.meta = dict(snakemake.config, **dict(wildcards=dict(snakemake.wildcards)))
+    if representative_meta:
+        n.meta[META_KEY] = representative_meta
     log_network_schema(n, stage="exit", baseline=schema_entry)
     n.export_to_netcdf(snakemake.output[0])

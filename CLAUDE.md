@@ -81,7 +81,7 @@ Defined in `workflow/Snakefile`:
 - `interconnect`: `usa | texas | western | eastern`
 - `simpl`: alphanumeric or `all` — pre-clustering granularity
 - `clusters`: integer optionally suffixed with `m`/`s`/`a`/`c`, or `all` — final cluster count. A plain integer (and `m`) aggregates only conventional generators, keeping renewable resource zones at `{simpl}` resolution; `s` ("small") aggregates every carrier; `a` aggregates none. Do not add `m` to new configs — it is the default.
-- `ll`: `v|c` + number/`opt`/`all` — line-limit scenario
+- `ll`: `v|c` + number/`opt`/`all` — line-limit scenario; or per planning horizon, `2040v1.1+2050v1.2` (config `{2040: v1.1, 2050: v1.2}`)
 - `opts`: dash/plus-separated options string (transmission, horizon discretization, etc.)
 - `sector`: `E`, `G`, or hyphenated combos
 

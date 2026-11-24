@@ -74,7 +74,7 @@ wildcard_constraints:
     interconnect="usa|texas|western|eastern",
     simpl="[a-zA-Z0-9]*|all",
     clusters="[0-9]+[msac]?|all",
-    ll="(v|c)([0-9\.]+|opt|all)|all",
+    ll="(v|c)([0-9\.]+|opt|all)|all|[0-9]{4}(v|c)([0-9\.]+|opt)(\+[0-9]{4}(v|c)([0-9\.]+|opt))*",
     opts="[-+a-zA-Z0-9\.]*",
     sector="([EG]-)*[EG]",
 
@@ -137,6 +137,17 @@ config["api"]["eia"] = os.environ.get("EIA_API_KEY") or config["api"].get("eia")
 # a wrong number several rules later. set_default=False keeps the schema from
 # becoming a second, invisible source of configuration.
 validate(config, "schemas/config.schema.yaml", set_default=False)
+
+
+def ll_wildcard(ll):
+    """Encode a per-period line limit {2040: "v1.1", 2050: "v1.2"} as the wildcard "2040v1.1+2050v1.2"."""
+    if not isinstance(ll, dict):
+        return str(ll)
+    periods = sorted(ll.items(), key=lambda item: int(item[0]))
+    return "+".join(f"{int(year)}{str(limit).strip()}" for year, limit in periods)
+
+
+config["scenario"]["ll"] = [ll_wildcard(ll) for ll in config["scenario"]["ll"]]
 
 
 run = config.get("run", {})

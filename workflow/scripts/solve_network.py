@@ -39,6 +39,13 @@ from opts.bidirectional_link import add_bidirectional_link_constraints
 from opts.interchange import add_interchange_constraints
 from opts.interfaces import add_interface_transmission_limits
 from opts.land import add_land_use_constraints
+from opts.piecewise_transmission import (
+    add_piecewise_line_costs,
+    attach_piecewise_line_costs,
+    correct_iterated_objective,
+    read_piecewise_line_costs,
+    store_piecewise_line_costs,
+)
 from opts.policy import (
     add_regional_co2limit,
     add_RPS_constraints,
@@ -63,6 +70,12 @@ from opts.sector import (
     add_sector_co2_constraints,
     add_sector_demand_response_constraints,
     add_water_heater_tank_constraints,
+)
+from opts.sssc import add_period_sssc_constraints, store_period_sssc_capacity
+from opts.transmission import (
+    add_period_transmission_limits,
+    mark_staged_transmission,
+    store_period_transmission_capacity,
 )
 
 logger_gurobi = logging.getLogger("gurobipy")
@@ -206,6 +219,16 @@ def extra_functionality(n, snapshots):
         if config["electricity"].get("exports", {}).get("volume_limit", False):
             add_interchange_constraints(n, config, "exports", sector_enabled)
 
+    # Per-period transmission capacities and ll limits (networks with several investment periods)
+    add_period_transmission_limits(n, snapshots)
+
+    # Per-period SSSC capacities (`lines: sssc`), limited by the per-period line capacities above
+    add_period_sssc_constraints(n, snapshots)
+
+    # Convex piecewise expansion costs of lines (`lines: piecewise_expansion_costs`); needs the
+    # per-period capacities and cost limits above
+    add_piecewise_line_costs(n, snapshots)
+
     # Apply aggregate interface transmission limits if configured
     if config["model_topology"].get("interface_transmission_limits", False):
         add_interface_transmission_limits(n, global_snakemake.input.interface_limits)
@@ -275,6 +298,8 @@ def run_optimize(n, rolling_horizon, skip_iterations, cf_solving, **kwargs):
         status, condition = n.optimize.optimize_transmission_expansion_iteratively(
             **kwargs,
         )
+        # the final solve's lines were charged at capital_cost; charge curve lines along their curves
+        correct_iterated_objective(n, kwargs.get("snapshots"), kwargs.get("multi_investment_periods", False))
 
     if status != "ok" and not rolling_horizon:
         logger.warning(
@@ -383,9 +408,15 @@ def solve_network(n, config, solving, opts="", **kwargs):
     n.config = config
     n.opts = opts
 
+    # pypsa-bill: AC lines and AC/DC links get one capacity per investment period in a
+    # perfect-foresight solve over several periods
+    mark_staged_transmission(n)
+
     match foresight:
         case "perfect":
             run_optimize(n, rolling_horizon, skip_iterations, cf_solving, **kwargs)
+            store_period_transmission_capacity(n, n.investment_periods)
+            store_period_sssc_capacity(n, n.investment_periods)
         case "myopic":
             _stash_original_nominal(n)
             for i, planning_horizon in enumerate(n.investment_periods):
@@ -396,6 +427,11 @@ def solve_network(n, config, solving, opts="", **kwargs):
                     apply_forced_retirements(n, planning_horizon, config)
 
                 run_optimize(n, rolling_horizon, skip_iterations, cf_solving, **kwargs)
+                store_period_transmission_capacity(n, [planning_horizon])
+                # lines are not frozen between horizons; keep what is built, so that their
+                # capacity does not decrease from one horizon to the next
+                ext = n.lines.s_nom_extendable
+                n.lines.loc[ext, "s_nom_min"] = n.lines.loc[ext, ["s_nom_min", "s_nom_opt"]].max(axis=1)
 
                 logger.info(f"Preparing brownfield from {planning_horizon}")
                 freeze_prior_periods(n, planning_horizon)
@@ -407,6 +443,7 @@ def solve_network(n, config, solving, opts="", **kwargs):
         case _:
             raise ValueError(f"Invalid foresight option: '{foresight}'. Must be 'perfect' or 'myopic'.")
 
+    store_piecewise_line_costs(n)
     return n
 
 
@@ -445,6 +482,10 @@ if __name__ == "__main__":
         n,
         solve_opts,
     )
+
+    # measured from today's s_nom, so attach before any solve changes it
+    if snakemake.input.get("piecewise_line_costs"):
+        attach_piecewise_line_costs(n, read_piecewise_line_costs(snakemake.input.piecewise_line_costs))
 
     n = solve_network(
         n,
