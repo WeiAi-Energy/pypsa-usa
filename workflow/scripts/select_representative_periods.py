@@ -33,8 +33,8 @@ Typical periods
 Weights
     ``objective`` and ``generators`` are multiplied by the block's weight: 1 for an
     extreme period, and for a typical period its cluster size scaled so that the
-    weightings of each investment period sum to what they did before (8760 h for a
-    full year). ``stores`` keeps the length of one timestep: PyPSA reads it as the
+    weightings of each investment period sum to what they did before (``HOURS_PER_YEAR``
+    for a full year). ``stores`` keeps the length of one timestep: PyPSA reads it as the
     hours elapsed between snapshots in the storage balances.
 
 Snapshots keep their real timestamps and stay in chronological order. Which block

@@ -3,7 +3,7 @@ Aggregate hourly dynamic line ratings (DLR) of the base network onto the model b
 
 Input is a CSV of hourly relative ratings with one column per line of the HIFLD
 ``elec_base_network.nc``: ``dlr_2012.csv`` (dynamic) with ``lines.dynamic_line_rating:
-true``, ``slr_2012.csv`` (static) otherwise, 8760 rows from 1 January 00:00 of the
+true``, ``slr_2012.csv`` (static) otherwise, ``HOURS_PER_YEAR`` rows from 1 January 00:00 of the
 weather year (rule ``retrieve_line_rating``). Output is a table of hourly relative
 ratings per model branch (``Line``, and the ``AC`` ``Link`` s of a transport model) on
 the 365-day calendar of the weather year, which ``prepare_network`` multiplies onto
