@@ -540,6 +540,33 @@ segment, not the segment mean, weighted by the segment duration. Both write
 `clustering: temporal: resolution_elec`, which can equivalently be set directly in the
 config file.
 
+(temporal-aggregation)=
+### Representative periods
+
+`clustering: temporal: representative_periods: enable: true` reduces an electricity-only
+network to a few periods of `period_length` hours (default 24) per investment period,
+after any `nH` averaging (it cannot be combined with `nSEG`). The year is cut into
+consecutive blocks from its first snapshot; three national series steer the choice: the
+onshore wind and the solar capacity factor, each averaged over the extendable candidates
+active in the period with their `p_nom_max` as weights, and total demand.
+
+- **Extreme periods**: the block with the highest mean demand, the lowest mean wind
+  capacity factor and the lowest mean solar capacity factor. A block already taken passes
+  to the next-ranked one, so the three are distinct. Each has weight 1.
+- **Typical periods**: Ward hierarchical clustering of the other blocks into `number`
+  clusters, on their profiles (each series divided by its maximum). Each cluster is
+  represented by the member whose mean wind CF, solar CF and demand are closest to the
+  cluster's, weighted by the cluster size, scaled so that each investment period's
+  weightings still sum to 8760 h.
+
+Snapshots keep their real timestamps. The `objective` and `generators` weightings carry
+the period weights; `stores` keeps the timestep length, so storage balances measure
+elapsed time correctly. In `solve_network`, every storage asset (including the ERM's
+shadow state of charge) cycles within each period, and ramp limits are dropped at period
+boundaries. Minimum up/down times of committable generators are not split at period
+boundaries. The selected periods are stored in `n.meta["representative_periods"]` of the
+prepared and solved networks.
+
 ## Per-carrier adjustments
 
 The `{opts}` grammar also accepts `<carrier>+{p,e,c,m}<factor>` tokens (e.g.

@@ -46,6 +46,8 @@ from opts.policy import (
     add_technology_capacity_target_constraints,
     apply_forced_retirements,
 )
+from opts.representative_periods import META_KEY as REPRESENTATIVE_PERIODS_META_KEY
+from opts.representative_periods import add_representative_period_constraints, representative_periods_metadata
 from opts.reserves import (
     add_ERM_constraints,
     store_ERM_duals,
@@ -147,6 +149,12 @@ def extra_functionality(n, snapshots):
 
     # Make snakemake available in function scope if it exists in global scope
     global_snakemake = globals().get("snakemake")
+
+    # Representative periods: storage cycles within each period, no ramping between periods
+    if representative_periods_metadata(n):
+        if sector_enabled:
+            raise NotImplementedError("Representative periods support electricity-only networks only.")
+        add_representative_period_constraints(n, snapshots)
 
     # Define constraint application functions in a registry
     # Each function should take network and necessary parameters
@@ -431,6 +439,7 @@ if __name__ == "__main__":
 
     n = pypsa.Network(snakemake.input.network)
     schema_entry = log_network_schema(n, stage="entry")
+    representative_meta = representative_periods_metadata(n)
 
     n = prepare_network(
         n,
@@ -449,6 +458,8 @@ if __name__ == "__main__":
         store_ERM_duals(n)
 
     n.meta = dict(snakemake.config, **dict(wildcards=dict(snakemake.wildcards)))
+    if representative_meta:
+        n.meta[REPRESENTATIVE_PERIODS_META_KEY] = representative_meta
     log_network_schema(n, stage="exit", baseline=schema_entry)
     n.export_to_netcdf(snakemake.output[0])
     with open(snakemake.output.config, "w") as file:

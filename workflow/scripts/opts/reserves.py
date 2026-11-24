@@ -12,6 +12,7 @@ import pandas as pd
 import pypsa
 from linopy import merge
 from opts._helpers import get_region_buses
+from opts.representative_periods import previous_in_block
 from pypsa.descriptors import nominal_attrs
 from xarray import DataArray
 
@@ -64,6 +65,14 @@ def define_SU_reserve_constraints(n, sns):
         (-1 / eff_dispatch * eh, m[f"{component}-p_dispatch_RESERVES"]),
         (eff_store * eh, m[f"{component}-p_store_RESERVES"]),
     ]
+
+    # representative periods: cycle within each period, like the real storage balance
+    previous_in_period = previous_in_block(n, soc, sns)
+    if previous_in_period is not None:
+        lhs += [(eff_stand, previous_in_period)]
+        rhs = -c_obj.da.inflow.sel(snapshot=sns, name=c_obj.active_assets) * eh
+        m.add_constraints(m.linexpr(*lhs), "=", rhs, name=f"{component}-energy_balance_RESERVES", mask=active)
+        return
 
     # mask `include_previous_soc` excludes the first snapshot for non-cyclic assets
     noncyclic_b = ~c_obj.da.cyclic_state_of_charge.sel(name=c_obj.active_assets)

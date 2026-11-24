@@ -27,6 +27,7 @@ from _helpers import (
 )
 from constants import HOURS_PER_YEAR
 from opts.bidirectional_link import bidirectional_pairs
+from select_representative_periods import apply_representative_periods, representative_periods_enabled
 
 idx = pd.IndexSlice
 
@@ -548,9 +549,16 @@ if __name__ == "__main__":
     # segments with package tsam
 
     if is_string and time_resolution.lower().endswith("seg"):
+        if representative_periods_enabled(params.representative_periods):
+            raise ValueError("clustering.temporal.representative_periods cannot be combined with nSEG segmentation.")
         solver_name = snakemake.config["solving"]["solver"]["name"]
         segments = int(time_resolution.lower().replace("seg", ""))
         n = apply_time_segmentation(n, segments, solver_name)
+
+    # representative periods, picked on the (possibly nH-averaged) series
+    representative_meta = None
+    if representative_periods_enabled(params.representative_periods):
+        representative_meta = apply_representative_periods(n, params.representative_periods)
 
     if params.co2limit_enable:
         add_co2limit(n, params.co2limit, num_years)

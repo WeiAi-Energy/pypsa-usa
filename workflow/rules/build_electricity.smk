@@ -1487,6 +1487,9 @@ rule build_dynamic_line_rating:
 rule prepare_network:
     params:
         time_resolution=config_provider("clustering", "temporal", "resolution_elec"),
+        representative_periods=config_provider(
+            "clustering", "temporal", "representative_periods", default={}
+        ),
         links=config_provider("links"),
         lines=config_provider("lines"),
         co2limit=config_provider("electricity", "co2limit"),

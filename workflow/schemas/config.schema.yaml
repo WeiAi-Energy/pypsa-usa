@@ -481,6 +481,13 @@ properties:
         properties:
           resolution_elec: {type: [integer, boolean]}
           resolution_sector: {type: [integer, boolean]}
+          representative_periods:
+            type: object
+            additionalProperties: false
+            properties:
+              enable: {type: boolean}
+              period_length: {type: number, exclusiveMinimum: 0}
+              number: {type: integer, minimum: 1}
 
   focus_weights:
     description: >

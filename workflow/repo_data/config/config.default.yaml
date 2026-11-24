@@ -477,6 +477,14 @@ clustering:
   temporal:                                # temporal aggregation (segments/typical periods)
     resolution_elec:   false               # int H or false = native hourly
     resolution_sector: false               # int H or false = native hourly
+    # Electricity-only: per investment period keep 3 extreme periods (max mean demand, min mean
+    # p_nom_max-weighted onwind CF, min mean solar CF; weight 1 each) + `number` typical periods
+    # (Ward clustering; weights = cluster sizes), so the weightings still sum to 8760 h.
+    # Picked after any nH averaging; not with nSEG.
+    representative_periods:
+      enable: true
+      period_length: 24                    # hours per period (extreme and typical); a whole number of snapshots
+      number: 1                            # typical periods per investment period, on top of the 3 extremes
 
 # KEEP THIS NULL, not {}. cluster_network branches on `is not None`, and an
 # empty mapping would send it down the custom-weights path: it re-normalises

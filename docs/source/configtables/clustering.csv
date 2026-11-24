@@ -12,5 +12,9 @@ aggregation_strategies:,,,
 temporal:,,,"Temporal aggregation — the primary temporal-resolution knob for solved networks. Equivalent to (and written by) the ``nH`` / ``nSEG`` tokens of the ``{opts}`` wildcard."
 -- resolution_elec,--,"int hours or ``false``","Resample electricity-only networks to every n hours; ``false`` keeps native hourly resolution."
 -- resolution_sector,--,"int hours or ``false``","Resample sector-coupled networks to every n hours; ``false`` keeps native hourly resolution."
+-- representative_periods,,,"Electricity-only networks: keep three extreme periods and ``number`` typical periods per investment period (see :ref:`temporal-aggregation`). Applied after ``nH`` averaging; cannot be combined with ``nSEG``."
+-- -- enable,bool,"{true, false}","Switch representative periods on."
+-- -- period_length,h,float,"Length of every period, extreme and typical; a whole number of snapshots. Default 24."
+-- -- number,--,int,"Typical periods per investment period, on top of the three extreme periods. Default 8."
 focus_weights:,,,
 -- {region_name},p.u.,float,"Optional per-region share of clusters in the form ``California: 0.5``, placing half of all clusters in that region. Fractions must sum to at most 1. Applied by the kmeans algorithm in both ``cluster_resources`` and ``cluster_network``; ``null`` distributes clusters by the configured weighting."
