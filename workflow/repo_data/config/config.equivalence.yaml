@@ -222,7 +222,6 @@ solving:
     rolling_horizon: false
     seed: 123
     track_iterations: false
-    min_iterations: 4
     max_iterations: 6
     transmission_losses: 2
     linearized_unit_commitment: true

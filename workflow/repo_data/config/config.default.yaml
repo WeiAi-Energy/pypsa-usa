@@ -496,14 +496,20 @@ solving:
     load_shedding: false                   # true = add slack generators at very high cost (debug infeasibility)
     clip_p_max_pu: 1.e-2                   # threshold below which renewable p_max_pu is set to 0
     noisy_costs: true                      # add small random noise to costs to break LP degeneracies
-    skip_iterations: true                  # skip line-iteration loop (typically true for capacity expansion)
+    skip_iterations: false                  # skip line-iteration loop (typically true for capacity expansion)
     rolling_horizon: false                 # true = solve in time-overlapping windows
     seed: 123                              # RNG seed for noisy_costs
     # --- options passed into n.optimize() ---
     track_iterations: false
-    min_iterations: 4
+    iteration_method: slp                  # fp = fixed point | slp = sequential LP with adaptive proximal term (a QP per iteration; use gurobi)
+    msq_threshold: 1.e-2                   # stop once RMS(line capacity step) / mean capacity < this ...
+    cost_threshold: 1.e-4                  # ... and the relative system cost change <= this
     max_iterations: 6
-    transmission_losses: 2                 # 0 = no losses; N = N-piecewise quadratic loss approximation
+    # proximal_weight: 0.5                 # OPTIONAL (slp): initial proximal weight; 0 = linear iterations (HiGHS can solve)
+    # proximal_adaptive: true              # OPTIONAL (slp): double the weight when steps reverse
+    # proximal_ceiling: 4.0                # OPTIONAL (slp): upper bound of the adaptive weight
+    # sensitivity_tolerance: 1.e-4         # OPTIONAL (slp): drop line sensitivities below this share of the line's voltage drop
+    transmission_losses: 0                # 0 = no losses; N = N-piecewise quadratic loss approximation
     linearized_unit_commitment: true       # LP relaxation of UC binaries
     horizon: 8760                          # rolling-horizon window length (hours)
     assign_all_duals: true                 # populate dual variables for every constraint

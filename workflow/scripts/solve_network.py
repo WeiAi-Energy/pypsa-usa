@@ -233,6 +233,18 @@ def extra_functionality(n, snapshots):
         add_fossil_generation_constraint(n, config)
 
 
+# optional `solving.options` passed on to optimize_transmission_expansion_iteratively
+# when set; pypsa-bill's defaults apply otherwise
+ITERATION_OPTIONS = (
+    "msq_threshold",
+    "cost_threshold",
+    "proximal_weight",
+    "proximal_adaptive",
+    "proximal_ceiling",
+    "sensitivity_tolerance",
+)
+
+
 def run_optimize(n, rolling_horizon, skip_iterations, cf_solving, **kwargs):
     """Initiate the correct type of pypsa.optimize function."""
     if rolling_horizon:
@@ -243,9 +255,15 @@ def run_optimize(n, rolling_horizon, skip_iterations, cf_solving, **kwargs):
     elif skip_iterations:
         status, condition = n.optimize(**kwargs)
     else:
-        kwargs["track_iterations"] = (cf_solving.get("track_iterations", False),)
-        kwargs["min_iterations"] = (cf_solving.get("min_iterations", 4),)
-        kwargs["max_iterations"] = (cf_solving.get("max_iterations", 6),)
+        # pypsa-bill: `iteration_method` is `fp` (fixed point) or `slp` (sequential
+        # LP with an adaptive proximal term, a QP per iteration); the iteration
+        # stops once both `msq_threshold` and `cost_threshold` are met
+        kwargs["method"] = cf_solving.get("iteration_method", "slp")
+        kwargs["track_iterations"] = cf_solving.get("track_iterations", False)
+        kwargs["max_iterations"] = cf_solving.get("max_iterations", 6)
+        for key in ITERATION_OPTIONS:
+            if key in cf_solving:
+                kwargs[key] = cf_solving[key]
         status, condition = n.optimize.optimize_transmission_expansion_iteratively(
             **kwargs,
         )

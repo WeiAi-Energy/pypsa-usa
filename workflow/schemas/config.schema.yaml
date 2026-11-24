@@ -507,8 +507,14 @@ properties:
           rolling_horizon: {type: boolean}
           seed: {type: integer}
           track_iterations: {type: boolean}
-          min_iterations: {type: integer}
-          max_iterations: {type: integer}
+          iteration_method: {enum: [fp, slp]}
+          msq_threshold: {type: number, minimum: 0}
+          cost_threshold: {type: number, minimum: 0}
+          max_iterations: {type: integer, minimum: 1}
+          proximal_weight: {type: number, minimum: 0}
+          proximal_adaptive: {type: boolean}
+          proximal_ceiling: {type: number, minimum: 0}
+          sensitivity_tolerance: {type: number, minimum: 0, exclusiveMaximum: 1}
           transmission_losses: {type: integer}
           linearized_unit_commitment: {type: boolean}
           horizon: {type: integer}

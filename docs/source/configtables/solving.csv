@@ -7,8 +7,14 @@ options,,,
 -- rolling_horizon,bool,"{'true','false'}","Whether to optimize the network in a rolling horizon manner, where the snapshot range is split into slices of size horizon which are solved consecutively."
 -- seed,int,-,Random seed for increased deterministic behaviour.
 -- track_iterations,bool,"{'true','false'}",Flag whether to store the intermediate branch capacities and objective function values are recorded for each iteration in ``network.lines['s_nom_opt_X']`` (where ``X`` labels the iteration)
--- min_iterations,--,int,Minimum number of solving iterations in between which resistance and reactence (``x/r``) are updated for branches according to ``s_nom_opt`` of the previous run.
+-- iteration_method,--,"{'fp','slp'}","Defaults to ``slp``. How the capacity dependence of line impedance (and of the SSSC term) is resolved when ``skip_iterations`` is false. ``fp``: fixed point, impedances are frozen at the previous iteration's capacities. ``slp``: sequential linear programming, the voltage law carries the first-order sensitivity to the line capacity, and an adaptive quadratic proximal term damps the step. This makes every iteration a QP, so use Gurobi; HiGHS' QP solver can stall."
+-- msq_threshold,--,float,"Convergence criterion on the step of the extendable line capacities: RMS of the change from the capacities the impedances were taken at, relative to their mean. The iteration stops once both this and ``cost_threshold`` are met."
+-- cost_threshold,--,float,"Convergence criterion on the relative change of the system cost (without the proximal term) from the previous iteration."
 -- max_iterations,--,int,Maximum number of solving iterations in between which resistance and reactence (``x/r``) are updated for branches according to ``s_nom_opt`` of the previous run.
+-- proximal_weight,--,float,"Optional, ``slp`` only. Initial weight of the proximal term, in units of a line's capital cost per its own size. 0 switches the term off, so every iteration is an LP. Defaults to 0.5."
+-- proximal_adaptive,bool,"{'true','false'}","Optional, ``slp`` only. Double the proximal weight, up to ``proximal_ceiling``, when successive steps move capacity back. Defaults to true."
+-- proximal_ceiling,--,float,"Optional, ``slp`` only. Upper bound of the adaptive proximal weight. Defaults to 4."
+-- sensitivity_tolerance,--,float,"Optional, ``slp`` only. Line sensitivities below this share of the line's voltage drop at its capacity are dropped. Defaults to 1e-4."
 -- transmission_losses,int,[0-9],"Add piecewise linear approximation of transmission losses based on n tangents. 0 means losses are ignored; the shipped default is 2."
 -- linearized_unit_commitment,bool,"{'true','false'}",Whether to optimise using the linearized unit commitment formulation.
 -- horizon,int,-,Number of snapshots in each rolling-horizon window (only used when ``rolling_horizon`` is true).
