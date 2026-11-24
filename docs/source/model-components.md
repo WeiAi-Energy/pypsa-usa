@@ -128,7 +128,12 @@ balancing authority, recorded as bus attributes ({doc}`model-network-schema`).
 In capacity-expansion mode, carriers listed under `electricity: extendable_carriers`
 may build new capacity (`p_nom_opt` ≥ existing), with annualized capital costs from
 the NREL ATB ({doc}`data-costs`) and operating costs from fuel prices and heat rates.
-Everything else is dispatch-only. In production-cost mode no investment is allowed and
+Each investment period adds one candidate per bus and carrier (per resource site for wind
+and solar) whose technology parameters (capital cost, efficiency, VOM, lifetime) all come
+from that period's cost table; nothing is copied from the existing plants. The existing
+capacity of an extendable carrier becomes a separate `<name> existing` generator that
+retires economically (`retirement: economic`) or on its lifetime. Everything else is
+dispatch-only. In production-cost mode no investment is allowed and
 the existing fleet is dispatched against demand. The optimization itself — objective,
 nodal balance, flow physics — is standard PyPSA; PyPSA-USA's additions are the custom
 constraints documented in {doc}`model-constraints`.

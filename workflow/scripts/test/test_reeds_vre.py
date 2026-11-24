@@ -413,8 +413,8 @@ def test_missing_generator_strategies_fall_back_to_the_defaults(base_network, ag
 
 @pytest.mark.fast
 def test_split_generators_keep_the_interconnection_cost_of_their_vintages(multi_period_base_network):
-    """split_retirement_gens re-adds the expandable units, which price every vintage."""
-    from add_extra_components import attach_multihorizon_existing_generators, split_retirement_gens
+    """The resource sites split_retirement_gens keeps carry the interconnection cost to every vintage."""
+    from add_extra_components import attach_renewable_vintages, split_retirement_gens
 
     n = multi_period_base_network
     wind = ["wind1", "wind2"]
@@ -422,19 +422,25 @@ def test_split_generators_keep_the_interconnection_cost_of_their_vintages(multi_
     n.generators["land_region"] = n.generators.bus
     n.generators.loc[wind, RENEWABLE_INTERCONNECTION_COL] = [300_000.0, 200_000.0]
     n.generators.loc[wind, RENEWABLE_INTERCONNECTION_SHARE_COL] = [0.5, 1.0]
-    costs = _costs().assign(lifetime=30.0, efficiency=1.0, opex_variable_per_mwh=0.0, heat_rate_mmbtu_per_mwh=0.0)
+    costs = _costs().assign(
+        lifetime=30.0,
+        efficiency=1.0,
+        marginal_cost=0.0,
+        opex_variable_per_mwh=0.0,
+        heat_rate_mmbtu_per_mwh=0.0,
+    )
 
-    split_retirement_gens(n, costs, {"onwind"}, economic=False)
+    split_retirement_gens(n, costs, {"onwind"}, economic=False, keep_sites=True)
 
     assert n.generators.at["wind1", RENEWABLE_INTERCONNECTION_COL] == 300_000.0
     assert n.generators.at["wind1", RENEWABLE_INTERCONNECTION_SHARE_COL] == 0.5
-    gens = n.generators[
+    sites = n.generators[
         n.generators.p_nom_extendable
         & (n.generators.carrier == "onwind")
         & ~n.generators.index.str.contains("existing")
     ]
     expected = renewable_interconnection_capital_cost(costs, "onwind", pd.Series([300_000.0]), share=[0.5]).iloc[0]
     for year in n.investment_periods:
-        attach_multihorizon_existing_generators(n, costs, gens, year)
+        attach_renewable_vintages(n, costs, sites, year)
         assert n.generators.at[f"wind1 {year}", "capital_cost"] == pytest.approx(expected)
         assert n.generators.at[f"wind1 {year}", RENEWABLE_INTERCONNECTION_SHARE_COL] == 0.5

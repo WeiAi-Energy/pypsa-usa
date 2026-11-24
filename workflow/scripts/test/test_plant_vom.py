@@ -3,14 +3,13 @@
 - ``add_sectors.convert_generators_2_links`` replaces gas/coal/oil generators
   with links that draw from the state fuel bus, which prices the fuel. The link
   must still carry the plant's VOM.
-- ``add_extra_components`` gives new units copied from an existing fleet the
-  ATB efficiency and VOM, at the fleet's fuel price.
+- ``add_extra_components`` keeps the existing fleet only as retiring capacity;
+  every new build takes the cost table of its investment period.
 - ``add_electricity.apply_dynamic_pricing`` adds each plant's own VOM.
 """
 
 import os
 import sys
-from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -20,8 +19,9 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 import add_extra_components as aec
 from _helpers import get_multiindex_snapshots
-from add_electricity import apply_dynamic_pricing
+from add_electricity import apply_dynamic_pricing, broadcast_investment_horizons_index
 from add_sectors import convert_generators_2_links
+from ambient_derate import DEFAULT_OUTAGE_CURVES, apply_ambient_derate, forced_outage_rate, load_outage_curves
 from build_powerplants import filter_outliers_zscore
 from solve_network import freeze_prior_periods
 
@@ -29,15 +29,15 @@ pytestmark = pytest.mark.fast
 
 COSTS = pd.DataFrame(
     {
-        "opex_variable_per_mwh": {"gas": 2.0, "CCGT-95CCS": 6.0, "solar": 0.0},
-        "opex_fixed_per_kw": {"gas": 10.0, "CCGT-95CCS": 30.0, "solar": 20.0},
-        "annualized_capex_fom": {"gas": 1e5, "CCGT-95CCS": 2e5, "solar": 5e4},
-        "cost_recovery_period_years": {"gas": 30, "CCGT-95CCS": 30, "solar": 30},
-        "lifetime": {"gas": 30, "CCGT-95CCS": 30, "solar": 30},
-        "marginal_cost": {"gas": 30.0, "CCGT-95CCS": 40.0, "solar": 0.0},
-        "efficiency": {"gas": 0.5, "CCGT-95CCS": 0.45, "solar": 0.0},
-        "heat_rate_mmbtu_per_mwh": {"gas": 6.824, "CCGT-95CCS": 7.58, "solar": 0.0},
-        "co2_emissions": {"gas": 0.2, "CCGT-95CCS": 0.01, "CCGT": 0.2, "solar": 0.0},
+        "opex_variable_per_mwh": {"gas": 2.0, "CCGT-95CCS": 6.0, "solar": 0.0, "onwind": 1.5},
+        "opex_fixed_per_kw": {"gas": 10.0, "CCGT-95CCS": 30.0, "solar": 20.0, "onwind": 25.0},
+        "annualized_capex_fom": {"gas": 1e5, "CCGT-95CCS": 2e5, "solar": 5e4, "onwind": 7e4},
+        "cost_recovery_period_years": {"gas": 30, "CCGT-95CCS": 30, "solar": 30, "onwind": 30},
+        "lifetime": {"gas": 30, "CCGT-95CCS": 30, "solar": 30, "onwind": 25},
+        "marginal_cost": {"gas": 30.0, "CCGT-95CCS": 40.0, "solar": 0.0, "onwind": 1.0},
+        "efficiency": {"gas": 0.5, "CCGT-95CCS": 0.45, "solar": 0.0, "onwind": 0.0},
+        "heat_rate_mmbtu_per_mwh": {"gas": 6.824, "CCGT-95CCS": 7.58, "solar": 0.0, "onwind": 0.0},
+        "co2_emissions": {"gas": 0.2, "CCGT-95CCS": 0.01, "CCGT": 0.2, "solar": 0.0, "onwind": 0.0},
     },
 )
 
@@ -104,45 +104,40 @@ def fleet_network(base_network):
     n.generators["land_region"] = ""
     n.generators.loc[["gas1", "gas2"], "efficiency"] = 0.4
     n.generators.loc[["gas1", "gas2"], "vom_cost"] = [3.0, 4.0]
+    n.add("Carrier", "gas")
     return n
 
 
-def _new_build_mc(fleet_mc, fleet_vom, fleet_eff=0.4, atb_eff=0.5, atb_vom=2.0):
-    """Fleet fuel price per MWh_th, burnt at the ATB efficiency, plus ATB VOM."""
-    return (fleet_mc - fleet_vom) * fleet_eff / atb_eff + atb_vom
-
-
-def test_retirement_split_new_unit_uses_atb(fleet_network):
+def test_split_keeps_the_fleet_and_adds_no_thermal_unit(fleet_network):
     n = fleet_network
     n.generators_t.marginal_cost["gas2"] = 20.0  # dynamic fuel price
 
     aec.split_retirement_gens(n, COSTS, ["gas"], economic=True)
 
     existing = n.generators.loc["gas2 existing"]
-    assert (existing.efficiency, existing.vom_cost, existing.marginal_cost) == (0.4, 4.0, 18)
+    assert (existing.efficiency, existing.vom_cost, existing.p_nom, existing.p_nom_max) == (0.4, 4.0, 200, 200)
+    assert existing.p_nom_extendable
+    assert existing.capital_cost == pytest.approx(10.0e3)  # fixed O&M only
     assert (n.generators_t.marginal_cost["gas2 existing"] == 20.0).all()
-
-    new = n.generators.loc["gas2"]
-    assert (new.efficiency, new.vom_cost) == (0.5, 2.0)
-    assert new.marginal_cost == pytest.approx(_new_build_mc(18, 4.0))
-    assert n.generators_t.marginal_cost["gas2"].to_numpy() == pytest.approx(_new_build_mc(20.0, 4.0))
+    # nothing is priced from the fleet: no new unit, no stale time series
+    assert "gas2" not in n.generators.index
+    assert all("gas2" not in df.columns for df in n.generators_t.values())
 
 
-def test_technical_retirement_splits_fixed_existing_from_new_unit(fleet_network):
+def test_technical_retirement_fixes_the_existing_part(fleet_network):
     n = fleet_network
 
     aec.split_retirement_gens(n, COSTS, ["gas"], economic=False)
 
     existing = n.generators.loc["gas2 existing"]
     assert (existing.p_nom, existing.p_nom_extendable, existing.efficiency) == (200, False, 0.4)
-    new = n.generators.loc["gas2"]
-    assert (new.p_nom, new.p_nom_extendable, new.efficiency, new.vom_cost) == (0, True, 0.5, 2.0)
 
 
 @pytest.mark.parametrize(("retirement", "retirable"), [("economic", True), ("technical", False)])
 def test_myopic_freeze_retires_existing_only_with_economic_retirement(fleet_network, retirement, retirable):
     n = fleet_network
     aec.split_retirement_gens(n, COSTS, ["gas"], economic=retirement == "economic")
+    aec.attach_new_thermal(n, COSTS, ["gas"], 2030)
     n.config = {"electricity": {"renewable_carriers": ["onwind", "solar"], "retirement": retirement}}
     n.generators["p_nom_opt"] = n.generators.p_nom
 
@@ -151,61 +146,183 @@ def test_myopic_freeze_retires_existing_only_with_economic_retirement(fleet_netw
     existing = n.generators.loc["gas2 existing"]
     assert existing.p_nom_extendable == retirable
     assert existing.p_nom == 200
-    assert not n.generators.at["gas2", "p_nom_extendable"]  # prior new build is frozen either way
+    assert not n.generators.at["z3 gas_2030", "p_nom_extendable"]  # prior new build is frozen either way
 
 
-def test_multihorizon_copies_use_atb_only_without_existing_capacity(fleet_network):
+def test_new_thermal_takes_the_cost_table_not_the_fleet(fleet_network, monkeypatch):
     n = fleet_network
+    aec.split_retirement_gens(n, COSTS, ["gas"], economic=True)
+
+    added = aec.attach_new_thermal(n, COSTS, ["gas"], 2030)
+
+    assert added.tolist() == ["z1 gas_2030", "z2 gas_2030", "z3 gas_2030"]
+    new = n.generators.loc[added]
+    assert (new.efficiency == 0.5).all()  # ATB, not the fleet's 0.4
+    assert (new.vom_cost == 2.0).all()
+    assert (new.marginal_cost == 30.0).all()
+    assert (new.lifetime == 30).all()
+    assert (new.capital_cost == 1e5).all()
+    assert (new.p_nom == 0).all() and new.p_nom_extendable.all()
+    # no fleet profile: the ambient derate sets p_max_pu from the bus temperature
+    assert not n.generators_t.p_max_pu.columns.intersection(added).any()
+    assert not n.generators_t.marginal_cost.columns.intersection(added).any()
+
+
+def test_new_thermal_respects_min_year(fleet_network):
+    n = fleet_network
+    n.add("Carrier", "CCGT")
+
+    added = aec.attach_new_thermal(n, COSTS, ["gas", "CCGT-95CCS"], 2030, min_years={"CCGT-95CCS": 2035})
+
+    assert set(n.generators.loc[added, "carrier"]) == {"gas"}
+
+
+def test_new_carrier_generators_get_vom(fleet_network):
+    n = fleet_network
+    n.add("Carrier", "CCGT")  # CO2 intensity is looked up on the base technology
+
+    aec.attach_new_thermal(n, COSTS, ["CCGT-95CCS"], 2030)
+
+    new = n.generators[n.generators.carrier == "CCGT-95CCS"]
+    assert len(new) == len(n.buses)
+    assert (new.vom_cost == 6.0).all()
+
+
+def _two_period(n):
     n.snapshots = get_multiindex_snapshots(
         sns_config={"start": "2030-01-01 00:00", "end": "2030-01-01 23:00", "inclusive": "both"},
         invest_periods=[2030, 2040],
     )
     n.set_investment_periods(periods=[2030, 2040])
-    gens = n.generators.loc[["gas2"]]
+    return n
+
+
+ELEC_CONFIG = {
+    "extendable_carriers": {"Generator": ["gas", "nuclear", "onwind", "solar"]},
+    "conventional_carriers": ["gas", "nuclear"],
+    "renewable_carriers": ["onwind", "solar"],
+}
+COSTS_NUCLEAR = pd.concat(
+    [
+        COSTS,
+        pd.DataFrame(
+            {
+                "opex_variable_per_mwh": {"nuclear": 3.0},
+                "opex_fixed_per_kw": {"nuclear": 150.0},
+                "annualized_capex_fom": {"nuclear": 6e5},
+                "cost_recovery_period_years": {"nuclear": 30},
+                "lifetime": {"nuclear": 60},
+                "marginal_cost": {"nuclear": 10.0},
+                "efficiency": {"nuclear": 0.33},
+                "heat_rate_mmbtu_per_mwh": {"nuclear": 10.4},
+                "co2_emissions": {"nuclear": 0.0},
+            },
+        ),
+    ],
+)
+
+
+@pytest.mark.parametrize("periods", [[2030], [2030, 2040]])
+def test_one_new_build_per_bus_carrier_and_period(fleet_network, periods):
+    """An existing extendable plant does not add a second, fleet priced, new-build option."""
+    n = _two_period(fleet_network) if len(periods) == 2 else fleet_network
+    n.add("Carrier", ["nuclear", "onwind", "solar"])
+    n.add("Generator", "nuc1", bus="z2", carrier="nuclear", p_nom=1000, p_nom_extendable=True, efficiency=0.32)
+    n.add("Generator", "nuc_planned", bus="z1", carrier="nuclear", p_nom=0, p_nom_extendable=True)
+    n.generators.loc["wind1", "p_nom"] = 100.0
+
+    thermal, sites = aec.split_existing_fleet(n, ELEC_CONFIG, COSTS_NUCLEAR, economic=True)
+    for year in periods:
+        aec.attach_renewable_vintages(n, COSTS_NUCLEAR, sites, year)
+        aec.attach_new_thermal(n, COSTS_NUCLEAR, thermal, year)
+    n.remove("Generator", sites.index)
+
+    assert thermal == ["gas", "nuclear"]
+    assert "nuc_planned" not in n.generators.index
+    new = n.generators[n.generators.p_nom_extendable & ~n.generators.index.str.contains("existing")]
+    per_option = new.groupby(["bus", "carrier", "build_year"]).size()
+    assert (per_option == 1).all()
+    nuclear = new[new.carrier == "nuclear"]
+    assert len(nuclear) == len(n.buses) * len(periods)
+    assert (nuclear.efficiency == 0.33).all() and (nuclear.lifetime == 60).all()
+    assert n.generators.at["nuc1 existing", "p_nom"] == 1000
+
+
+def test_renewable_vintages_keep_the_resource_and_take_the_cost_table(fleet_network):
+    n = _two_period(fleet_network)
+    n.generators_t.p_max_pu["wind1"] = 0.8
+    n.generators.loc["wind1", ["p_nom", "land_region"]] = [100.0, "region_a"]
+    costs = COSTS
+
+    split = aec.split_retirement_gens(n, costs, ["onwind"], economic=False, keep_sites=True)
+    assert split.tolist() == ["wind1"]
+    existing = n.generators.loc["wind1 existing"]
+    assert (existing.p_nom, existing.p_nom_max, existing.p_nom_extendable) == (100, 100, False)
+    assert (n.generators_t.p_max_pu["wind1 existing"] == 0.8).all()
+
+    sites = n.generators.loc[["wind1"]]
+    for year in (2030, 2040):
+        aec.attach_renewable_vintages(n, costs, sites, year)
 
     for year in (2030, 2040):
-        aec.attach_multihorizon_existing_generators(n, COSTS, gens, year)
-
-    # 2030 carries the fleet's 200 MW, so keeps its parameters
-    first = n.generators.loc["gas2 2030"]
-    assert (first.p_nom, first.efficiency, first.vom_cost, first.marginal_cost) == (200, 0.4, 4.0, 18)
-    later = n.generators.loc["gas2 2040"]
-    assert (later.p_nom, later.efficiency, later.vom_cost) == (0, 0.5, 2.0)
-    assert later.marginal_cost == pytest.approx(_new_build_mc(18, 4.0))
+        new = n.generators.loc[f"wind1 {year}"]
+        assert (new.bus, new.land_region, new.p_nom, new.p_nom_max) == ("z1", "region_a", 0, 500)
+        assert (new.marginal_cost, new.vom_cost, new.lifetime, new.efficiency) == (1.0, 1.5, 25, 1)
+        assert new.capital_cost == pytest.approx(7e4)
+        assert (n.generators_t.p_max_pu[f"wind1 {year}"] == 0.8).all()
 
 
-def test_new_parameters_are_idempotent(fleet_network):
-    """Copying an already converted new unit again leaves its marginal cost."""
+@pytest.mark.parametrize("listed", [True, False])
+def test_renewable_carrier_without_sites_is_not_built(fleet_network, caplog, listed):
+    """No offshore sites: no constant-output "offwind" at every bus, whether or not it is in renewable_carriers."""
     n = fleet_network
-    aec.split_retirement_gens(n, COSTS, ["gas"], economic=True)
-    converted = n.generators.loc[["gas2"]].copy()
+    config = {
+        "extendable_carriers": {"Generator": ["gas", "offwind"]},
+        "conventional_carriers": ["gas"],
+        "renewable_carriers": ["onwind", "solar", *(["offwind"] if listed else [])],
+    }
 
-    n.add("Generator", "gas2 copy", bus="z3", carrier="gas", p_nom=0, marginal_cost=converted.marginal_cost.iloc[0])
-    aec.apply_new_build_parameters(n, converted, pd.Index(["gas2 copy"]), COSTS)
+    thermal, sites = aec.split_existing_fleet(
+        n,
+        config,
+        COSTS,
+        economic=True,
+        profile_carriers=["dataset", "onwind", "offwind", "solar"],
+    )
 
-    assert n.generators.at["gas2 copy", "marginal_cost"] == pytest.approx(converted.marginal_cost.iloc[0])
+    assert thermal == ["gas"]
+    assert sites.empty
+    assert "offwind" in caplog.text
 
 
-def test_renewable_copies_keep_fleet_values(fleet_network):
+def test_existing_and_new_thermal_both_get_the_ambient_derate(fleet_network):
     n = fleet_network
-    solar_mc = n.generators.at["solar1", "marginal_cost"]
+    settings = {"prime_movers": {"gas": "combined_cycle", "nuclear": "nuclear"}, "max_outage": 0.4}
+    curves = load_outage_curves(os.path.join(os.path.dirname(__file__), "..", "..", DEFAULT_OUTAGE_CURVES))
+    hours = n.snapshots.get_level_values(1)
+    temperature = pd.DataFrame(
+        {"z1": np.linspace(-20, 40, len(hours)), "z2": 35.0, "z3": np.linspace(40, -20, len(hours))},
+        index=pd.DatetimeIndex(hours),
+    )
+    # the fleet as add_electricity derates it
+    n.generators_t.p_max_pu = n.generators_t.p_max_pu.drop(columns=["gas1", "gas2"])
+    apply_ambient_derate(n, temperature, settings, curves, broadcast_investment_horizons_index)
+    fleet_profile = n.generators_t.p_max_pu["gas2"].copy()
+    wind_profile = n.generators_t.p_max_pu["wind1"].copy()
 
-    aec.split_retirement_gens(n, COSTS, ["solar"], economic=False)
+    aec.split_retirement_gens(n, COSTS_NUCLEAR, ["gas"], economic=True)
+    added = aec.attach_new_thermal(n, COSTS_NUCLEAR, ["gas", "nuclear"], 2030)
+    # add_extra_components derates what has no profile yet
+    apply_ambient_derate(n, temperature, settings, curves, broadcast_investment_horizons_index)
 
-    assert n.generators.at["solar1", "efficiency"] == 1
-    assert n.generators.at["solar1", "marginal_cost"] == solar_mc
-
-
-def test_new_carrier_generators_get_vom(fleet_network, monkeypatch):
-    n = fleet_network
-    monkeypatch.setattr(aec, "snakemake", SimpleNamespace(config={"costs": {}}), raising=False)
-    n.add("Carrier", "CCGT")  # CO2 intensity is looked up on the base technology
-
-    aec.attach_multihorizon_new_generators(n, COSTS, ["CCGT-95CCS"], 2030)
-
-    new = n.generators[n.generators.carrier == "CCGT-95CCS"]
-    assert len(new) == len(n.buses)
-    assert (new.vom_cost == 6.0).all()
+    pd.testing.assert_series_equal(n.generators_t.p_max_pu["gas2 existing"], fleet_profile, check_names=False)
+    assert len(added) == 6
+    for g in added:
+        bus, carrier = n.generators.loc[g, ["bus", "carrier"]]
+        curve = curves[settings["prime_movers"][carrier]]
+        expected = 1 - forced_outage_rate(temperature[bus].to_numpy(), curve, max_outage=0.4)
+        assert n.generators_t.p_max_pu[g].to_numpy() == pytest.approx(expected, abs=1e-3)
+    pd.testing.assert_series_equal(n.generators_t.p_max_pu["wind1"], wind_profile)
 
 
 # ---------------------------------------------------------------------------

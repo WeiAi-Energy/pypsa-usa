@@ -1,6 +1,32 @@
 (release-notes)=
 # Release Notes
 
+## Unreleased
+
+- **Temperature-dependent thermal derate replaces the EIA-860 seasonal derate**
+  ([#850](https://github.com/PyPSA/pypsa-usa/issues/850)). Thermal units get
+  `p_max_pu(t) = 1 - FOR(T_bus(t))`, with forced outage rate vs. temperature per prime
+  mover from Murphy et al. (2019), as in ReEDS, and `T_bus` the area-weighted mean air
+  temperature of the bus region. The new rule `build_ambient_temperature` reads it from the
+  ERA5 cutout of `renewable_weather_years[0]`, so **every run now needs that cutout**
+  (`retrieve_cutout` downloads it from Zenodo, also under `renewable.dataset: reeds` and
+  `godeeep`). The summer/winter month switch and the `conventional: ambient_derate:
+  enable` / `replaces_seasonal_derate` / `source` keys are gone; a config that still sets
+  them fails schema validation. Carriers without a curve (geothermal) are no longer derated.
+- **New builds take the cost table of their investment period, never the existing fleet.**
+  `add_extra_components` adds one candidate per bus, carrier and period for every
+  extendable thermal carrier (`"<bus> <carrier>_<year>"`), at every bus whether or not the
+  carrier has plants there. Efficiency, VOM, marginal cost, capital cost and lifetime come
+  from `costs_{year}.csv`, the regional multiplier from the county of the bus, and the
+  ambient derate from the temperature of the bus. Ramp limits, minimum stable level and unit
+  commitment keep the PyPSA defaults. Wind and solar vintages (`"<site> <year>"`) keep
+  only the resource of their site (profile, potential, land region, ReEDS multiplier and
+  interconnection cost). This removes the duplicate nuclear candidate at buses with existing
+  nuclear, and the single-period runs now name their renewable new builds with the year too.
+  Every new build and battery uses the physical `lifetime`, not the cost recovery period.
+  An extendable renewable carrier with no resource site is no longer added at every bus
+  with `p_max_pu = 1`.
+
 ## v1.0.0 (2026-10-05)
 
 v1.0.0 restructures the workflow around **early spatial

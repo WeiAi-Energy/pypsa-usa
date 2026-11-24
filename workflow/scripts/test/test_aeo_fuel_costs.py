@@ -151,7 +151,7 @@ def test_plants_pay_the_aeo_fuel_cost_of_each_period():
 
     apply_power_fuel_prices(n, costs_dict)
 
-    mc = n.generators_t.marginal_cost.groupby(level="period").first()
+    mc = period_marginal_cost(n)
     assert mc["p1 CCGT existing"].tolist() == pytest.approx([2 + 10 / 0.5, 2 + 20 / 0.5])
     # without a VOM of its own, a plant takes the VOM of its carrier's cost data
     assert mc["p1 coal-95CCS_2050"].tolist() == pytest.approx([4 + 5 / 0.4, 4 + 6 / 0.4])
@@ -159,8 +159,134 @@ def test_plants_pay_the_aeo_fuel_cost_of_each_period():
     # nuclear and biomass plants pay the (ATB) fuel cost of the cost data too
     assert mc["p1 nuclear existing"].tolist() == pytest.approx([2.5 + 3.3 / 0.32] * 2)
     assert mc["p1 biomass existing"].tolist() == pytest.approx([5 + 19.9 / 0.25] * 2)
-    assert "p1 solar" not in mc
+    assert mc["p1 solar"].tolist() == [0, 0]  # not a fuel plant: untouched
     assert n.generators.at["p1 CCGT existing", "marginal_cost"] == pytest.approx(2 + 10 / 0.5)
+    # only plants whose cost changes between periods get a time series
+    assert set(n.generators_t.marginal_cost.columns) == {"p1 CCGT existing", "p1 coal-95CCS_2050", "p1 oil"}
+
+
+def period_marginal_cost(n):
+    """Marginal cost of every generator in each investment period: its series, else its static value."""
+    return n.get_switchable_as_dense("Generator", "marginal_cost").groupby(level="period").first()
+
+
+def fuel_network(periods, plants):
+    """A one-bus network over two hours of each period with fuel plants (name -> build_year, lifetime)."""
+    import pypsa
+    from _helpers import get_multiindex_snapshots
+
+    n = pypsa.Network()
+    n.snapshots = get_multiindex_snapshots(
+        sns_config={"start": "2030-01-01 00:00", "end": "2030-01-01 01:00", "inclusive": "both"},
+        invest_periods=periods,
+    )
+    n.set_investment_periods(periods=periods)
+    n.add("Bus", "p1")
+    for name, (carrier, build_year, lifetime) in plants.items():
+        n.add("Generator", name, bus="p1", carrier=carrier, efficiency=0.5, build_year=build_year, lifetime=lifetime)
+    n.generators["vom_cost"] = 1.0
+    return n
+
+
+def fuel_costs_by_period(prices):
+    """Cost data of each period from {period: {carrier: fuel cost}}."""
+    return {
+        period: pd.DataFrame({"fuel_cost_real_per_mwhth": fuel, "opex_variable_per_mwh": 0.0})
+        for period, fuel in ((p, pd.Series(f)) for p, f in prices.items())
+    }
+
+
+def test_single_period_needs_no_fuel_cost_series():
+    from add_extra_components import apply_power_fuel_prices
+
+    n = fuel_network([2030], {"CCGT existing": ("CCGT", 1990, 50), "OCGT 2030": ("OCGT", 2030, 30)})
+    apply_power_fuel_prices(n, fuel_costs_by_period({2030: {"CCGT": 10.0, "OCGT": 12.0}}))
+
+    assert n.generators_t.marginal_cost.empty
+    assert n.generators.marginal_cost.tolist() == pytest.approx([1 + 10 / 0.5, 1 + 12 / 0.5])
+
+
+def test_only_plants_with_changing_active_costs_get_a_series():
+    from add_extra_components import apply_power_fuel_prices
+
+    n = fuel_network(
+        [2030, 2040, 2050],
+        {
+            "CCGT existing": ("CCGT", 1990, 100),  # active 2030-2050, price changes: series
+            "CCGT 2030": ("CCGT", 2030, 15),  # active 2030 and 2040: series
+            "CCGT 2050": ("CCGT", 2050, 30),  # active in 2050 only: static 2050 cost
+            "coal retired": ("coal", 1980, 40),  # never active: static first-period cost
+            "nuclear existing": ("nuclear", 1990, 100),  # active throughout, constant price: static
+            "OCGT 2040": ("OCGT", 2040, 30),  # active 2040 and 2050 at the same price: static
+        },
+    )
+    prices = {
+        2030: {"CCGT": 10.0, "coal": 4.0, "nuclear": 3.0, "OCGT": 20.0},
+        2040: {"CCGT": 14.0, "coal": 5.0, "nuclear": 3.0, "OCGT": 22.0},
+        2050: {"CCGT": 18.0, "coal": 6.0, "nuclear": 3.0, "OCGT": 22.0},
+    }
+    apply_power_fuel_prices(n, fuel_costs_by_period(prices))
+
+    assert list(n.generators_t.marginal_cost.columns) == ["CCGT existing", "CCGT 2030"]
+    mc = period_marginal_cost(n)
+    assert mc["CCGT existing"].tolist() == pytest.approx([21, 29, 37])
+    assert mc["CCGT 2030"].tolist()[:2] == pytest.approx([21, 29])
+    static = n.generators.marginal_cost
+    assert static["CCGT 2050"] == pytest.approx(1 + 18.0 / 0.5)
+    assert static["coal retired"] == pytest.approx(1 + 4.0 / 0.5)
+    assert static["nuclear existing"] == pytest.approx(1 + 3.0 / 0.5)
+    assert static["OCGT 2040"] == pytest.approx(1 + 22.0 / 0.5)
+
+
+def test_active_period_costs_match_a_full_series():
+    """In every period a plant is active in, its cost equals the full snapshot x plant table's."""
+    import numpy as np
+    from add_extra_components import apply_power_fuel_prices
+
+    rng = np.random.default_rng(0)
+    periods = [2030, 2035, 2040, 2050]
+    carriers = ["CCGT", "OCGT", "coal", "oil", "nuclear", "biomass"]
+    plants = {
+        f"g{i}": (
+            rng.choice(carriers),
+            int(rng.choice([1970, 1995, 2030, 2035, 2040, 2050])),
+            float(rng.choice([10, 20, 40, np.inf])),
+        )
+        for i in range(60)
+    }
+    n = fuel_network(periods, plants)
+    n.generators["efficiency"] = rng.uniform(0.25, 0.6, len(n.generators))
+    prices = {p: {c: float(rng.choice([3.0, 7.5, rng.uniform(1, 30)])) for c in carriers} for p in periods}
+    costs_dict = fuel_costs_by_period(prices)
+
+    apply_power_fuel_prices(n, costs_dict)
+
+    # the full table: VOM + period fuel cost / efficiency for every plant and snapshot
+    fuel = pd.DataFrame(prices).T
+    full = fuel.loc[periods, n.generators.carrier].to_numpy() / n.generators.efficiency.to_numpy() + 1.0
+    mc = period_marginal_cost(n).to_numpy()
+    active = np.vstack([n.get_active_assets("Generator", p).to_numpy() for p in periods])
+    assert active.any() and not active.all()
+    np.testing.assert_array_equal(mc[active], full[active])
+
+
+def test_ptc_after_period_fuel_costs():
+    """The PTC comes off both the static cost and the series of a vintage."""
+    from add_extra_components import apply_power_fuel_prices, apply_ptc
+
+    n = fuel_network([2030, 2040], {"CCGT 2030": ("CCGT", 2030, 30), "CCGT 2040": ("CCGT", 2040, 30)})
+    n.generators["p_nom_extendable"] = True
+    costs_dict = fuel_costs_by_period({2030: {"CCGT": 10.0}, 2040: {"CCGT": 14.0}})
+    for period, costs in costs_dict.items():
+        costs["ptc_per_mwh"] = {2030: 5.0, 2040: 0.0}[period]
+
+    apply_power_fuel_prices(n, costs_dict)
+    apply_ptc(n, costs_dict)
+
+    mc = period_marginal_cost(n)
+    assert mc["CCGT 2030"].tolist() == pytest.approx([21 - 5, 29 - 5])  # series
+    assert n.generators.at["CCGT 2040", "marginal_cost"] == pytest.approx(29)  # static, no credit
+    assert "CCGT 2040" not in n.generators_t.marginal_cost
 
 
 # nuclear, SMR and biomass pay the ATB fuel cost

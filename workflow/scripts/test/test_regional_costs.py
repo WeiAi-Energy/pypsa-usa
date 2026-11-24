@@ -423,23 +423,29 @@ def test_vintages_take_the_multiplier_the_merged_generator_was_priced_with(base_
 
 
 @pytest.mark.fast
-def test_attached_vintages_carry_the_multiplier(multi_period_base_network):
-    from add_extra_components import attach_multihorizon_existing_generators
+def test_new_thermal_takes_the_multiplier_of_its_bus(multi_period_base_network):
+    """A new build is priced with the county of its bus, not with the fleet's own multiplier."""
+    from add_extra_components import attach_new_thermal
 
     n = multi_period_base_network
-    n.generators["land_region"] = n.generators.bus
     n.generators.loc["gas2", REGIONAL_MULTIPLIER_COL] = 1.125
-    gens = n.generators.loc[["gas2"]]
-    costs = _gas_costs().assign(efficiency=0.5, opex_variable_per_mwh=0.0, heat_rate_mmbtu_per_mwh=0.0)
+    costs = _gas_costs().assign(
+        efficiency=0.5,
+        marginal_cost=30.0,
+        lifetime=40.0,
+        opex_variable_per_mwh=0.0,
+        co2_emissions=0.2,
+    )
     annuity = calculate_annuity(30.0, 0.05)
 
     for year in n.investment_periods:
-        attach_multihorizon_existing_generators(
+        attach_new_thermal(
             n,
             costs,
-            gens,
+            ["gas"],
             year,
             bus_multipliers=pd.DataFrame({"gas": {"z1": 1.0, "z2": 1.0, "z3": 1.5}}),
         )
-        assert n.generators.at[f"gas2 {year}", "capital_cost"] == pytest.approx(150_000 + annuity * 0.125 * 1e6)
-        assert n.generators.at[f"gas2 {year}", REGIONAL_MULTIPLIER_COL] == 1.125
+        assert n.generators.at[f"z3 gas_{year}", "capital_cost"] == pytest.approx(150_000 + annuity * 0.5 * 1e6)
+        assert n.generators.at[f"z1 gas_{year}", "capital_cost"] == pytest.approx(150_000)
+        assert n.generators.at[f"z3 gas_{year}", "lifetime"] == 40.0

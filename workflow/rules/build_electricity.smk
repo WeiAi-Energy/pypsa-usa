@@ -1354,6 +1354,7 @@ def flowgates_for_extra_components(wildcards):
 
 rule add_extra_components:
     input:
+        unpack(ambient_derate_files),
         **{
             f"phs_shp_{hour}": "repo_data/"
             + f"psh/40-100-dam-height-{hour}hr-no-croplands-no-ephemeral-no-highways.gpkg"
@@ -1363,6 +1364,8 @@ rule add_extra_components:
             if hour.isdigit()
         },
         network=NETWORKS + "{interconnect}/elec_s{simpl}_c{clusters}.nc",
+        # maps the {simpl} buses of the ambient temperature onto the clustered buses
+        busmap_c=BUSMAPS + "{interconnect}/busmap_s{simpl}_{clusters}.csv",
         tech_costs=lambda wildcards: expand(
             COSTS + "costs_{year}.csv",
             year=config["scenario"]["planning_horizons"],
