@@ -18,13 +18,25 @@ CORRIDOR_COST = LENGTH_KM * HVDC_OVERHEAD + HVDC_INVERTER_PAIR
 
 @pytest.fixture
 def costs():
+    # a one-year recovery at zero WACC and no FOM: the upfront cost is the annual cost
     return pd.DataFrame(
         {
-            "annualized_capex_per_mw_km": [30.0, HVDC_OVERHEAD, 100.0, float("nan")],
-            "annualized_capex_per_mw": [float("nan"), float("nan"), float("nan"), HVDC_INVERTER_PAIR],
+            "capex_per_mw_km": [30.0, HVDC_OVERHEAD, 100.0, float("nan")],
+            "capex_per_kw": [float("nan"), float("nan"), float("nan"), HVDC_INVERTER_PAIR / 1e3],
+            "cost_recovery_period_years": 1.0,
+            "wacc_real": 0.0,
+            "fom_fraction": 0.0,
         },
         index=["HVAC overhead", "HVDC overhead", "HVDC submarine", "HVDC inverter pair"],
     )
+
+
+@pytest.mark.fast
+def test_transmission_fom_adds_to_capital_recovery(dc_network, costs):
+    """The FOM share of the upfront cost is paid every year on top of capital recovery."""
+    costs["fom_fraction"] = 0.015
+    update_transmission_costs(dc_network, costs)
+    assert dc_network.links.capital_cost["dc2"] == pytest.approx(1.015 * CORRIDOR_COST)
 
 
 @pytest.fixture

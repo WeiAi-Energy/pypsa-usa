@@ -60,14 +60,14 @@ def reeds_capacity_file(tmp_path):
 @pytest.mark.fast
 def test_added_reeds_line_capital_cost_is_per_mw(clustering, reeds_capacity_file):
     costs = pd.DataFrame(
-        {"annualized_capex_per_mw_km": [HVAC_OVERHEAD_COST]},
+        {"capex_per_mw_km": [HVAC_OVERHEAD_COST], "cost_recovery_period_years": [1.0], "wacc_real": [0.0]},
         index=["HVAC overhead"],
     )
     calibrate_tamu_transmission_capacity(
         clustering,
         reeds_capacity_file,
         topological_boundaries="state",
-        s_max_pu=0.7,
+        n1_derate=0.7,
         length_factor=1.25,
         costs=costs,
         build_year=2025,

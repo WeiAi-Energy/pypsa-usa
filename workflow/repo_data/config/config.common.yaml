@@ -16,7 +16,7 @@
 #                        `dataset`, which used to be duplicated in
 #                        config.default.yaml with the same value)
 #   lines:       config.default.yaml (the line-type catalog moved
-#                        there to join s_max_pu and friends)
+#                        there to join N1_derate and friends)
 #   renewable_weather_years / renewable_scenarios / co2:
 #                config.default.yaml (they were duplicated here with
 #                        identical values)

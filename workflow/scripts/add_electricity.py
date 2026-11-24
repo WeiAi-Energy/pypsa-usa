@@ -46,6 +46,7 @@ from regional_cost import (
     regional_capital_cost,
     renewable_interconnection_capital_cost,
     renewable_interconnection_enabled,
+    transmission_annual_factor,
 )
 from sklearn.neighbors import BallTree
 
@@ -230,16 +231,6 @@ def apply_dynamic_pricing(
     )
 
 
-def _transmission_annuity(costs: pd.DataFrame, technology: str) -> float:
-    """Annuity factor of a transmission cost row (same basis as build_cost_data)."""
-    return float(
-        calculate_annuity(
-            costs.at[technology, "cost_recovery_period_years"],
-            costs.at[technology, "wacc_real"],
-        ),
-    )
-
-
 def _regional_branch_capex(df: pd.DataFrame) -> pd.Series | None:
     """The stored region/voltage-resolved overnight unit cost, if usable."""
     if BRANCH_CAPEX_COL not in df.columns:
@@ -255,7 +246,7 @@ def update_transmission_costs(n, costs, length_factor=1.0, regional: bool = True
     in ``aggregate_to_substations`` from the ReEDS county-pair and voltage-class
     tables and carried through clustering), the cost is
 
-        annuity x overnight USD/MW per great-circle km x great-circle km
+        annual factor x overnight USD/MW per great-circle km x great-circle km
 
     of the current bus coordinates. ReEDS prices already embed route detour, so
     the routed ``length`` (great-circle x ``lines.length_factor``) is deliberately
@@ -264,11 +255,17 @@ def update_transmission_costs(n, costs, length_factor=1.0, regional: bool = True
     ``HVDC overhead`` costs per km of ``length * length_factor``.
 
     HVDC links keep their national ``HVDC submarine`` cost on the underwater
-    share and the ``HVDC inverter pair`` per-MW cost on top. Each link of a
-    ``_fwd``/``_rev`` pair carries half of that corridor cost.
+    share and the ``HVDC inverter pair`` per-MW cost on top (a pair of LCC converter
+    stations). Each link of a ``_fwd``/``_rev`` pair carries half of that corridor cost.
+
+    Every upfront cost is annualized at
+    :func:`regional_cost.transmission_annual_factor`, the capital recovery factor plus
+    the transmission FOM share.
     """
+    hvac = transmission_annual_factor(costs, "HVAC overhead")
+    hvac_per_km = hvac * costs.at["HVAC overhead", "capex_per_mw_km"]
     if not n.lines.empty:
-        national = n.lines["length"] * length_factor * costs.at["HVAC overhead", "annualized_capex_per_mw_km"]
+        national = n.lines["length"] * length_factor * hvac_per_km
         unit = _regional_branch_capex(n.lines) if regional else None
         if unit is None:
             n.lines["capital_cost"] = national
@@ -276,7 +273,7 @@ def update_transmission_costs(n, costs, length_factor=1.0, regional: bool = True
             km = great_circle_km(n, n.lines)
             # co-located endpoints: fall back to the routed length
             km = km.where(km > 0, n.lines["length"] / max(length_factor, 1e-9))
-            regional_cost = _transmission_annuity(costs, "HVAC overhead") * unit * km
+            regional_cost = hvac * unit * km
             n.lines["capital_cost"] = regional_cost.fillna(national)
             missing = int(unit.isna().sum())
             if missing:
@@ -288,7 +285,7 @@ def update_transmission_costs(n, costs, length_factor=1.0, regional: bool = True
                 per_km.min(),
                 per_km.median(),
                 per_km.max(),
-                costs.at["HVAC overhead", "annualized_capex_per_mw_km"],
+                hvac_per_km,
             )
 
     if n.links.empty:
@@ -303,18 +300,19 @@ def update_transmission_costs(n, costs, length_factor=1.0, regional: bool = True
 
     links = n.links.loc[dc_b]
     underwater = links["underwater_fraction"].fillna(0.0) if "underwater_fraction" in links else 0.0
-    overhead = links["length"] * length_factor * costs.at["HVDC overhead", "annualized_capex_per_mw_km"]
+    hvdc = transmission_annual_factor(costs, "HVDC overhead")
+    overhead = links["length"] * length_factor * hvdc * costs.at["HVDC overhead", "capex_per_mw_km"]
     unit = _regional_branch_capex(links) if regional else None
     if unit is not None:
         km = great_circle_km(n, links)
         km = km.where(km > 0, links["length"] / max(length_factor, 1e-9))
-        overhead = (_transmission_annuity(costs, "HVDC overhead") * unit * km).fillna(overhead)
+        overhead = (hvdc * unit * km).fillna(overhead)
 
-    costs = (
-        (1.0 - underwater) * overhead
-        + underwater * links["length"] * length_factor * costs.at["HVDC submarine", "annualized_capex_per_mw_km"]
-        + costs.at["HVDC inverter pair", "annualized_capex_per_mw"]
+    submarine = transmission_annual_factor(costs, "HVDC submarine") * costs.at["HVDC submarine", "capex_per_mw_km"]
+    converters = (
+        transmission_annual_factor(costs, "HVDC inverter pair") * costs.at["HVDC inverter pair", "capex_per_kw"]
     )
+    costs = (1.0 - underwater) * overhead + underwater * links["length"] * length_factor * submarine + converters * 1e3
     # A DC line built as a `_fwd`/`_rev` link pair expands both links together
     # (bidirectional link constraint), so each link carries half of the cost.
     costs = costs.where(~_bidirectional_pair(costs.index), costs / 2)

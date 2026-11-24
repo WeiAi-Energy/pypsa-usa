@@ -266,41 +266,57 @@ def get_sector_costs(
 
 
 # Transmission cost assumptions are independent of ATB scenario / model case.
-# TEPCC 2023; WACC & Lifetime from https://emp.lbl.gov/publications/improving-estimates-transmission
+# Capex: TEPCC 2023. WACC 3.6% (real) and a 40-year cost recovery period are project assumptions
+# (previously 4.4% and 60 years from https://emp.lbl.gov/publications/improving-estimates-transmission)
 # Subsea: Purvins et al. (2018): https://doi.org/10.1016/j.jclepro.2018.03.095
+# Converters and FOM follow ReEDS inputs/scalars.csv (v2025.7.0 on), whose costs are in 2004$:
+# - cost_acdc_lcc, 150,000 $/MW for one 500 kV LCC converter station (MISO MTEP25), applied twice
+#   per LCC line, so an HVDC link (or back-to-back tie) pays for a pair;
+# - trans_fom_frac, transmission FOM of 1.5% of the upfront cost per year, for lines and converters.
+REEDS_DOLLAR_YEAR = 2004
+LCC_CONVERTER_STATION_PER_KW = 150.0  # 2004$/kW
+TRANSMISSION_FOM_FRACTION = 0.015
+TRANSMISSION_TECHS = ["HVAC overhead", "HVDC overhead", "HVDC submarine", "HVDC inverter pair"]
+# Dollar year of a transmission (pypsa-name, parameter) if not the model's; get_transmission_data converts it
+TRANSMISSION_DOLLAR_YEARS = {("HVDC inverter pair", "capex_per_kw"): REEDS_DOLLAR_YEAR}
+TRANSMISSION_DEFAULT_DOLLAR_YEAR = 2023  # process_atb_scenario without `transmission` (costs: dollar_year default)
 TRANSMISSION_DATA = [
     {"pypsa-name": "HVAC overhead", "parameter": "capex_per_mw_km", "value": 1541},
     {
         "pypsa-name": "HVAC overhead",
         "parameter": "cost_recovery_period_years",
-        "value": 60,
+        "value": 40,
     },
-    {"pypsa-name": "HVAC overhead", "parameter": "wacc_real", "value": 0.044},
+    {"pypsa-name": "HVAC overhead", "parameter": "wacc_real", "value": 0.036},
     {"pypsa-name": "HVDC overhead", "parameter": "capex_per_mw_km", "value": 1026.53},
     {
         "pypsa-name": "HVDC overhead",
         "parameter": "cost_recovery_period_years",
-        "value": 60,
+        "value": 40,
     },
-    {"pypsa-name": "HVDC overhead", "parameter": "wacc_real", "value": 0.044},
+    {"pypsa-name": "HVDC overhead", "parameter": "wacc_real", "value": 0.036},
     {"pypsa-name": "HVDC submarine", "parameter": "capex_per_mw_km", "value": 504.141},
     {
         "pypsa-name": "HVDC submarine",
         "parameter": "cost_recovery_period_years",
-        "value": 60,
+        "value": 40,
     },
-    {"pypsa-name": "HVDC submarine", "parameter": "wacc_real", "value": 0.044},
+    {"pypsa-name": "HVDC submarine", "parameter": "wacc_real", "value": 0.036},
     {
         "pypsa-name": "HVDC inverter pair",
         "parameter": "capex_per_kw",
-        "value": 173.730,
+        "value": 2 * LCC_CONVERTER_STATION_PER_KW,  # 2004$/kW, see TRANSMISSION_DOLLAR_YEARS
     },
     {
         "pypsa-name": "HVDC inverter pair",
         "parameter": "cost_recovery_period_years",
-        "value": 60,
+        "value": 40,
     },
-    {"pypsa-name": "HVDC inverter pair", "parameter": "wacc_real", "value": 0.044},
+    {"pypsa-name": "HVDC inverter pair", "parameter": "wacc_real", "value": 0.036},
+    *(
+        {"pypsa-name": tech, "parameter": "fom_fraction", "value": TRANSMISSION_FOM_FRACTION}
+        for tech in TRANSMISSION_TECHS
+    ),
 ]
 
 
@@ -345,7 +361,7 @@ ATB_VALUE_COLS = [
 FINANCE_PROXY = {f"{h}hr_battery_storage": "geothermal" for h in (2, 4, 6, 8, 10)}
 
 # Rates keep more digits than the 3 decimals of every other cost parameter
-RATE_PARAMETERS = ["capital_charge_rate", "fixed_charge_rate", "ptc_per_mwh", "itc_effective"]
+RATE_PARAMETERS = ["capital_charge_rate", "fixed_charge_rate", "ptc_per_mwh", "itc_effective", "fom_fraction"]
 
 
 def build_aeo_fuel_costs(api: str, tech_year: int, aeo_scenario: str, dollar_year: int) -> pd.DataFrame:
@@ -435,6 +451,15 @@ def get_beccs_data(dollar_year: int) -> pd.Series:
     data = pd.Series(BECCS_DATA)
     costs = ["capcost", "fom", "vom"]
     data[costs] = to_dollars(data[costs], year=BECCS_DOLLAR_YEAR, to_year=dollar_year)
+    return data
+
+
+def get_transmission_data(dollar_year: int) -> pd.DataFrame:
+    """``TRANSMISSION_DATA`` with the costs listed in ``TRANSMISSION_DOLLAR_YEARS`` in US dollars of ``dollar_year``."""
+    data = pd.DataFrame(TRANSMISSION_DATA)
+    for (tech, parameter), year in TRANSMISSION_DOLLAR_YEARS.items():
+        row = (data["pypsa-name"] == tech) & (data["parameter"] == parameter)
+        data.loc[row, "value"] = to_dollars(data.loc[row, "value"], year=year, to_year=dollar_year)
     return data
 
 
@@ -575,6 +600,7 @@ def process_atb_scenario(
     aeo: pd.DataFrame,
     beccs: pd.Series | None = None,
     base_sub: pd.DataFrame | None = None,
+    transmission: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Run the full cost pipeline for one (atb_scenario, model_case) slice.
 
@@ -606,7 +632,7 @@ def process_atb_scenario(
         [
             pudl_atb,
             pd.DataFrame(EMISSIONS_DATA),
-            pd.DataFrame(TRANSMISSION_DATA),
+            get_transmission_data(TRANSMISSION_DEFAULT_DOLLAR_YEAR) if transmission is None else transmission,
             pd.DataFrame(LIFETIME_DATA),
         ],
         ignore_index=True,
@@ -673,6 +699,13 @@ def process_atb_scenario(
     pivot_atb["annualized_connection_capex_per_mw_km"] = (
         pivot_atb["capital_charge_rate"] * pivot_atb["capex_grid_connection_per_kw_km"]
     )
+
+    # Transmission FOM is a share of the upfront cost per year (fom_fraction, ReEDS trans_fom_frac);
+    # the network prices branches at regional_cost.transmission_annual_factor, CRF + fom_fraction
+    if "fom_fraction" in pivot_atb:
+        fom = pivot_atb["fom_fraction"]
+        per_kw = fom.notna() & pivot_atb["capex_per_kw"].notna()
+        pivot_atb.loc[per_kw, "opex_fixed_per_kw"] = fom[per_kw] * pivot_atb.loc[per_kw, "capex_per_kw"]
 
     pivot_atb["annualized_capex_fom"] = pivot_atb["annualized_capex_per_mw"] + (pivot_atb["opex_fixed_per_kw"] * 1e3)
     result = pivot_atb.melt(
@@ -754,6 +787,7 @@ if __name__ == "__main__":
 
     # BECCS costs and performance, independent of ATB scenario / case
     beccs = get_beccs_data(dollar_year)
+    transmission = get_transmission_data(dollar_year)
 
     # Iterate over every (atb_scenario, model_case) so that the final CSV holds
     # the entire ATB scenario grid; downstream selects the correct slice via
@@ -775,7 +809,7 @@ if __name__ == "__main__":
             base_sub = (
                 complete_atb_slice(pudl_atb_year, atb_scenario, base_case) if base_case != atb_model_case else None
             )
-            result = process_atb_scenario(sub, aeo, beccs, base_sub)
+            result = process_atb_scenario(sub, aeo, beccs, base_sub, transmission)
             result["atb_scenario"] = atb_scenario
             result["atb_model_case"] = atb_model_case
             scenario_results.append(result)

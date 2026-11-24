@@ -565,6 +565,21 @@ def carrier_capital_charge_rate(costs: pd.DataFrame, carrier: str) -> float:
     return float(calculate_annuity(costs.at[carrier, "cost_recovery_period_years"], costs.at[carrier, "wacc_real"]))
 
 
+def transmission_annual_factor(costs: pd.DataFrame, technology: str) -> float:
+    """Annual cost of a transmission row per unit of its upfront cost: capital recovery plus FOM.
+
+    The capital recovery factor of its ``cost_recovery_period_years`` and ``wacc_real``
+    plus ``fom_fraction``, the share of the upfront cost spent on fixed O&M per year
+    (ReEDS ``trans_fom_frac``; zero in a cost table without it). Applies to AC lines,
+    HVDC lines and converters alike.
+    """
+    from _helpers import calculate_annuity
+
+    crf = calculate_annuity(costs.at[technology, "cost_recovery_period_years"], costs.at[technology, "wacc_real"])
+    fom = costs.at[technology, "fom_fraction"] if "fom_fraction" in costs.columns else 0.0
+    return float(crf + (fom if pd.notna(fom) else 0.0))
+
+
 def overnight_delta_capital_cost(annualized_capex_fom, capex_overnight_per_kw, annuity_factor, multiplier):
     """Capital cost with only the overnight portion scaled by ``multiplier``.
 

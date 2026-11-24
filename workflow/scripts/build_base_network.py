@@ -227,6 +227,18 @@ def assign_line_length(n: pypsa.Network, length_factor: float):
     n.lines["length"] = distances * length_factor
 
 
+# HVDC losses of ReEDS (inputs/scalars.csv, input_processing/transmission.py): an LCC converter
+# station at each end loses 1 - converter_efficiency_lcc, the DC line tranloss_permile_dc per mile.
+LCC_CONVERTER_LOSS = 1 - 0.993
+DC_LOSS_PER_MILE = 0.00005
+KM_PER_MILE = 1.609344
+
+
+def hvdc_efficiency(length_km):
+    """ReEDS HVDC link efficiency: 0.7% at each of two LCC converter stations plus 0.5% per 100 miles of line."""
+    return 1 - 2 * LCC_CONVERTER_LOSS - DC_LOSS_PER_MILE * np.asarray(length_km) / KM_PER_MILE
+
+
 def assign_link_length_and_efficiency(n: pypsa.Network, length_factor: float):
     """Set each DC link's length (great-circle distance times ``length_factor``) and its efficiency."""
     bus_df = n.buses[["x", "y"]]
@@ -234,8 +246,7 @@ def assign_link_length_and_efficiency(n: pypsa.Network, length_factor: float):
     bus1 = bus_df.loc[n.links.bus1].values
     length = haversine_np(bus0[:, 0], bus0[:, 1], bus1[:, 0], bus1[:, 1]) * length_factor
     n.links["length"] = length
-    # 2% loss for inverters, 3%/1000km loss for DC lines, https://www.nature.com/articles/s41560-025-01752-6#Sec14
-    n.links["efficiency"] = 1 - 0.02 - 0.03 * length / 1000
+    n.links["efficiency"] = hvdc_efficiency(length)
 
 
 def create_grid(polygon, cell_size):

@@ -77,18 +77,24 @@ def model():
     )
 
 
+FOM_FRACTION = 0.015
+ANNUAL_FACTOR = calculate_annuity(40.0, 0.036) + FOM_FRACTION
+
+
 def _costs():
     rows = {
-        "HVAC overhead": {"capex_per_mw_km": 1541.0, "cost_recovery_period_years": 60.0, "wacc_real": 0.044},
-        "HVDC overhead": {"capex_per_mw_km": 1026.53, "cost_recovery_period_years": 60.0, "wacc_real": 0.044},
-        "HVDC submarine": {"capex_per_mw_km": 504.141, "cost_recovery_period_years": 60.0, "wacc_real": 0.044},
-        "HVDC inverter pair": {"capex_per_mw_km": 0.0, "cost_recovery_period_years": 60.0, "wacc_real": 0.044},
+        "HVAC overhead": {"capex_per_mw_km": 1541.0, "cost_recovery_period_years": 40.0, "wacc_real": 0.036},
+        "HVDC overhead": {"capex_per_mw_km": 1026.53, "cost_recovery_period_years": 40.0, "wacc_real": 0.036},
+        "HVDC submarine": {"capex_per_mw_km": 504.141, "cost_recovery_period_years": 40.0, "wacc_real": 0.036},
+        "HVDC inverter pair": {"capex_per_mw_km": 0.0, "cost_recovery_period_years": 40.0, "wacc_real": 0.036},
     }
     costs = pd.DataFrame(rows).T
-    annuity = calculate_annuity(60.0, 0.044)
-    costs["annualized_capex_per_mw_km"] = annuity * costs["capex_per_mw_km"]
-    costs["annualized_capex_per_mw"] = 0.0
-    costs.loc["HVDC inverter pair", "annualized_capex_per_mw"] = annuity * 173.73e3
+    costs["capex_per_kw"] = 0.0
+    costs.loc["HVDC inverter pair", "capex_per_kw"] = 483.9
+    costs["fom_fraction"] = FOM_FRACTION
+    # annual cost per unit of upfront cost: capital recovery plus FOM
+    costs["annualized_capex_per_mw_km"] = ANNUAL_FACTOR * costs["capex_per_mw_km"]
+    costs["annualized_capex_per_mw"] = ANNUAL_FACTOR * costs["capex_per_kw"] * 1e3
     return costs
 
 
@@ -245,7 +251,7 @@ def test_update_transmission_costs_regional_and_national(model):
 
     update_transmission_costs(n, costs, regional=True)
     km = great_circle_km(n, n.lines)
-    annuity = calculate_annuity(60.0, 0.044)
+    annuity = ANNUAL_FACTOR
     assert n.lines.capital_cost.to_numpy() == pytest.approx((annuity * n.lines[BRANCH_CAPEX_COL] * km).to_numpy())
     link_km = great_circle_km(n, n.links).iloc[0]
     assert n.links.at["dc_fwd", "capital_cost"] == pytest.approx(

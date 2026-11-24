@@ -1303,7 +1303,7 @@ rule cluster_network:
             "model_topology", "topological_boundaries"
         ),
         topology_aggregation=config_provider("model_topology", "aggregate"),
-        s_max_pu=config_provider("lines", "s_max_pu", default=0.7),
+        N1_derate=config_provider("lines", "N1_derate", default=0.7),
     input:
         network=NETWORKS + "{interconnect}/elec_s{simpl}_l_pp.pkl",
         regions_onshore=GEOSPATIAL + "{interconnect}/regions_onshore_s{simpl}.geojson",

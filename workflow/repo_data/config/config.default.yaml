@@ -307,7 +307,7 @@ conventional:
 # ====================================================================
 # docs : LINES
 lines:
-  s_max_pu: 0.7                            # apparent-power utilization cap (fraction of s_nom); 0.7 = N-1 derate
+  N1_derate: 0.7                           # N-1 derate of line capacity (fraction of s_nom), set as the lines' static s_max_pu
   s_nom_max: .inf                          # MVA cap on expanded line capacity per corridor (.inf = unbounded)
   max_extension: 20000                     # MW cap on total network-wide line expansion
   length_factor: 1.25                      # multiplier on geographic length to account for routing/right-of-way

@@ -222,7 +222,8 @@ def provision_baseline_worktree() -> Path:
 
     # Shared harness configs (kept in sync from the develop repo_data copies).
     # master keeps the pre-2026-09-06 {clusters} suffix semantics, so
-    # scenario.clusters is translated on the way in (paths.baseline_clusters).
+    # scenario.clusters is translated on the way in (paths.baseline_clusters),
+    # and reads the N-1 derate from lines.s_max_pu (develop: lines.N1_derate).
     for cfg in (REPO / "workflow" / "repo_data" / "config").glob("config.equivalence*.yaml"):
         text = re.sub(
             r"^(\s*clusters:\s*\[)([^\]]*)(\])",
@@ -231,6 +232,7 @@ def provision_baseline_worktree() -> Path:
             count=1,
             flags=re.MULTILINE,
         )
+        text = re.sub(r"^(\s*)N1_derate:", r"\1s_max_pu:", text, count=1, flags=re.MULTILINE)
         (wf / "config" / cfg.name).write_text(text)
 
     # Harness-specific policy CSVs (e.g. the USA national CO2 cap) are

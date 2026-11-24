@@ -13,7 +13,6 @@ import pyomo.environ as po
 import pypsa
 import seaborn as sns
 from _helpers import (
-    calculate_annuity,
     configure_logging,
     is_transport_model,
     load_costs,
@@ -39,6 +38,7 @@ from regional_cost import (
     LINE_CAPEX_STRATEGIES,
     TransmissionCostModel,
     assign_bus_counties,
+    transmission_annual_factor,
 )
 
 warnings.filterwarnings(action="ignore", category=UserWarning)
@@ -47,7 +47,9 @@ idx = pd.IndexSlice
 
 logger = logging.getLogger(__name__)
 
-TRANSMISSION_LIFETIME = 60  # years; matches HVAC/HVDC cost_recovery_period_years in build_cost_data.py
+# Years of operation of lines/links: they never retire. Only their build_year (the first planning
+# horizon) matters, marking them as brownfield for myopic runs. Cost recovery (40 years) is in build_cost_data.py.
+TRANSMISSION_LIFETIME = np.inf
 
 
 def normed(x):
@@ -315,7 +317,7 @@ def clustering_for_n_clusters(
     return clustering
 
 
-def add_itls(buses, itls, itl_cost, planning_horizons, lifetime):
+def add_itls(buses, itls, itl_cost, planning_horizons, lifetime, annual_factor):
     """
     Adds ITL limits to the network.
 
@@ -334,9 +336,8 @@ def add_itls(buses, itls, itl_cost, planning_horizons, lifetime):
         itl_cost["interface"] = itl_cost.r + "||" + itl_cost.rr
         itl_cost = itl_cost[itl_cost.interface.isin(itls.interface)]
         itl_cost["USD2023perMW"] = itl_cost["USD2004perMW"] * (314.54 / 188.9)
-        itl_cost["USD2023perMWyr"] = (
-            calculate_annuity(60, 0.044) * itl_cost["USD2023perMW"]
-        )  # wacc_real = 0.044 according to build_cost_data.py
+        # capital recovery plus FOM of HVAC overhead (regional_cost.transmission_annual_factor)
+        itl_cost["USD2023perMWyr"] = annual_factor * itl_cost["USD2023perMW"]
         itls = itls.merge(
             itl_cost[["interface", "length_miles", "USD2023perMWyr"]],
             on="interface",
@@ -449,6 +450,7 @@ def convert_to_transport(
     topology_aggregation,
     planning_horizons,
     lifetime,
+    annual_factor,
     agg_busmap=None,
 ):
     """
@@ -470,7 +472,7 @@ def convert_to_transport(
             itls.r.isin(clustering.n.buses[f"{topological_boundaries}"])
             & itls.rr.isin(clustering.n.buses[f"{topological_boundaries}"])
         ]
-    add_itls(buses, itls_filt, itl_cost, planning_horizons, lifetime)
+    add_itls(buses, itls_filt, itl_cost, planning_horizons, lifetime, annual_factor)
 
     if itl_agg_fn:
         assert agg_busmap is not None, "agg_busmap is required when itl_agg_fn is given."
@@ -512,7 +514,7 @@ def convert_to_transport(
 
         itl_lower_res = pd.concat([itl_lower_res, itls_between])
         itl_agg_costs = None if itl_agg_costs_fn is None else pd.concat([itl_cost, pd.read_csv(itl_agg_costs_fn)])
-        add_itls(buses, itl_lower_res, itl_agg_costs, planning_horizons, lifetime)
+        add_itls(buses, itl_lower_res, itl_agg_costs, planning_horizons, lifetime, annual_factor)
         itls = pd.concat([itls_filt, itl_lower_res])
     else:
         itls = itls_filt
@@ -686,7 +688,7 @@ def calibrate_tamu_transmission_capacity(
     clustering,
     reeds_capacity_file,
     topological_boundaries,
-    s_max_pu,
+    n1_derate,
     length_factor,
     costs,
     build_year,
@@ -709,8 +711,8 @@ def calibrate_tamu_transmission_capacity(
         Path to REEDS transmission capacity CSV file
     topological_boundaries : str
         The topological boundary level ('state', 'reeds_zone', 'county')
-    s_max_pu : float
-        Maximum loading factor for lines (from config lines:s_max_pu)
+    n1_derate : float
+        N-1 derate of the line capacities (from config lines:N1_derate)
     length_factor : float
         Factor to multiply air-line distance for line length calculation
     costs : pd.DataFrame
@@ -729,16 +731,18 @@ def calibrate_tamu_transmission_capacity(
     """
     logger.info("Calibrate TAMU transmission capacity...")
 
-    hvac_overhead_cost = costs.at["HVAC overhead", "annualized_capex_per_mw_km"]
+    hvac_overhead_cost = (
+        transmission_annual_factor(costs, "HVAC overhead") * costs.at["HVAC overhead", "capex_per_mw_km"]
+    )
 
     # Read REEDS capacity data
     reeds_data = pd.read_csv(reeds_capacity_file)
     reeds_data.columns = reeds_data.columns.str.lower()
 
     # Create mapping from interface to maximum capacity
-    # Use the larger value between forward and reverse divided by s_max_pu as new s_nom
+    # Use the larger value between forward and reverse divided by the N-1 derate as new s_nom
     reeds_data["max_capacity_mw"] = np.maximum(reeds_data["mw_f0"], reeds_data["mw_r0"])
-    reeds_data["new_s_nom"] = reeds_data["max_capacity_mw"] / s_max_pu
+    reeds_data["new_s_nom"] = reeds_data["max_capacity_mw"] / n1_derate
 
     # Create bidirectional mapping from region pairs to new s_nom and original data
     reeds_capacity_map = {}
@@ -974,10 +978,7 @@ def calibrate_tamu_transmission_capacity(
                 bus_county.reindex(new_lines_df["bus1"]).set_axis(new_lines_df.index),
                 new_lines_df["v_nom"].to_numpy(),
             )
-            annuity = calculate_annuity(
-                costs.at["HVAC overhead", "cost_recovery_period_years"],
-                costs.at["HVAC overhead", "wacc_real"],
-            )
+            annuity = transmission_annual_factor(costs, "HVAC overhead")
             new_lines_df[BRANCH_CAPEX_COL] = unit.to_numpy()
             new_lines_df["capital_cost"] = annuity * unit.to_numpy() * new_lines_df["length"] / length_factor
         clustering.n.add(
@@ -1232,6 +1233,7 @@ if __name__ == "__main__":
                 topology_aggregation,
                 snakemake.params.planning_horizons,
                 transmission_lifetime,
+                transmission_annual_factor(costs, "HVAC overhead"),
                 agg_busmap=agg_busmap,
             )
         else:
@@ -1260,8 +1262,7 @@ if __name__ == "__main__":
                     f"Valid values are 'state', 'reeds_zone', 'county'",
                 )
 
-        # Get s_max_pu from config
-        s_max_pu = params.get("s_max_pu", 0.7)  # Default to 0.7 if not specified
+        n1_derate = params.get("N1_derate", 0.7)
 
         # Check if topology_aggregation was used (original region info saved)
         use_original_region = False
@@ -1273,7 +1274,7 @@ if __name__ == "__main__":
             clustering,
             reeds_capacity_file,
             topological_boundaries,
-            s_max_pu,
+            n1_derate,
             params.length_factor,
             costs,
             transmission_build_year,
