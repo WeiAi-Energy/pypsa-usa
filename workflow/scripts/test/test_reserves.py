@@ -75,8 +75,43 @@ def multi_period_reserve_network(multi_period_base_network):
     return n
 
 
+def _regional_reserve_slack(n, buses, erm_value):
+    """Regional reserve capacity (generators, shadow storage, boundary flows) minus requirement."""
+    buses = pd.Index(buses)
+    snapshots = n.snapshots
+
+    demand = n.loads_t.p.loc[:, n.loads.bus.isin(buses)].sum(axis=1)
+    requirement = demand * (1.0 + erm_value)
+
+    gens = n.generators.index[n.generators.bus.isin(buses)]
+    p_max_pu = n.get_switchable_as_dense("Generator", "p_max_pu", snapshots)[gens]
+    capacity = (p_max_pu * n.generators.p_nom_opt[gens]).sum(axis=1)
+
+    # storage enters with its shadow (RESERVES) dispatch
+    su = n.storage_units.index[n.storage_units.bus.isin(buses)]
+    if not su.empty:
+        shadow = (
+            n.model.solution["StorageUnit-p_dispatch_RESERVES"].to_pandas()
+            - n.model.solution["StorageUnit-p_store_RESERVES"].to_pandas()
+        )
+        capacity = capacity + shadow[su].sum(axis=1).values
+
+    # lines and links enter with their actual flows across the region boundary
+    def net_import(c, flow, efficiency=None):
+        df = n.static(c)
+        inflow = df.index[~df.bus0.isin(buses) & df.bus1.isin(buses)]
+        outflow = df.index[df.bus0.isin(buses) & ~df.bus1.isin(buses)]
+        into = flow[inflow] * (efficiency[inflow] if efficiency is not None else 1)
+        return into.sum(axis=1) - flow[outflow].sum(axis=1)
+
+    link_eff = n.get_switchable_as_dense("Link", "efficiency", snapshots)
+    imports = net_import("Line", n.lines_t.p0) + net_import("Link", n.links_t.p0, link_eff)
+
+    return capacity + imports - requirement, imports
+
+
 def test_erm_constraint_binding(reserve_margin_network):
-    """Test that ERM constraint correctly limits generation capacity."""
+    """Test that the regional ERM constraint holds in every snapshot."""
     n = reserve_margin_network.copy()
 
     erm_value = 0.90
@@ -87,45 +122,50 @@ def test_erm_constraint_binding(reserve_margin_network):
     n.optimize(solver_name="glpk", multi_investment_periods=True, extra_functionality=extra_functionality)
     store_ERM_duals(n)
 
-    nodal_demand = n.loads_t.p.T.groupby(n.loads.bus).sum().T
-    nodal_reserve_requirement = nodal_demand * (1.0 + erm_value)
+    # one row per snapshot, not per bus
+    assert n.model.constraints["GlobalConstraint-all_ERM"].shape == (len(n.snapshots),)
 
-    nodal_generator_capacity = (
-        (n.generators.p_nom_opt * n.get_switchable_as_dense("Generator", "p_max_pu", n.snapshots))
-        .T.groupby(n.generators.bus)
-        .sum()
-        .T
-    )
-    nodal_storage_capacity = (
-        (
-            n.storage_units.p_nom_opt
-            * n.get_switchable_as_dense("StorageUnit", "p_max_pu", n.snapshots)
-            * n.storage_units.efficiency_store
-        )
-        .T.groupby(n.storage_units.bus)
-        .sum()
-        .T
-    )
+    slack, imports = _regional_reserve_slack(n, n.buses.index, erm_value)
+    assert (imports.abs() < 1e-6).all(), "No line or link crosses the boundary of region 'all'"
+    assert (slack >= -0.1).all(), "Regional reserve capacity should cover the regional reserve requirement"
+    assert (slack.abs() < 0.1).any(), "ERM of 0.90 should bind in at least one snapshot"
 
-    line_contribution = n.lines_t["s_RESERVES"]
-    injection_b0 = -1 * line_contribution.T.groupby(n.lines.bus0).sum().T
-    injection_b1 = line_contribution.T.groupby(n.lines.bus1).sum().T
-    line_injections = injection_b0.add(injection_b1, fill_value=0)
 
-    link_contribution = n.links_t["p_RESERVES"]
-    injection_b0 = -1 * link_contribution.T.groupby(n.links.bus0).sum().T
-    injection_b1 = link_contribution.T.groupby(n.links.bus1).sum().T
-    link_injections = injection_b0.add(injection_b1, fill_value=0)
+def test_erm_counts_boundary_flows(reserve_margin_network):
+    """Only actual flows across a region's boundary enter its ERM constraint."""
+    n = reserve_margin_network.copy()
 
-    nodal_reserve_capacity = (
-        nodal_generator_capacity.add(nodal_storage_capacity, fill_value=0)
-        .add(line_injections, fill_value=0)
-        .add(link_injections, fill_value=0)
-    )
+    erm_dict = {"NERC1": 0.15, "NERC2": 0.15}
 
-    assert (nodal_reserve_capacity - nodal_reserve_requirement >= -0.1).all().all(), (
-        "Nodal reserve capacity should be at least as large as the nodal reserve requirement"
-    )
+    def extra_functionality(n, sns):
+        add_ERM_constraints(n, sns, regional_erm_data=erm_dict)
+
+    n.optimize(solver_name="glpk", multi_investment_periods=True, extra_functionality=extra_functionality)
+    store_ERM_duals(n)
+
+    m = n.model
+
+    def flow_labels(var, name):
+        return set(m.variables[var].sel(name=name).labels.values.ravel())
+
+    for region, buses in {"NERC1": ["z1"], "NERC2": ["z2", "z3"]}.items():
+        con = m.constraints[f"GlobalConstraint-{region}_ERM"]
+        assert con.shape == (len(n.snapshots),)
+
+        # line1 (z1-z2) and link1 (z1-z3) cross the boundary; line2 (z2-z3) is inside NERC2
+        labels = set(con.vars.values.ravel()) - {-1}
+        assert labels & flow_labels("Line-s", "line1")
+        assert labels & flow_labels("Link-p", "link1")
+        assert not labels & flow_labels("Line-s", "line2")
+
+        slack, _ = _regional_reserve_slack(n, buses, erm_dict[region])
+        assert (slack >= -0.1).all(), f"ERM of {region} should hold in every snapshot"
+
+    # each bus carries the dual of its own region
+    prices = n.buses_t.erm_price
+    assert (prices["z2"] == prices["z3"]).all()
+    dual_nerc1 = m.dual["GlobalConstraint-NERC1_ERM"].to_pandas().reindex(n.snapshots)
+    assert np.allclose(prices["z1"], dual_nerc1)
 
 
 def test_multiple_non_overlapping_erms(reserve_margin_network):

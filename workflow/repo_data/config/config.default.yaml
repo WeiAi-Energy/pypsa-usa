@@ -190,7 +190,19 @@ electricity:
   SAFE_regional_reservemargins:   'repo_data/config/policy_constraints/SAFE_regional_prm.csv'
 
   erm:                                     # Energy Reserve Margin — only consumed when the ERM opt is enabled
-    all: 0.15                              # default ERM applied to every region (fraction of annual energy)
+    # {region: margin}; one constraint per region per snapshot: reserve capacity + actual net
+    # imports across the region boundary >= (1 + margin) * demand. Region = bus nerc_reg here.
+    all: null                              # null = off; the base layer's system-wide `all: 0.15` would otherwise merge in
+    MISO: 0.15
+    SERC: 0.15
+    SPP: 0.15
+    PJM: 0.15
+    ERCOT: 0.15
+    NPCC_NE: 0.15
+    NPCC_NY: 0.15
+    WECC_NWPP: 0.15
+    WECC_CA: 0.15
+    WECC_SRSG: 0.15
 
   # ---------------- Policy & emissions ----------------
   # co2base: 2.4e9                       # OPTIONAL: reference CO2 budget (tCO2/yr) scaled by the Co2L<x> opt; required by Co2L<x>
