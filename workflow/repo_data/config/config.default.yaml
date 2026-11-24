@@ -70,12 +70,12 @@ run:
 # users set a single value per wildcard. See docs/source/config-wildcards.md.
 # docs : SCENARIO
 scenario:
-  interconnect: [western]                # geographic scope; one of: usa | texas | western | eastern
-  planning_horizons: [2030, 2040, 2050]  # investment-period years (2018-2023 | 2030 | 2040 | 2050)
-  clusters: [33]                         # final cluster count; plain integer keeps renewable resource zones (== m); suffix s / a / c or "all"
-  simpl: [75]                            # pre-clustering kmeans granularity; alphanumeric or "all"
-  ll: [v1.0]                             # line-limit scenario; v|c + number/opt/all (e.g. v1.0, copt)
-  opts: [REM-3h]                         # dash/plus-separated options string (REM = renewable-energy mix, 3h = 3-hour temporal resolution)
+  interconnect: [usa]                # geographic scope; one of: usa | texas | western | eastern
+  planning_horizons: [2030, 2035, 2040]  # investment-period years (2018-2023 | 2030 | 2040 | 2050)
+  clusters: [3072]                         # final cluster count; plain integer keeps renewable resource zones (== m); suffix s / a / c or "all"
+  simpl: [county]                            # pre-clustering kmeans granularity; alphanumeric or "all"
+  ll: [{2030: v1.05, 2035: v1.1, 2040: v1.15}]                             # line-limit scenario; v|c + number/opt/all (e.g. v1.0, copt), or per period {2040: v1.1, 2050: v1.2}
+  opts: [TCT-RPS-ERM-6h]                         # dash/plus-separated options string (REM = renewable-energy mix, 3h = 3-hour temporal resolution)
   sector: ""                             # sector-coupling; "" (electricity-only) | E | G | E-G
 
 foresight: 'perfect'                     # multi-horizon solve mode; perfect (monolithic) | myopic (sequential)
@@ -86,8 +86,8 @@ foresight: 'perfect'                     # multi-horizon solve mode; perfect (mo
 # ====================================================================
 # docs : MODEL_TOPOLOGY
 model_topology:
-  transmission_network: 'reeds'          # transmission dataset; reeds | tamu | hifld (power-flow grid built from HIFLD lines, not calibrated to ReEDS)
-  topological_boundaries: 'reeds_zone'   # post-cluster zone type; county | reeds_zone | state
+  transmission_network: 'hifld'          # transmission dataset; reeds | tamu | hifld (power-flow grid built from HIFLD lines, not calibrated to ReEDS)
+  topological_boundaries: 'county'   # post-cluster zone type; county | reeds_zone | state
   interface_transmission_limits: false   # apply NARIS2024 inter-region transfer caps (requires reeds backbone)
   # KEEP THIS NULL, not {}. build_base_network treats "not None" as "the user
   # asked for a footprint filter" and then asserts that topological_boundaries
@@ -125,12 +125,12 @@ enable:
 # The ReEDS CFs are UTC like the snapshots; in leap years Feb 29 takes the
 # 1 March labels, the convention GODEEEP and EER demand already follow.
 # docs : RENEWABLE_WEATHER_YEARS
-renewable_weather_years: [2019]         # weather years to use (single year unless multi-horizon godeeep)
+renewable_weather_years: [2012]         # weather years to use (single year unless multi-horizon godeeep)
 
 # docs : SNAPSHOTS
 snapshots:
-  start: "2019-01-01"                   # ISO date string; first snapshot timestamp
-  end: "2020-01-01"                     # ISO date string; one past the last snapshot if inclusive=left
+  start: "2012-01-01"                   # ISO date string; first snapshot timestamp
+  end: "2013-01-01"                     # ISO date string; one past the last snapshot if inclusive=left
   inclusive: "left"                     # pandas.date_range inclusive arg; left | right | both | neither
 
 # GODEEEP future-scenario controls. Used only when renewable.dataset = godeeep
@@ -142,7 +142,7 @@ snapshots:
 # (config.common.yaml). Note rcp45hotter is published for solar only — its
 # wind_125m Zenodo record is unregistered.
 # docs : RENEWABLE_SCENARIOS
-renewable_scenarios: ["rcp85cooler"]   # climate scenario; historical | rcp45cooler | rcp45hotter | rcp85cooler | rcp85hotter
+renewable_scenarios: ["historical"]   # climate scenario; historical | rcp45cooler | rcp45hotter | rcp85cooler | rcp85hotter
 
 # For multi-horizon godeeep, the YEAR is taken from each planning_horizon
 # automatically — these knobs only set the month/day slice within that year.
@@ -160,8 +160,8 @@ renewable_snapshots:
 # ====================================================================
 # docs : ELECTRICITY
 electricity:
-  conventional_carriers: [nuclear, oil, OCGT, CCGT, coal, geothermal, biomass, waste]   # plant types attached as existing capacity from EIA-860
-  renewable_carriers:   [onwind, offwind_floating, solar, hydro]                        # variable renewables attached as existing capacity
+  conventional_carriers: [nuclear, oil, OCGT, CCGT, coal, biomass]   # plant types attached as existing capacity from EIA-860
+  renewable_carriers:   [onwind, offwind, offwind_floating, solar, hydro]                        # variable renewables attached as existing capacity
   retirement: economic                   # economic = allow early retirement at fixed cost; technical = existing capacity fixed until its lifetime ends
   honor_planned_retirements: true        # drop existing/proposed units at their EIA planned_generator_retirement_date (false = keep every existing unit indefinitely)
 
@@ -169,8 +169,8 @@ electricity:
   # p_nom and pay annualized capex; carriers listed only above are
   # fixed (brownfield-only).
   extendable_carriers:
-    Generator:    [solar, onwind, offwind_floating, OCGT, CCGT, CCGT-95CCS, coal, nuclear, hydrogen_ct]
-    StorageUnit:  [4hr_battery_storage, 8hr_battery_storage]                            # Xhr_battery_storage (X = 2..10)
+    Generator:    [solar, onwind, offwind, offwind_floating, OCGT, CCGT, coal, nuclear]
+    StorageUnit:  [4hr_battery_storage]                            # Xhr_battery_storage (X = 2..10)
     Store: []                              # candidate Store carriers (e.g. H2_tank); requires sector coupling
     Link:  []                              # candidate Link carriers (e.g. HVDC)
 
@@ -217,7 +217,7 @@ electricity:
 
   # ---------------- Demand ----------------
   demand:
-    profile: efs                           # demand time series source; efs (EIA-EFS) | eia (historical actuals) | eer (EER scenarios) | servm (CPUC SERVM, California only)
+    profile: eer                           # demand time series source; efs (EIA-EFS) | eia (historical actuals) | eer (EER scenarios) | servm (CPUC SERVM, California only)
     bus_allocation: population             # per-bus demand weight; population (2020 census counties) | breakthrough (legacy BE Pd)
     scenario:                              # EFS/EER/SERVM scenario knobs (ignored if profile=eia)
       efs_case:  reference                 # reference | medium | high
@@ -414,7 +414,7 @@ costs:
     # while builds go to the cheapest sites first. With large bus regions (coarse
     # simpl, like the 75 of this default) it overstates the cost, so it is off
     # until the supply curve is binned (issue #849); turn it on for fine simpl.
-    renewable_interconnection: false
+    renewable_interconnection: true
     column_to_tech:                        # ReEDS technology-group column -> pypsa carriers; null = no county multipliers
       BATTERY|PVB: [2hr_battery_storage, 4hr_battery_storage, 6hr_battery_storage, 8hr_battery_storage, 10hr_battery_storage]
       COAL|BIO: [coal, coal-95CCS, coal-99CCS, biomass, biomass-95CCS]

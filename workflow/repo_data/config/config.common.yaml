@@ -57,7 +57,7 @@ renewable:
   #   reeds   = NREL ReEDS supply-curve sites and hourly CFs, for exactly one
   #             renewable_weather_years entry in 2007-2013 or 2016-2023; the
   #             land-access variant follows renewable_land_access
-  dataset: godeeep                         # atlite | godeeep | reeds
+  dataset: reeds                         # atlite | godeeep | reeds
 
   # How GODEEEP cells are weighted up to the s{simpl} cluster bus.
   #   capacity     = availability-weighted per substation, then p_nom_max-weighted
