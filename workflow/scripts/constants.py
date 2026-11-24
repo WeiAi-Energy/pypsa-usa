@@ -677,13 +677,13 @@ ATB_TECH_MAPPER = {
         "display_name": "Nuclear - AP1000",
         "technology": "Nuclear",
         "techdetail": "Nuclear - Large",
-        "crp": 60,
+        "crp": 30,
     },
     "SMR": {  # small modular reactor
         "display_name": "Nuclear - Small Modular Reactor",
         "technology": "Nuclear",
         "techdetail": "Nuclear - Small",
-        "crp": 60,
+        "crp": 30,
     },
     "onwind": {
         "display_name": "Land-Based Wind - Class 4 - Technology 1",
