@@ -1,8 +1,22 @@
 import logging  # noqa: D100
 
+import pandas as pd
 from constants import FWD_SUFFIX, REV_SUFFIX
 
 logger = logging.getLogger(__name__)
+
+
+def bidirectional_pairs(links) -> dict:
+    """Pair each '_fwd' link in ``links`` with the '_rev' link of the same name and vintage."""
+    links = pd.Index(links)
+    pairs = {}
+    if links.empty:  # empty components carry an int64 index under pypsa v1
+        return pairs
+    for fwd_link in links[links.str.contains(FWD_SUFFIX, regex=False)]:
+        rev_link = REV_SUFFIX.join(fwd_link.rsplit(FWD_SUFFIX, 1))
+        if rev_link in links:
+            pairs[fwd_link] = rev_link
+    return pairs
 
 
 def add_bidirectional_link_constraints(n):
@@ -17,14 +31,7 @@ def add_bidirectional_link_constraints(n):
 
     This ensures the two links model the same physical infrastructure.
     """
-    extendable_links = n.links.index[n.links.p_nom_extendable]
-
-    # Pair each '_fwd' link with the '_rev' link of the same name and vintage
-    complete_pairs = {}
-    for fwd_link in extendable_links[extendable_links.str.contains(FWD_SUFFIX, regex=False)]:
-        rev_link = REV_SUFFIX.join(fwd_link.rsplit(FWD_SUFFIX, 1))
-        if rev_link in extendable_links:
-            complete_pairs[fwd_link] = rev_link
+    complete_pairs = bidirectional_pairs(n.links.index[n.links.p_nom_extendable])
 
     if not complete_pairs:
         logger.info("No complete bidirectional link pairs found")

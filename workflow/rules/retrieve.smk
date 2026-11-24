@@ -448,6 +448,34 @@ rule retrieve_hifld_transmission_lines:
         "../scripts/retrieve_hifld_transmission_lines.py"
 
 
+# Hourly relative ratings of the HIFLD base network lines (dlr = dynamic, slr =
+# static), one column per line of elec_base_network.nc; ~3.6 GB each. Fetched for
+# interconnect usa, transmission_network hifld and a weather year in
+# LINE_RATING_YEARS (see line_rating_kind in build_electricity.smk).
+from constants import LINE_RATING_RECORD, LINE_RATING_YEARS
+
+
+rule retrieve_line_rating:
+    wildcard_constraints:
+        line_rating="dlr|slr",
+        rating_year="|".join(str(y) for y in LINE_RATING_YEARS),
+    params:
+        url=lambda w: (
+            f"https://zenodo.org/records/{LINE_RATING_RECORD}/files/"
+            f"{w.line_rating}_{w.rating_year}.csv?download=1"
+        ),
+    output:
+        DATA + "{line_rating}_{rating_year}.csv",
+    log:
+        LOGS + "retrieve/line_rating_{line_rating}_{rating_year}.log",
+    resources:
+        walltime="03:00:00",
+        mem_mb=2000,
+    retries: 2
+    script:
+        "../scripts/retrieve_http_file.py"
+
+
 if "EGS" in config["electricity"]["extendable_carriers"]["Generator"]:
 
     rule retrieve_egs:

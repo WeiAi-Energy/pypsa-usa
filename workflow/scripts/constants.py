@@ -47,6 +47,12 @@ HIFLD_TRANSMISSION_LINES_URL = (
     "US_Electric_Power_Transmission_Lines/FeatureServer/0"
 )
 
+#: Zenodo record of the hourly relative line ratings of the HIFLD base network
+#: (``dlr_{year}.csv`` dynamic, ``slr_{year}.csv`` static; one column per base line),
+#: and the weather years it holds.
+LINE_RATING_RECORD = "24452558"
+LINE_RATING_YEARS = (2012,)
+
 #: Zenodo record of each ReEDS VRE resource (one file per land-access scenario).
 REEDS_VRE_RECORDS = {
     "onwind": "18827074",

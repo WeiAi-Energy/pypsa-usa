@@ -580,28 +580,6 @@ allOf:
         properties:
           solver_options: {type: object, minProperties: 1}
 
-# Dynamic line ratings need the per-base-line rating table.
-- if:
-    properties:
-      lines:
-        properties:
-          dynamic_line_rating:
-            properties:
-              enable: {const: true}
-            required: [enable]
-  then:
-    properties:
-      lines:
-        properties:
-          dynamic_line_rating:
-            properties:
-              file:
-                description: >-
-                  lines.dynamic_line_rating.enable needs file: the CSV of hourly
-                  relative ratings per line of elec_base_network.nc.
-                type: string
-            required: [file]
-
 # GODEEEP needs an NREL land-access overlay and ReEDS picks its supply-curve
 # variant by it: the key must be declared and non-null (null is only valid with
 # dataset: atlite).

@@ -1416,26 +1416,64 @@ rule add_extra_components:
         "../scripts/add_extra_components.py"
 
 
-def dynamic_line_rating_enabled():
-    return bool(config["lines"].get("dynamic_line_rating", {}).get("enable", False))
+def line_rating_year():
+    """The weather year of the line-rating tables, or None if none is published for it."""
+    from constants import LINE_RATING_YEARS
+
+    years = set(config["renewable_weather_years"])
+    if len(years) == 1 and (year := years.pop()) in LINE_RATING_YEARS:
+        return year
+    return None
+
+
+def line_rating_kind(wildcards):
+    """``dlr`` / ``slr`` table multiplied onto the branch ratings, or None.
+
+    The tables exist for the HIFLD base network of the whole US in the weather
+    years LINE_RATING_YEARS; lines.dynamic_line_rating picks dynamic (true) or
+    static (false) ratings.
+    """
+    if (
+        wildcards.interconnect == "usa"
+        and config["model_topology"]["transmission_network"] == "hifld"
+        and line_rating_year() is not None
+    ):
+        return "dlr" if config["lines"]["dynamic_line_rating"] else "slr"
+    return None
+
+
+def line_rating_profile(wildcards):
+    kind = line_rating_kind(wildcards)
+    if kind is None:
+        return []
+    return PROFILES + (
+        f"{wildcards.interconnect}/line_rating_{kind}_{line_rating_year()}"
+        f"_s{wildcards.simpl}_c{wildcards.clusters}.parquet"
+    )
 
 
 rule build_dynamic_line_rating:
-    params:
-        dynamic_line_rating=config_provider("lines", "dynamic_line_rating"),
+    wildcard_constraints:
+        line_rating="dlr|slr",
+        rating_year=r"\d{4}",
     input:
-        dlr=config["lines"].get("dynamic_line_rating", {}).get("file") or [],
+        dlr=DATA + "{line_rating}_{rating_year}.csv",
         base_network=NETWORKS + "{interconnect}/elec_base_network.nc",
         busmap_b=BUSMAPS + "{interconnect}/busmap_b.csv",
         busmap_s=BUSMAPS + "{interconnect}/busmap_s{simpl}.csv",
         busmap_c=BUSMAPS + "{interconnect}/busmap_s{simpl}_{clusters}.csv",
         network=NETWORKS + "{interconnect}/elec_s{simpl}_c{clusters}_ec.nc",
     output:
-        PROFILES + "{interconnect}/dynamic_line_rating_s{simpl}_c{clusters}.parquet",
+        PROFILES
+        + "{interconnect}/line_rating_{line_rating}_{rating_year}_s{simpl}_c{clusters}.parquet",
     log:
-        LOGS + "{interconnect}/build_dynamic_line_rating_s{simpl}_c{clusters}.log",
+        LOGS
+        + "{interconnect}/build_dynamic_line_rating_{line_rating}_{rating_year}_s{simpl}_c{clusters}.log",
     benchmark:
-        BENCHMARKS + "{interconnect}/build_dynamic_line_rating_s{simpl}_c{clusters}"
+        (
+            BENCHMARKS
+            + "{interconnect}/build_dynamic_line_rating_{line_rating}_{rating_year}_s{simpl}_c{clusters}"
+        )
     threads: 1
     resources:
         mem_mb=lambda wildcards, input, attempt: 8000 * attempt,
@@ -1457,6 +1495,7 @@ rule prepare_network:
         gaslimit_enable=config_provider("electricity", "gaslimit_enable", default=False),
         transmission_network=config_provider("model_topology", "transmission_network"),
         costs=config_provider("costs"),
+        line_rating=line_rating_kind,
     input:
         network=(
             config["custom_files"]["files_path"]
@@ -1470,12 +1509,7 @@ rule prepare_network:
             else RESOURCES
             + f"costs/costs_{config['scenario']['planning_horizons'][0]}.csv"
         ),
-        dlr=(
-            PROFILES
-            + "{interconnect}/dynamic_line_rating_s{simpl}_c{clusters}.parquet"
-            if dynamic_line_rating_enabled()
-            else []
-        ),
+        line_rating=line_rating_profile,
     output:
         NETWORKS + "{interconnect}/elec_s{simpl}_c{clusters}_ec_l{ll}_{opts}.nc",
     log:

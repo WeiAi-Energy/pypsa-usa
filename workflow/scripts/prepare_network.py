@@ -26,6 +26,7 @@ from _helpers import (
     update_config_from_wildcards,
 )
 from constants import HOURS_PER_YEAR
+from opts.bidirectional_link import bidirectional_pairs
 
 idx = pd.IndexSlice
 
@@ -91,27 +92,28 @@ def add_emission_prices(n, emission_prices={"co2": 0.0}, exclude_co2=False):
     n.storage_units["marginal_cost"] += su_ep
 
 
-def set_line_s_max_pu(n, transport_model, s_max_pu=0.7):
+def set_line_s_max_pu(n, transport_model, n1_derate=0.7):
+    """Set the static line ``s_max_pu`` to the N-1 derate (``lines.N1_derate``)."""
     if not transport_model:
-        logger.info(f"N-1 security margin of lines set to {s_max_pu}")
-        n.lines["s_max_pu"] = s_max_pu
+        logger.info(f"N-1 security margin of lines set to {n1_derate}")
+        n.lines["s_max_pu"] = n1_derate
 
 
-def apply_dynamic_line_rating(n, fn, cap=None):
+def apply_dynamic_line_rating(n, fn):
     """
-    Scale branch ratings by hourly relative dynamic line ratings read from ``fn``.
+    Scale branch ratings by hourly relative line ratings read from ``fn``.
 
     ``fn`` (.parquet or .csv) holds one column per model Line or AC Link and one row
     per hour of the weather year (365-day calendar), as written by rule
-    ``build_dynamic_line_rating``. Snapshots are matched by relabelling each timestep
-    to the weather year. Lines get ``s_max_pu * rating``, AC links
-    ``p_max_pu * rating``; ``cap`` clips the relative rating from above.
+    ``build_dynamic_line_rating`` from the dynamic (``dlr``) or static (``slr``)
+    ratings. Snapshots are matched by relabelling each timestep to the weather year.
+    The rating multiplies the static rating independently of the N-1 derate: lines
+    get ``s_max_pu_t = N1_derate * rating`` (``s_max_pu`` as ``set_line_s_max_pu``
+    left it), AC links ``p_max_pu_t = p_max_pu * rating``.
     """
     rating = pd.read_parquet(fn) if str(fn).endswith(".parquet") else pd.read_csv(fn, index_col=0)
     rating.index = pd.DatetimeIndex(rating.index)
     rating.columns = rating.columns.astype(str)
-    if cap is not None:
-        rating = rating.clip(upper=cap)
 
     weather_year = rating.index[0].year
     timesteps = n.snapshots.get_level_values("timestep")
@@ -136,9 +138,130 @@ def apply_dynamic_line_rating(n, fn, cap=None):
     if not applied:
         raise ValueError(f"No column of {fn} names a Line or AC Link of this network.")
     logger.info(
-        f"Dynamic line rating from {fn} (weather year {weather_year}, cap {cap}) applied to {applied} branches; "
+        f"Line rating from {fn} (weather year {weather_year}) applied to {applied} branches; "
         f"mean relative rating {rating.to_numpy().mean():.3f}."
     )
+
+
+LL_PERIOD_PATTERN = re.compile(r"(\d{4})([vc])([0-9.]+|opt)")
+
+
+def parse_ll_by_period(ll: str) -> dict[int, tuple[str, str]] | None:
+    """
+    Read a per-period ll wildcard such as ``2040v1.1+2050v1.2``.
+
+    Returns ``{period: (ll_type, factor)}``, or None for a single limit such as ``v1.1``.
+    """
+    if not ll[:1].isdigit():
+        return None
+    limits = {}
+    for part in ll.split("+"):
+        match = LL_PERIOD_PATTERN.fullmatch(part)
+        if match is None:
+            raise ValueError(f"Cannot read per-period transmission limit {part!r} in ll wildcard {ll!r}.")
+        limits[int(match[1])] = (match[2], match[3])
+    return limits
+
+
+def halve_paired_link_length(n):
+    """
+    Give each link of a ``_fwd``/``_rev`` pair of AC/DC links half the corridor's length.
+
+    A pair is one corridor (an HVDC line, or an interface of the transport model) with a
+    link per direction; both links carry the corridor's length and expand together (the
+    bidirectional link constraint). Their capital cost is already split in half, so the
+    cost (``c``) limit counts the corridor once; halving the length does the same for the
+    volume (``v``) limit and its reference. Call after the link costs and efficiencies,
+    which use the full length, are set, and before the transmission limits.
+    """
+    if n.links.empty:
+        return
+    pairs = bidirectional_pairs(n.links.index[n.links.carrier.isin(["AC", "DC"])])
+    paired = pd.Index([*pairs, *pairs.values()])
+    if paired.empty:
+        return
+    n.links.loc[paired, "length"] /= 2
+    logger.info(f"Halved the length of {len(paired)} links in {len(pairs)} '_fwd'/'_rev' pairs.")
+
+
+def _transmission_reference(n, ll_type):
+    """Today's length- (``v``) or cost- (``c``) weighted capacity of AC lines and AC/DC links."""
+    col = "capital_cost" if ll_type == "c" else "length"
+    links = n.links[n.links.carrier.isin(["AC", "DC"])] if not n.links.empty else n.links
+    return n.lines.s_nom @ n.lines[col] + links.p_nom @ links[col]
+
+
+def _make_transmission_extendable(n):
+    """Let AC lines and AC/DC links expand from today's capacity; all are non-extendable before this."""
+    n.lines["s_nom_min"] = n.lines.s_nom
+    n.lines["s_nom_extendable"] = True
+    if n.links.empty:
+        return
+    links = n.links.carrier.isin(["AC", "DC"])
+    n.links.loc[links, "p_nom_min"] = n.links.loc[links, "p_nom"]
+    n.links.loc[links, "p_nom_extendable"] = True
+
+
+def apply_transmission_limit(n, ll: str):
+    """
+    Set the transmission limits of the ll wildcard.
+
+    With several investment periods every ll, per-period or single, gets a limit per
+    period, so that lines expand period by period; a single ll applies to all of them.
+    """
+    limits = parse_ll_by_period(ll)
+    if limits is None and len(n.investment_periods) > 1:
+        limits = {int(n.investment_periods[0]): (ll[0], ll[1:])}
+    if limits is None:
+        return set_transmission_limit(n, ll[0], ll[1:])
+    return set_transmission_limit_by_period(n, limits)
+
+
+def set_transmission_limit_by_period(n, limits):
+    """
+    Set one transmission limit per investment period.
+
+    Used for a per-period ll wildcard, and for a single ll (e.g. ``v1.1``) on a network
+    with several investment periods, which then applies to every period. Each limit caps the length- or cost-weighted capacity installed by that period,
+    relative to today's. A period without its own entry takes the latest earlier one;
+    periods before the first entry get no expansion. The limits are stored as
+    GlobalConstraints of type ``transmission_*_limit_per_period`` (PyPSA ignores
+    these types) and built in solve_network, which gives every line a capacity per
+    period so that a limit binds only on what is built by its period.
+    """
+    periods = list(n.investment_periods)
+    unknown = sorted(set(limits) - set(periods))
+    if unknown:
+        raise ValueError(f"ll names years {unknown} that are not planning horizons {periods}.")
+
+    first = min(limits)
+    limit = (limits[first][0], "1.0")
+    by_period = {}
+    for period in periods:
+        limit = limits.get(period, limit)
+        by_period[period] = limit
+    logger.info(f"Setting transmission limits per period: {by_period}")
+
+    if any(factor == "opt" or float(factor) > 1.0 for _, factor in by_period.values()):
+        _make_transmission_extendable(n)
+    else:
+        logger.info("No period allows transmission expansion; lines and links stay fixed.")
+        return n
+
+    # an `opt` period gets an infinite limit, so solve_network still builds its capacity
+    for period, (ll_type, factor) in by_period.items():
+        con_type = "expansion_cost" if ll_type == "c" else "volume_expansion"
+        constant = np.inf if factor == "opt" else round(float(factor) * _transmission_reference(n, ll_type), 2)
+        n.add(
+            "GlobalConstraint",
+            f"l{ll_type}_limit_{period}",
+            type=f"transmission_{con_type}_limit_per_period",
+            investment_period=period,
+            sense="<=",
+            constant=constant,
+            carrier_attribute="AC, DC",
+        )
+    return n
 
 
 def set_transmission_limit(n, ll_type, factor):
@@ -407,11 +530,12 @@ if __name__ == "__main__":
     )
     n.investment_period_weightings["objective"] = objective_w
 
-    set_line_s_max_pu(n, transport_model, params.lines["s_max_pu"])
+    set_line_s_max_pu(n, transport_model, params.lines["N1_derate"])
 
-    dlr = params.lines.get("dynamic_line_rating") or {}
-    if dlr.get("enable"):
-        apply_dynamic_line_rating(n, snakemake.input.dlr, cap=dlr.get("cap"))
+    # dlr (lines.dynamic_line_rating: true) or slr ratings, multiplied onto N1_derate;
+    # None where no rating table exists (see line_rating_kind in build_electricity.smk)
+    if params.line_rating:
+        apply_dynamic_line_rating(n, snakemake.input.line_rating)
 
     # temporal averaging
     time_resolution = params.time_resolution
